@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.sql import func
+
+metadata = MetaData()
+
+data_sources = Table(
+    "data_sources",
+    metadata,
+    Column("source_id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("source_type", String, nullable=False),
+    Column("config", JSONB, nullable=False, default=dict),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+market_data_refs = Table(
+    "market_data_refs",
+    metadata,
+    Column("dataset_id", String, primary_key=True),
+    Column("source_id", ForeignKey("data_sources.source_id"), nullable=False),
+    Column("asset", String, nullable=False),
+    Column("instrument", String, nullable=False),
+    Column("data_type", String, nullable=False),
+    Column("timeframe", String, nullable=True),
+    Column("data_origin", String, nullable=False, default="raw"),
+    Column("start_ts", DateTime(timezone=True), nullable=True),
+    Column("end_ts", DateTime(timezone=True), nullable=True),
+    Column("row_count", Integer, nullable=True),
+    Column("storage_backend", String, nullable=False),
+    Column("storage_uri", Text, nullable=False),
+    Column("schema_descriptor", JSONB, nullable=False, default=dict),
+    Column("quality_status", String, nullable=False, default="unknown"),
+    Column("ingestion_version", String, nullable=False),
+    UniqueConstraint("source_id", "instrument", "data_type", "timeframe", "data_origin", "ingestion_version"),
+)
+
+signal_engines = Table(
+    "signal_engines",
+    metadata,
+    Column("signal_engine_id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("description", Text, nullable=False, default=""),
+)
+
+signal_engine_versions = Table(
+    "signal_engine_versions",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("signal_engine_id", ForeignKey("signal_engines.signal_engine_id"), nullable=False),
+    Column("version", String, nullable=False),
+    Column("code_ref", JSONB, nullable=False),
+    Column("supported_input_data_types", JSONB, nullable=False, default=list),
+    Column("output_envelope_version", String, nullable=False),
+    Column("runtime_entrypoint", String, nullable=False),
+    Column("live_scanner_entrypoint", String, nullable=True),
+    Column("configuration_schema", JSONB, nullable=False, default=dict),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("signal_engine_id", "version"),
+)
+
+signals = Table(
+    "signals",
+    metadata,
+    Column("signal_id", String, primary_key=True),
+    Column("signal_engine_id", String, nullable=False),
+    Column("signal_engine_version", String, nullable=False),
+    Column("asset", String, nullable=False),
+    Column("instrument", String, nullable=False),
+    Column("timestamp", DateTime(timezone=True), nullable=False),
+    Column("data_refs", JSONB, nullable=False, default=list),
+    Column("payload_schema", String, nullable=False),
+    Column("payload", JSONB, nullable=False, default=dict),
+)
+
+strategy_modules = Table(
+    "strategy_modules",
+    metadata,
+    Column("strategy_id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("description", Text, nullable=False, default=""),
+)
+
+strategy_versions = Table(
+    "strategy_versions",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("strategy_id", ForeignKey("strategy_modules.strategy_id"), nullable=False),
+    Column("version", String, nullable=False),
+    Column("code_ref", JSONB, nullable=False),
+    Column("supported_signal_engine_ids", JSONB, nullable=False, default=list),
+    Column("parameter_schema", JSONB, nullable=False, default=dict),
+    Column("decision_schema", JSONB, nullable=False, default=dict),
+    Column("execution_profile_schema", JSONB, nullable=False, default=dict),
+    Column("test_suite_status", String, nullable=False, default="unknown"),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("strategy_id", "version"),
+)
+
+walk_forward_templates = Table(
+    "walk_forward_templates",
+    metadata,
+    Column("template_id", String, primary_key=True),
+    Column("anchor", String, nullable=False),
+    Column("retrain_cadence", String, nullable=False),
+    Column("train_range", String, nullable=False),
+    Column("validation_range", String, nullable=False),
+    Column("oos_range", String, nullable=False),
+    Column("embargo", String, nullable=False),
+    Column("scoring_profile", String, nullable=False),
+    Column("promotion_gate", String, nullable=False),
+)
+
+walk_forward_runs = Table(
+    "walk_forward_runs",
+    metadata,
+    Column("run_id", String, primary_key=True),
+    Column("template_id", ForeignKey("walk_forward_templates.template_id"), nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("signal_engine_id", String, nullable=False),
+    Column("asset", String, nullable=False),
+    Column("train_start", Date, nullable=False),
+    Column("train_end", Date, nullable=False),
+    Column("validation_start", Date, nullable=False),
+    Column("validation_end", Date, nullable=False),
+    Column("oos_start", Date, nullable=False),
+    Column("oos_end", Date, nullable=False),
+    Column("status", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+stage_runs = Table(
+    "stage_runs",
+    metadata,
+    Column("stage_run_id", String, primary_key=True),
+    Column("walk_forward_run_id", ForeignKey("walk_forward_runs.run_id"), nullable=False),
+    Column("stage", String, nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("strategy_version", String, nullable=False),
+    Column("signal_engine_id", String, nullable=False),
+    Column("signal_engine_version", String, nullable=False),
+    Column("dataset_refs", JSONB, nullable=False, default=list),
+    Column("status", String, nullable=False),
+    Column("metrics", JSONB, nullable=False, default=dict),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+decisions = Table(
+    "decisions",
+    metadata,
+    Column("decision_id", String, primary_key=True),
+    Column("stage_run_id", ForeignKey("stage_runs.stage_run_id"), nullable=False),
+    Column("signal_id", ForeignKey("signals.signal_id"), nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("strategy_version", String, nullable=False),
+    Column("action", String, nullable=False),
+    Column("direction", String, nullable=False),
+    Column("confidence", Float, nullable=False),
+    Column("reason_code", String, nullable=False),
+    Column("execution_profile", JSONB, nullable=False, default=dict),
+    Column("diagnostics", JSONB, nullable=False, default=dict),
+)
+
+score_summaries = Table(
+    "score_summaries",
+    metadata,
+    Column("score_id", String, primary_key=True),
+    Column("stage_run_id", ForeignKey("stage_runs.stage_run_id"), nullable=False),
+    Column("scoring_method", String, nullable=False),
+    Column("metrics", JSONB, nullable=False, default=dict),
+    Column("records_uri", Text, nullable=True),
+    Column("summary", Text, nullable=False),
+)
+
+agent_tasks = Table(
+    "agent_tasks",
+    metadata,
+    Column("task_id", String, primary_key=True),
+    Column("walk_forward_run_id", ForeignKey("walk_forward_runs.run_id"), nullable=False),
+    Column("stage", String, nullable=False),
+    Column("strategy_id", String, nullable=False),
+    Column("strategy_version", String, nullable=False),
+    Column("task_bundle_uri", Text, nullable=False),
+    Column("input_bundle_hash", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+agent_runs = Table(
+    "agent_runs",
+    metadata,
+    Column("agent_run_id", String, primary_key=True),
+    Column("task_id", ForeignKey("agent_tasks.task_id"), nullable=False),
+    Column("provider", String, nullable=False),
+    Column("prompt_hash", String, nullable=False),
+    Column("output_diff_uri", Text, nullable=True),
+    Column("audit_note_uri", Text, nullable=True),
+    Column("status", String, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+deployment_routes = Table(
+    "deployment_routes",
+    metadata,
+    Column("route_id", String, primary_key=True),
+    Column("strategy_id", String, nullable=False),
+    Column("strategy_version", String, nullable=False),
+    Column("signal_engine_id", String, nullable=False),
+    Column("signal_engine_version", String, nullable=False),
+    Column("asset", String, nullable=False),
+    Column("instrument", String, nullable=False),
+    Column("account_mode", String, nullable=False),
+    Column("execution_adapter", String, nullable=False),
+    Column("risk_limits", JSONB, nullable=False),
+    Column("promoted", Boolean, nullable=False, default=False),
+    Column("data_warmed", Boolean, nullable=False, default=False),
+    Column("manually_armed", Boolean, nullable=False, default=False),
+    Column("enabled", Boolean, nullable=False, default=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("strategy_id", "asset"),
+)
+
+audit_log = Table(
+    "audit_log",
+    metadata,
+    Column("audit_id", String, primary_key=True),
+    Column("entity_type", String, nullable=False),
+    Column("entity_id", String, nullable=False),
+    Column("event_type", String, nullable=False),
+    Column("payload", JSONB, nullable=False, default=dict),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)

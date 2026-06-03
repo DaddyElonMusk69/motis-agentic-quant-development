@@ -1,0 +1,48 @@
+[project]
+name = "motis-quant-terminal"
+version = "0.1.0"
+description = "Deterministic agent-assisted quant research and execution terminal."
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.128.0",
+  "uvicorn[standard]>=0.38.0",
+  "pydantic>=2.12.0",
+  "sqlalchemy>=2.0.0",
+  "alembic>=1.17.0",
+  "psycopg[binary]>=3.2.0",
+  "pyarrow>=24.0.0",
+  "httpx>=0.28.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.0",
+  "pytest-asyncio>=1.3.0",
+  "ruff>=0.14.0"
+]
+
+[build-system]
+requires = ["setuptools>=80.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = [
+  "packages/strategy_sdk/src",
+  "apps/api/src",
+  "apps/worker/src"
+]
+include = [
+  "quant_terminal_*"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [
+  "packages/strategy_sdk/src",
+  "apps/api/src",
+  "apps/worker/src"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
