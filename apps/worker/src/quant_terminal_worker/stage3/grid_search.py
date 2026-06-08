@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import itertools
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_TP_VALUES = [round(1.0 + (0.3 * index), 1) for index in range(9)]
-DEFAULT_SL_VALUES = [round(0.3 + (0.1 * index), 1) for index in range(13)]
 DEFAULT_FORWARD_HOURS = 36
+DEFAULT_FEES_BPS_PER_SIDE = 5.0
 DEFAULT_LEVERAGE = 5
+DEFAULT_SL_MULTIPLIERS = [0.75, 1.0, 1.25]
 
 
 def run_stage3_grid_search(
@@ -20,43 +22,283 @@ def run_stage3_grid_search(
     candles: list[Any],
     tp_values: list[float] | None = None,
     sl_values: list[float] | None = None,
-    forward_hours: int = DEFAULT_FORWARD_HOURS,
+    forward_hours: int | None = None,
     leverage: int = DEFAULT_LEVERAGE,
     shortlist_size: int = 5,
+    fees_bps_per_side: float = DEFAULT_FEES_BPS_PER_SIDE,
+) -> dict[str, Any]:
+    run_stage3_fixed_sl_baseline(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    run_stage3_exact_protection(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    return run_stage3_local_variants(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        shortlist_size=shortlist_size,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+
+
+def run_stage3_fixed_sl_baseline(
+    *,
+    workspace_root: Path,
+    session: dict[str, Any],
+    candles: list[Any],
+    tp_values: list[float] | None = None,
+    forward_hours: int | None = None,
+    leverage: int = DEFAULT_LEVERAGE,
+    fees_bps_per_side: float = DEFAULT_FEES_BPS_PER_SIDE,
+) -> dict[str, Any]:
+    context = _prepare_stage3_context(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    fixed_result = _score_policy_config(
+        config=_fixed_sl_config(context),
+        trades=context["trade_inputs"],
+        candles=context["candle_rows"],
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    _clear_stage3_completion_artifacts(context["promotion_root"])
+    artifact = _base_stage3_artifact(context)
+    artifact.update(
+        {
+            "fixed_sl_complete": True,
+            "exact_protection_complete": False,
+            "local_variants_complete": False,
+            "fixed_sl_baseline_result": fixed_result,
+            "results": [fixed_result],
+        }
+    )
+    return _write_stage3_artifact(context=context, artifact=artifact, write_optimal=False, write_candidates=False)
+
+
+def run_stage3_exact_protection(
+    *,
+    workspace_root: Path,
+    session: dict[str, Any],
+    candles: list[Any],
+    tp_values: list[float] | None = None,
+    forward_hours: int | None = None,
+    leverage: int = DEFAULT_LEVERAGE,
+    fees_bps_per_side: float = DEFAULT_FEES_BPS_PER_SIDE,
+) -> dict[str, Any]:
+    context = _prepare_stage3_context(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    existing = _load_stage3_grid_artifact(context["promotion_root"])
+    fixed_result = existing.get("fixed_sl_baseline_result") if existing else None
+    if not fixed_result:
+        raise ValueError("Stage 3B exact protection requires completed Stage 3A fixed SL baseline.")
+    exact_result = _score_policy_config(
+        config=_exact_protection_config(context),
+        trades=context["trade_inputs"],
+        candles=context["candle_rows"],
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    _clear_stage3_completion_artifacts(context["promotion_root"])
+    artifact = _base_stage3_artifact(context)
+    artifact.update(
+        {
+            "fixed_sl_complete": True,
+            "exact_protection_complete": True,
+            "local_variants_complete": False,
+            "fixed_sl_baseline_result": fixed_result,
+            "exact_protection_result": exact_result,
+            "exact_policy_result": exact_result,
+            "results": [fixed_result, exact_result],
+        }
+    )
+    return _write_stage3_artifact(context=context, artifact=artifact, write_optimal=False, write_candidates=False)
+
+
+def run_stage3_local_variants(
+    *,
+    workspace_root: Path,
+    session: dict[str, Any],
+    candles: list[Any],
+    tp_values: list[float] | None = None,
+    forward_hours: int | None = None,
+    leverage: int = DEFAULT_LEVERAGE,
+    shortlist_size: int = 5,
+    fees_bps_per_side: float = DEFAULT_FEES_BPS_PER_SIDE,
+) -> dict[str, Any]:
+    context = _prepare_stage3_context(
+        workspace_root=workspace_root,
+        session=session,
+        candles=candles,
+        tp_values=tp_values,
+        forward_hours=forward_hours,
+        leverage=leverage,
+        fees_bps_per_side=fees_bps_per_side,
+    )
+    existing = _load_stage3_grid_artifact(context["promotion_root"])
+    fixed_result = existing.get("fixed_sl_baseline_result") if existing else None
+    exact_result = (existing.get("exact_protection_result") or existing.get("exact_policy_result")) if existing else None
+    if not exact_result:
+        raise ValueError("Stage 3C local variants requires completed Stage 3B exact protection.")
+    local_configs = _local_variant_configs(
+        stage2_policy=context["stage2_policy"],
+        stage0_initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        tp_levels=context["tp_levels"],
+        hard_exit_hours=context["hard_exit_hours"],
+    )
+    local_results = [
+        _score_policy_config(
+            config=config,
+            trades=context["trade_inputs"],
+            candles=context["candle_rows"],
+            leverage=leverage,
+            fees_bps_per_side=fees_bps_per_side,
+        )
+        for config in local_configs
+    ]
+    ranked = sorted([row for row in [fixed_result, exact_result, *local_results] if row], key=_ranking_key, reverse=True)
+    top = ranked[:shortlist_size]
+    stage4_candidates = _build_stage4_candidates(
+        session=session,
+        records=top,
+        stage2_policy=context["stage2_policy"],
+        stage0_risk_policy=context["risk_policy"],
+    )
+    _clear_stage3_downstream_artifacts(context["promotion_root"])
+    artifact = _base_stage3_artifact(context)
+    artifact.update(
+        {
+            "fixed_sl_complete": True,
+            "exact_protection_complete": True,
+            "local_variants_complete": True,
+            "fixed_sl_baseline_result": fixed_result,
+            "exact_protection_result": exact_result,
+            "exact_policy_result": exact_result,
+            "local_variant_results": local_results,
+            "stage3c_total_combinations_tested": len(local_results),
+            "stage3c_value_ranges": _stage3c_value_ranges(local_results),
+            "stage3c_shortlist": top,
+            "results": ranked,
+            "optimal": {
+                "criterion": "max_net_pnl_then_profit_factor_then_wr_then_fewer_initial_sl",
+                "best": ranked[0] if ranked else {},
+                "top_5": top,
+            },
+            "stage4_candidates": stage4_candidates,
+        }
+    )
+    return _write_stage3_artifact(context=context, artifact=artifact, write_optimal=True, write_candidates=True)
+
+
+def _prepare_stage3_context(
+    *,
+    workspace_root: Path,
+    session: dict[str, Any],
+    candles: list[Any],
+    tp_values: list[float] | None,
+    forward_hours: int | None,
+    leverage: int,
+    fees_bps_per_side: float,
 ) -> dict[str, Any]:
     artifact_root = _session_artifact_root(workspace_root=workspace_root, session=session)
     promotion_root = artifact_root / "promotion"
-    trade_inputs = _load_trade_inputs(promotion_root / "stage2_capture_per_signal.json")
+    trade_inputs = _load_trade_inputs(promotion_root / "stage3_trade_inputs.json")
     if not trade_inputs:
-        raise ValueError("Stage 3 requires non-empty Stage 2 MATCH signal inputs.")
+        raise ValueError("Stage 3 requires a non-empty all-trade input artifact from Stage 2.")
+
+    stage2_policy = _load_stage2_exit_policy(promotion_root / "stage2_exit_policy.json")
+    stage0_risk = _load_stage0_risk_policy(workspace_root=workspace_root, session=session)
+    hard_exit_hours = int(forward_hours or stage0_risk["hard_exit_hours"])
+    risk_policy = {
+        "initial_sl_pct": float(stage0_risk["initial_sl_pct"]),
+        "hard_exit_hours": hard_exit_hours,
+    }
+    tp_levels = tp_values or _load_stage2_tp_levels(promotion_root / "stage2_capture_curve.json")
+    if not tp_levels:
+        raise ValueError("Stage 3 requires Stage 2 TP levels from promotion/stage2_capture_curve.json.")
 
     candle_rows = [_coerce_candle(candle) for candle in candles]
     candle_rows.sort(key=lambda row: row["timestamp"])
-    tps = tp_values or DEFAULT_TP_VALUES
-    sls = sl_values or DEFAULT_SL_VALUES
-    results = [
-        _score_setup(
-            trades=trade_inputs,
-            candles=candle_rows,
-            tp_pct=tp,
-            sl_pct=sl,
-            forward_hours=forward_hours,
-            leverage=leverage,
-        )
-        for tp in tps
-        for sl in sls
-    ]
-    sorted_results = sorted(
-        results,
-        key=lambda row: (row["pnl_pct"], row["expectancy"], row["profit_factor"], row["wr"]),
-        reverse=True,
+    return {
+        "workspace_root": workspace_root,
+        "artifact_root": artifact_root,
+        "promotion_root": promotion_root,
+        "session": session,
+        "trade_inputs": trade_inputs,
+        "stage2_policy": stage2_policy,
+        "risk_policy": risk_policy,
+        "hard_exit_hours": hard_exit_hours,
+        "tp_levels": tp_levels,
+        "candle_rows": candle_rows,
+        "leverage": leverage,
+        "fees_bps_per_side": fees_bps_per_side,
+    }
+
+
+def _fixed_sl_config(context: dict[str, Any]) -> dict[str, Any]:
+    return _policy_config(
+        config_id="fixed_sl_baseline",
+        stage3_step="fixed_sl_baseline",
+        protection_enabled=False,
+        final_tp_pct=float(context["stage2_policy"]["policy"]["lock_profit_pct"]),
+        protect_trigger_pct=None,
+        trail_sl_pct=None,
+        initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        initial_sl_multiplier=1.0,
+        hard_exit_hours=context["hard_exit_hours"],
     )
-    top = sorted_results[:shortlist_size]
-    stage4_candidates = _build_stage4_candidates(session=session, candidates=top)
-    artifact = {
-        "schema_version": "0.1",
+
+
+def _exact_protection_config(context: dict[str, Any]) -> dict[str, Any]:
+    return _policy_config(
+        config_id="exact_protection_policy",
+        stage3_step="exact_protection_policy",
+        protection_enabled=True,
+        final_tp_pct=float(context["stage2_policy"]["policy"]["lock_profit_pct"]),
+        protect_trigger_pct=float(context["stage2_policy"]["policy"]["protect_trigger_pct"]),
+        trail_sl_pct=float(context["stage2_policy"]["policy"]["trail_sl_pct"]),
+        initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        initial_sl_multiplier=1.0,
+        hard_exit_hours=context["hard_exit_hours"],
+    )
+
+
+def _base_stage3_artifact(context: dict[str, Any]) -> dict[str, Any]:
+    session = context["session"]
+    risk_policy = context["risk_policy"]
+    return {
+        "schema_version": "0.2",
         "stage": "stage3_conditional_execution_setup",
         "artifact_role": "stage3_grid_results",
+        "stage3_mode": "numerical_exit_policy",
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "session_id": session["session_id"],
         "asset": session.get("asset"),
@@ -64,51 +306,125 @@ def run_stage3_grid_search(
         "strategy_version": session.get("strategy_version"),
         "signal_engine_id": session.get("signal_engine_id"),
         "signal_set_id": session.get("signal_set_id"),
-        "total_signals": len(trade_inputs),
-        "forward_hours": forward_hours,
-        "leverage": leverage,
-        "entry_model": "market",
-        "tp_values": tps,
-        "sl_values": sls,
-        "tiebreaker": "candle_body_direction",
-        "results": results,
-        "optimal": {
-            "criterion": "max_pnl_pct",
-            "top_5": top,
-            "best": top[0] if top else None,
-        },
-        "stage4_candidates": stage4_candidates,
+        "total_signals": len(context["trade_inputs"]),
+        "total_executable_decisions": len(context["trade_inputs"]),
+        "forward_hours": context["hard_exit_hours"],
+        "leverage": context["leverage"],
+        "fees_bps_per_side": context["fees_bps_per_side"],
+        "tp_range_source": "stage2_exit_policy_adjacent_levels",
+        "tp_values": context["tp_levels"],
+        "sl_values": sorted({round(risk_policy["initial_sl_pct"] * multiplier, 4) for multiplier in DEFAULT_SL_MULTIPLIERS}),
+        "stage2_exit_policy": context["stage2_policy"],
+        "stage0_risk_policy": risk_policy,
+        "fixed_sl_complete": False,
+        "exact_protection_complete": False,
+        "local_variants_complete": False,
+        "fixed_sl_baseline_result": {},
+        "exact_protection_result": {},
+        "exact_policy_result": {},
+        "local_variant_results": [],
+        "stage3c_total_combinations_tested": 0,
+        "stage3c_value_ranges": {},
+        "stage3c_shortlist": [],
+        "results": [],
+        "optimal": {"criterion": "max_net_pnl_then_profit_factor_then_wr_then_fewer_initial_sl", "best": {}, "top_5": []},
+        "stage4_candidates": {"candidates": []},
     }
+
+
+def _write_stage3_artifact(
+    *,
+    context: dict[str, Any],
+    artifact: dict[str, Any],
+    write_optimal: bool,
+    write_candidates: bool,
+) -> dict[str, Any]:
+    promotion_root = context["promotion_root"]
     promotion_root.mkdir(parents=True, exist_ok=True)
-    grid_path = promotion_root / "stage3_grid_results.json"
+    results_path = promotion_root / "stage3_grid_results.json"
     optimal_path = promotion_root / "stage3_optimal.json"
     candidates_path = promotion_root / "stage4_candidates.json"
     summary_path = promotion_root / "stage3_summary.md"
-    grid_path.write_text(json.dumps(artifact, indent=2) + "\n")
-    optimal_path.write_text(json.dumps(artifact["optimal"], indent=2) + "\n")
-    candidates_path.write_text(json.dumps(stage4_candidates, indent=2) + "\n")
-    summary_path.write_text(_render_summary(artifact))
+    results_path.write_text(json.dumps(artifact, indent=2) + "\n")
+    if write_optimal:
+        optimal_path.write_text(json.dumps(artifact["optimal"], indent=2) + "\n")
+        summary_path.write_text(_render_summary(artifact))
+    if write_candidates:
+        candidates_path.write_text(json.dumps(artifact["stage4_candidates"], indent=2) + "\n")
     return {
         **artifact,
-        "grid_results_path": str(grid_path),
-        "optimal_path": str(optimal_path),
-        "stage4_candidates_path": str(candidates_path),
-        "summary_path": str(summary_path),
+        "grid_results_path": str(results_path),
+        "optimal_path": str(optimal_path) if optimal_path.exists() else None,
+        "stage4_candidates_path": str(candidates_path) if candidates_path.exists() else None,
+        "summary_path": str(summary_path) if summary_path.exists() else None,
     }
 
 
-def simulate_trade(
+def _score_policy_config(
+    *,
+    config: dict[str, Any],
+    trades: list[dict[str, Any]],
+    candles: list[dict[str, Any]],
+    leverage: int,
+    fees_bps_per_side: float,
+) -> dict[str, Any]:
+    outcomes = [
+        _simulate_policy_trade(
+            trade=trade,
+            candles=candles,
+            protection_enabled=bool(config["protection_enabled"]),
+            final_tp_pct=config["final_tp_pct"],
+            initial_sl_pct=config["initial_sl_pct"],
+            protect_trigger_pct=config["protect_trigger_pct"],
+            trail_sl_pct=config["trail_sl_pct"],
+            hard_exit_hours=config["hard_exit_hours"],
+            fees_bps_per_side=fees_bps_per_side,
+        )
+        for trade in trades
+    ]
+    metrics = _aggregate_outcomes(outcomes)
+    return {
+        **config,
+        **metrics,
+        "stage3_mode": "numerical_exit_policy",
+        "protection_enabled": bool(config["protection_enabled"]),
+        "tp": config["final_tp_pct"],
+        "sl": config["initial_sl_pct"],
+        "entry_model": "market",
+        "rr_ratio": round(config["final_tp_pct"] / config["initial_sl_pct"], 4) if config["initial_sl_pct"] else 0.0,
+        "leverage": leverage,
+        "fees_bps_per_side": fees_bps_per_side,
+        "outcomes": outcomes,
+    }
+
+
+def _simulate_policy_trade(
     *,
     trade: dict[str, Any],
     candles: list[dict[str, Any]],
-    tp_pct: float,
-    sl_pct: float,
-    forward_hours: int,
-) -> str:
-    entry = float(trade["reference_price"])
-    direction = trade["direction"]
+    protection_enabled: bool,
+    final_tp_pct: float,
+    initial_sl_pct: float,
+    protect_trigger_pct: float | None,
+    trail_sl_pct: float | None,
+    hard_exit_hours: int,
+    fees_bps_per_side: float,
+) -> dict[str, Any]:
+    direction = str(trade["direction"]).upper()
+    reference_price = float(trade["reference_price"])
     signal_ts = _coerce_datetime(trade["signal_ts"])
-    cutoff = signal_ts + timedelta(hours=forward_hours)
+    cutoff = signal_ts + timedelta(hours=hard_exit_hours)
+    target_price = _target_price(reference_price, pct=final_tp_pct, direction=direction)
+    active_sl = _stop_price(reference_price, pct=initial_sl_pct, direction=direction)
+    protected_sl = _protected_stop_price(reference_price, pct=float(trail_sl_pct), direction=direction) if protection_enabled and trail_sl_pct is not None else None
+    protect_trigger = _target_price(reference_price, pct=float(protect_trigger_pct), direction=direction) if protection_enabled and protect_trigger_pct is not None else None
+    sl_kind = "initial"
+    protection_active = False
+    last_close = reference_price
+    last_timestamp = signal_ts
+    exit_price = reference_price
+    exit_timestamp = signal_ts
+    outcome = "TIME_EXIT"
 
     for candle in candles:
         timestamp = candle["timestamp"]
@@ -116,179 +432,512 @@ def simulate_trade(
             continue
         if timestamp > cutoff:
             break
-        if direction == "LONG":
-            tp_price = entry * (1 + tp_pct / 100)
-            sl_price = entry * (1 - sl_pct / 100)
-            tp_hit = candle["high"] >= tp_price
-            sl_hit = candle["low"] <= sl_price
-        else:
-            tp_price = entry * (1 - tp_pct / 100)
-            sl_price = entry * (1 + sl_pct / 100)
-            tp_hit = candle["low"] <= tp_price
-            sl_hit = candle["high"] >= sl_price
+        last_close = float(candle["close"])
+        last_timestamp = timestamp
+        tp_hit, sl_hit = _tp_sl_hit(candle, tp=target_price, sl=active_sl, direction=direction)
+        if tp_hit or sl_hit:
+            if tp_hit and sl_hit:
+                body = candle["close"] - candle["open"]
+                tp_first = _body_favors_direction(body, direction=direction)
+            else:
+                tp_first = tp_hit
+            if tp_first:
+                outcome = "TP"
+                exit_price = target_price
+            else:
+                outcome = "PROTECTED_SL" if sl_kind == "protected" else "INITIAL_SL"
+                exit_price = active_sl
+            exit_timestamp = timestamp
+            break
+        if protection_enabled and not protection_active and protect_trigger is not None and protected_sl is not None and _price_hit(candle, protect_trigger, direction=direction):
+            protection_active = True
+            active_sl = protected_sl
+            sl_kind = "protected"
+    else:
+        exit_price = last_close
+        exit_timestamp = last_timestamp
 
-        if tp_hit and sl_hit:
-            body = candle["close"] - candle["open"]
-            if direction == "LONG":
-                return "TP" if body >= 0 else "SL"
-            return "TP" if body <= 0 else "SL"
-        if tp_hit:
-            return "TP"
-        if sl_hit:
-            return "SL"
-    return "NEITHER"
+    if outcome == "TIME_EXIT":
+        exit_price = last_close
+        exit_timestamp = last_timestamp
 
-
-def _score_setup(
-    *,
-    trades: list[dict[str, Any]],
-    candles: list[dict[str, Any]],
-    tp_pct: float,
-    sl_pct: float,
-    forward_hours: int,
-    leverage: int,
-) -> dict[str, Any]:
-    outcomes = []
-    for trade in trades:
-        outcome = simulate_trade(
-            trade=trade,
-            candles=candles,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            forward_hours=forward_hours,
-        )
-        outcomes.append({**trade, "outcome": outcome})
-    return _summarize_outcomes(
-        outcomes=outcomes,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        leverage=leverage,
-    )
-
-
-def _summarize_outcomes(
-    *,
-    outcomes: list[dict[str, Any]],
-    tp_pct: float,
-    sl_pct: float,
-    leverage: int,
-) -> dict[str, Any]:
-    total = len(outcomes)
-    tp_count = sum(1 for row in outcomes if row["outcome"] == "TP")
-    sl_count = sum(1 for row in outcomes if row["outcome"] == "SL")
-    neither = sum(1 for row in outcomes if row["outcome"] == "NEITHER")
-    gross_tp = tp_count * tp_pct
-    gross_sl = sl_count * sl_pct
+    gross = _pnl_pct(reference_price, exit_price, direction=direction)
+    fees = fees_bps_per_side * 2 / 100
+    net = gross - fees
     return {
-        "tp": round(tp_pct, 1),
-        "sl": round(sl_pct, 1),
-        "entry_model": "market",
-        "tp_count": tp_count,
-        "sl_count": sl_count,
-        "neither": neither,
+        "signal_id": trade["signal_id"],
+        "sample_role": trade.get("sample_role", "full_cycle"),
+        "direction": direction,
+        "agreement": trade.get("agreement", "UNKNOWN"),
+        "outcome": outcome,
+        "entry_price": reference_price,
+        "exit_price": round(exit_price, 10),
+        "signal_ts": signal_ts.isoformat().replace("+00:00", "Z"),
+        "exit_ts": exit_timestamp.isoformat().replace("+00:00", "Z"),
+        "gross_pnl_pct": round(gross, 4),
+        "fees_pct": round(fees, 4),
+        "net_pnl_pct": round(net, 4),
+        "protection_enabled": protection_enabled,
+        "protection_activated": protection_active,
+    }
+
+
+def _aggregate_outcomes(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+    base = _empty_split()
+    for outcome in outcomes:
+        _add_outcome(base, outcome)
+    slice_split: dict[str, dict[str, Any]] = {}
+    side_split: dict[str, dict[str, Any]] = {}
+    agreement_split: dict[str, dict[str, Any]] = {}
+    for outcome in outcomes:
+        _add_outcome(slice_split.setdefault(str(outcome["sample_role"]), _empty_split()), outcome)
+        _add_outcome(side_split.setdefault(str(outcome["direction"]), _empty_split()), outcome)
+        _add_outcome(agreement_split.setdefault(str(outcome["agreement"]), _empty_split()), outcome)
+    return {
+        **_finalize_split(base),
+        "slice_split": {key: _finalize_split(value) for key, value in slice_split.items()},
+        "side_split": {key: _finalize_split(value) for key, value in side_split.items()},
+        "agreement_split": {key: _finalize_split(value) for key, value in agreement_split.items()},
+        "mismatch_split": {key: _finalize_split(value) for key, value in agreement_split.items()},
+    }
+
+
+def _empty_split() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "tp_count": 0,
+        "initial_sl_count": 0,
+        "protected_sl_count": 0,
+        "time_exit_count": 0,
+        "gross_pnl_pct": 0.0,
+        "net_pnl_pct": 0.0,
+        "fees_pct": 0.0,
+        "gross_profit_pct": 0.0,
+        "gross_loss_pct": 0.0,
+        "wins": 0,
+    }
+
+
+def _add_outcome(target: dict[str, Any], outcome: dict[str, Any]) -> None:
+    net = float(outcome["net_pnl_pct"])
+    target["total"] += 1
+    if outcome["outcome"] == "TP":
+        target["tp_count"] += 1
+    elif outcome["outcome"] == "INITIAL_SL":
+        target["initial_sl_count"] += 1
+    elif outcome["outcome"] == "PROTECTED_SL":
+        target["protected_sl_count"] += 1
+    else:
+        target["time_exit_count"] += 1
+    target["gross_pnl_pct"] += float(outcome["gross_pnl_pct"])
+    target["net_pnl_pct"] += net
+    target["fees_pct"] += float(outcome["fees_pct"])
+    if net > 0:
+        target["gross_profit_pct"] += net
+        target["wins"] += 1
+    elif net < 0:
+        target["gross_loss_pct"] += abs(net)
+
+
+def _finalize_split(split: dict[str, Any]) -> dict[str, Any]:
+    total = int(split["total"])
+    sl_count = int(split["initial_sl_count"]) + int(split["protected_sl_count"])
+    net = float(split["net_pnl_pct"])
+    gross = float(split["gross_pnl_pct"])
+    loss = float(split["gross_loss_pct"])
+    profit_factor = 999.0 if loss == 0 and split["gross_profit_pct"] > 0 else (split["gross_profit_pct"] / loss if loss else 0.0)
+    return {
         "total": total,
-        "wr": round(tp_count / total * 100, 1) if total else 0.0,
-        "expectancy": round((gross_tp - gross_sl) / total, 2) if total else 0.0,
-        "profit_factor": round(gross_tp / gross_sl, 2) if gross_sl > 0 else (999 if gross_tp > 0 else 0),
-        "pnl_pct": round((gross_tp - gross_sl) * leverage, 1),
-        "rr_ratio": round(tp_pct / sl_pct, 1) if sl_pct > 0 else 0,
-        "slice_split": _split_counts(outcomes, "sample_role"),
-        "side_split": _split_counts(outcomes, "direction"),
+        "tp_count": int(split["tp_count"]),
+        "initial_sl_count": int(split["initial_sl_count"]),
+        "protected_sl_count": int(split["protected_sl_count"]),
+        "time_exit_count": int(split["time_exit_count"]),
+        "sl_count": sl_count,
+        "neither": int(split["time_exit_count"]),
+        "wr": round(split["wins"] / total * 100, 4) if total else 0.0,
+        "expectancy": round(net / total, 4) if total else 0.0,
+        "gross_pnl_pct": round(gross, 4),
+        "net_pnl_pct": round(net, 4),
+        "pnl_pct": round(net, 4),
+        "fees_pct": round(float(split["fees_pct"]), 4),
+        "profit_factor": round(profit_factor, 4),
     }
 
 
-def _split_counts(outcomes: list[dict[str, Any]], key: str) -> dict[str, dict[str, int]]:
-    split: dict[str, dict[str, int]] = {}
-    for row in outcomes:
-        bucket = str(row.get(key) or "unknown")
-        current = split.setdefault(bucket, {"tp_count": 0, "sl_count": 0, "neither": 0, "total": 0})
-        current["total"] += 1
-        if row["outcome"] == "TP":
-            current["tp_count"] += 1
-        elif row["outcome"] == "SL":
-            current["sl_count"] += 1
-        else:
-            current["neither"] += 1
-    return split
-
-
-def _build_stage4_candidates(*, session: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "schema_version": "0.1",
-        "artifact_role": "stage4_candidates",
-        "source_stage": "stage3_conditional_execution_setup",
-        "session_id": session["session_id"],
-        "strategy_id": session.get("strategy_id"),
-        "asset": session.get("asset"),
-        "candidates": [
-            {
-                "candidate_id": f"market_tp_{row['tp']:.1f}_sl_{row['sl']:.1f}".replace(".", "p"),
-                "setup": {
-                    "entry_model": "market",
-                    "tp_pct": row["tp"],
-                    "sl_pct": row["sl"],
-                    "timeout_policy": "close_at_cutoff",
-                },
-                "stage3_metrics": {
-                    "wr": row["wr"],
-                    "expectancy": row["expectancy"],
-                    "profit_factor": row["profit_factor"],
-                    "pnl_pct": row["pnl_pct"],
-                    "tp_count": row["tp_count"],
-                    "sl_count": row["sl_count"],
-                    "neither": row["neither"],
-                },
-            }
-            for row in candidates
-        ],
-    }
-
-
-def _render_summary(artifact: dict[str, Any]) -> str:
-    lines = [
-        "# Stage 3 Grid Search",
-        "",
-        f"Session: `{artifact['session_id']}`",
-        f"Signals: {artifact['total_signals']}",
-        f"Leverage: {artifact['leverage']}x",
-        f"Tiebreaker: {artifact['tiebreaker']}",
-        "",
-        "| TP | SL | WR | TP | SL | Neither | Expectancy | PF | PnL |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in artifact["optimal"]["top_5"]:
-        lines.append(
-            f"| {row['tp']:.1f}% | {row['sl']:.1f}% | {row['wr']:.1f}% | {row['tp_count']} | "
-            f"{row['sl_count']} | {row['neither']} | {row['expectancy']:.2f}% | "
-            f"{row['profit_factor']:.2f} | {row['pnl_pct']:.1f}% |"
+def _local_variant_configs(
+    *,
+    stage2_policy: dict[str, Any],
+    stage0_initial_sl_pct: float,
+    tp_levels: list[float],
+    hard_exit_hours: int,
+) -> list[dict[str, Any]]:
+    policy = stage2_policy["policy"]
+    lock_values = _adjacent_values(tp_levels, float(policy["lock_profit_pct"]))
+    protect_values = _adjacent_values(tp_levels, float(policy["protect_trigger_pct"]))
+    trail_values = _adjacent_values(tp_levels, float(policy["trail_sl_pct"]))
+    exact_protected_key = (
+        round(float(policy["lock_profit_pct"]), 10),
+        round(float(policy["protect_trigger_pct"]), 10),
+        round(float(policy["trail_sl_pct"]), 10),
+        1.0,
+    )
+    exact_fixed_key = (round(float(policy["lock_profit_pct"]), 10), 1.0)
+    configs = []
+    seen = set()
+    for final_tp, multiplier in itertools.product(lock_values, DEFAULT_SL_MULTIPLIERS):
+        key = ("fixed", round(final_tp, 10), multiplier)
+        if (round(final_tp, 10), multiplier) == exact_fixed_key or key in seen:
+            continue
+        seen.add(key)
+        initial_sl = round(stage0_initial_sl_pct * multiplier, 4)
+        configs.append(
+            _policy_config(
+                config_id=f"fixed_variant_tp_{_id_pct(final_tp)}_sl_{_id_pct(initial_sl)}",
+                stage3_step="fixed_sl_variant",
+                protection_enabled=False,
+                final_tp_pct=final_tp,
+                protect_trigger_pct=None,
+                trail_sl_pct=None,
+                initial_sl_pct=initial_sl,
+                initial_sl_multiplier=multiplier,
+                hard_exit_hours=hard_exit_hours,
+            )
         )
-    lines.append("")
-    lines.append("Stage 4 must test these shortlisted setups on the full frozen Stage 1 decision set.")
-    lines.append("")
-    return "\n".join(lines)
+    for final_tp, protect, trail, multiplier in itertools.product(lock_values, protect_values, trail_values, DEFAULT_SL_MULTIPLIERS):
+        if trail > protect:
+            continue
+        key = ("protected", round(final_tp, 10), round(protect, 10), round(trail, 10), multiplier)
+        if key[1:] == exact_protected_key or key in seen:
+            continue
+        seen.add(key)
+        initial_sl = round(stage0_initial_sl_pct * multiplier, 4)
+        configs.append(
+            _policy_config(
+                config_id=f"variant_tp_{_id_pct(final_tp)}_sl_{_id_pct(initial_sl)}_protect_{_id_pct(protect)}_trail_{_id_pct(trail)}",
+                stage3_step="local_variant",
+                protection_enabled=True,
+                final_tp_pct=final_tp,
+                protect_trigger_pct=protect,
+                trail_sl_pct=trail,
+                initial_sl_pct=initial_sl,
+                initial_sl_multiplier=multiplier,
+                hard_exit_hours=hard_exit_hours,
+            )
+        )
+    return configs
+
+
+def _policy_config(
+    *,
+    config_id: str,
+    stage3_step: str,
+    protection_enabled: bool,
+    final_tp_pct: float,
+    protect_trigger_pct: float | None,
+    trail_sl_pct: float | None,
+    initial_sl_pct: float,
+    initial_sl_multiplier: float,
+    hard_exit_hours: int,
+) -> dict[str, Any]:
+    return {
+        "config_id": config_id,
+        "stage3_step": stage3_step,
+        "protection_enabled": protection_enabled,
+        "final_tp_pct": round(final_tp_pct, 4),
+        "lock_profit_pct": round(final_tp_pct, 4),
+        "protect_trigger_pct": round(protect_trigger_pct, 4) if protect_trigger_pct is not None else None,
+        "trail_sl_pct": round(trail_sl_pct, 4) if trail_sl_pct is not None else None,
+        "initial_sl_pct": round(initial_sl_pct, 4),
+        "initial_sl_multiplier": initial_sl_multiplier,
+        "hard_exit_hours": hard_exit_hours,
+    }
 
 
 def _load_trade_inputs(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
-        raise ValueError(f"Stage 3 requires Stage 2 per-signal artifact: {path}")
-    rows = json.loads(path.read_text())
-    return [
-        {
-            "signal_id": str(row["signal_id"]),
-            "sample_role": str(row.get("sample_role") or "full_cycle"),
-            "direction": _direction(row),
-            "signal_ts": row["signal_ts"],
-            "reference_price": float(row["reference_price"]),
+        raise ValueError(f"Stage 3 requires all-trade input artifact: {path}")
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, list):
+        raise ValueError("Stage 3 all-trade input artifact must be a JSON list.")
+    trades = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        direction = str(item.get("decision_direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            raise ValueError("Stage 3 requires an all-trade input artifact with decision_direction for every row.")
+        if item.get("reference_price") is None or item.get("signal_ts") is None or item.get("signal_id") is None:
+            raise ValueError("Stage 3 all-trade input rows require signal_id, signal_ts, and reference_price.")
+        trades.append(
+            {
+                **item,
+                "direction": direction,
+                "decision_direction": direction,
+                "agreement": str(item.get("agreement") or "UNKNOWN").upper(),
+            }
+        )
+    return trades
+
+
+def _load_stage2_exit_policy(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise ValueError("Stage 3 requires a promoted Stage 2 exit policy at promotion/stage2_exit_policy.json.")
+    payload = json.loads(path.read_text())
+    policy = payload.get("policy") if isinstance(payload, dict) else None
+    if not isinstance(policy, dict):
+        raise ValueError("Stage 2 exit policy artifact is missing policy values.")
+    for key in ("lock_profit_pct", "protect_trigger_pct", "trail_sl_pct"):
+        if policy.get(key) is None:
+            raise ValueError(f"Stage 2 exit policy is missing {key}.")
+    return payload
+
+
+def _load_stage0_risk_policy(*, workspace_root: Path, session: dict[str, Any]) -> dict[str, float | int]:
+    root_value = session.get("stage0_artifact_root") or (session.get("manifest") or {}).get("stage0_artifact_root")
+    if not root_value:
+        raise ValueError("Stage 3 requires Stage 0 artifact root to read risk policy.")
+    stage0_root = Path(str(root_value))
+    if not stage0_root.is_absolute():
+        stage0_root = workspace_root / stage0_root
+    summary_path = stage0_root / "scores" / "ground_truth_summary.json"
+    if not summary_path.is_file():
+        raise ValueError(f"Stage 0 ground truth summary not found: {summary_path}")
+    summary = json.loads(summary_path.read_text())
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else summary
+    threshold = metrics.get("significance_threshold_pct")
+    forward_hours = metrics.get("forward_hours")
+    if threshold is None or forward_hours is None:
+        raise ValueError("Stage 0 ground truth summary must include significance_threshold_pct and forward_hours.")
+    return {
+        "initial_sl_pct": float(threshold),
+        "hard_exit_hours": int(forward_hours),
+    }
+
+
+def _load_stage2_tp_levels(path: Path) -> list[float]:
+    if not path.is_file():
+        raise ValueError(f"Stage 2 capture curve artifact not found: {path}")
+    payload = json.loads(path.read_text())
+    values = payload.get("tp_levels")
+    if not isinstance(values, list) or not values:
+        values = list((payload.get("results") or {}).keys())
+    levels = sorted({round(float(value), 4) for value in values})
+    return levels
+
+
+def _adjacent_values(levels: list[float], selected: float) -> list[float]:
+    ordered = sorted({round(float(level), 4) for level in levels})
+    selected = round(float(selected), 4)
+    if selected not in ordered:
+        ordered.append(selected)
+        ordered.sort()
+    index = ordered.index(selected)
+    values = [selected]
+    if index > 0:
+        values.append(ordered[index - 1])
+    if index < len(ordered) - 1:
+        values.append(ordered[index + 1])
+    return sorted(values)
+
+
+def _stage3c_value_ranges(local_results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "final_tp_pct": sorted({row["final_tp_pct"] for row in local_results}),
+        "protect_trigger_pct": sorted({row["protect_trigger_pct"] for row in local_results if row.get("protect_trigger_pct") is not None}),
+        "trail_sl_pct": sorted({row["trail_sl_pct"] for row in local_results if row.get("trail_sl_pct") is not None}),
+        "initial_sl_pct": sorted({row["initial_sl_pct"] for row in local_results}),
+        "initial_sl_multipliers": sorted({row["initial_sl_multiplier"] for row in local_results}),
+    }
+
+
+def _build_stage4_candidates(
+    *,
+    session: dict[str, Any],
+    records: list[dict[str, Any]],
+    stage2_policy: dict[str, Any],
+    stage0_risk_policy: dict[str, Any],
+) -> dict[str, Any]:
+    candidates = []
+    for row in records:
+        candidate_id = _candidate_id(row)
+        setup = {
+            "entry_model": "market",
+            "tp_pct": row["final_tp_pct"],
+            "sl_pct": row["initial_sl_pct"],
+            "final_tp_pct": row["final_tp_pct"],
+            "lock_profit_pct": row["lock_profit_pct"],
+            "initial_sl_pct": row["initial_sl_pct"],
+            "initial_sl_multiplier": row["initial_sl_multiplier"],
+            "protection_enabled": bool(row["protection_enabled"]),
+            "hard_exit_hours": row["hard_exit_hours"],
+            "max_hold_hours": row["hard_exit_hours"],
+            "timeout_policy": "close_at_cutoff",
+            "exit_policy_type": "numerical_stage2_policy",
         }
-        for row in rows
+        if row["protection_enabled"]:
+            setup["protect_trigger_pct"] = row["protect_trigger_pct"]
+            setup["trail_sl_pct"] = row["trail_sl_pct"]
+        candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "setup": setup,
+                "stage3_metrics": {
+                    "stage3_mode": row["stage3_mode"],
+                    "stage3_step": row["stage3_step"],
+                    "wr": row["wr"],
+                    "profit_factor": row["profit_factor"],
+                    "gross_pnl_pct": row["gross_pnl_pct"],
+                    "net_pnl_pct": row["net_pnl_pct"],
+                    "fees_pct": row["fees_pct"],
+                    "protection_enabled": bool(row["protection_enabled"]),
+                    "tp_count": row["tp_count"],
+                    "initial_sl_count": row["initial_sl_count"],
+                    "protected_sl_count": row["protected_sl_count"],
+                    "time_exit_count": row["time_exit_count"],
+                },
+            }
+        )
+    return {
+        "schema_version": "0.2",
+        "artifact_role": "stage4_candidates",
+        "source_stage": "stage3_conditional_execution_setup",
+        "stage3_mode": "numerical_exit_policy",
+        "session_id": session["session_id"],
+        "strategy_id": session.get("strategy_id"),
+        "asset": session.get("asset"),
+        "stage2_exit_policy": stage2_policy,
+        "stage0_risk_policy": stage0_risk_policy,
+        "candidates": candidates,
+    }
+
+
+def _clear_stage3_downstream_artifacts(promotion_root: Path) -> None:
+    for artifact in [
+        "stage3_pyramid_results.json",
+        "stage3_pyramid_optimal.json",
+        "stage3_pyramid_summary.md",
+        "stage4_realized_expectancy.json",
+        "stage4_trade_ledger.json",
+        "stage4_optimal.json",
+        "stage4_summary.md",
+    ]:
+        (promotion_root / artifact).unlink(missing_ok=True)
+    shutil.rmtree(promotion_root / "stage4_runs", ignore_errors=True)
+
+
+def _clear_stage3_completion_artifacts(promotion_root: Path) -> None:
+    for artifact in [
+        "stage3_optimal.json",
+        "stage4_candidates.json",
+        "stage3_summary.md",
+    ]:
+        (promotion_root / artifact).unlink(missing_ok=True)
+    _clear_stage3_downstream_artifacts(promotion_root)
+
+
+def _load_stage3_grid_artifact(promotion_root: Path) -> dict[str, Any]:
+    path = promotion_root / "stage3_grid_results.json"
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text())
+    return payload if isinstance(payload, dict) else {}
+
+
+def _render_summary(artifact: dict[str, Any]) -> str:
+    best = artifact["optimal"]["best"]
+    fixed = artifact["fixed_sl_baseline_result"]
+    exact = artifact["exact_protection_result"]
+    lines = [
+        "# Stage 3 Numerical Exit Policy",
+        "",
+        f"Session: `{artifact['session_id']}`",
+        f"Executable decisions: {artifact['total_executable_decisions']}",
+        f"Initial SL from Stage 0: {artifact['stage0_risk_policy']['initial_sl_pct']:.2f}%",
+        f"Hard exit: {artifact['stage0_risk_policy']['hard_exit_hours']}h",
+        "",
+        "## 3A Fixed SL Baseline",
+        "",
+        f"TP / initial SL: {fixed['final_tp_pct']:.2f}% / {fixed['initial_sl_pct']:.2f}%",
+        f"TP / initial SL / time: {fixed['tp_count']} / {fixed['initial_sl_count']} / {fixed['time_exit_count']}",
+        f"Net PnL: {fixed['net_pnl_pct']:.4f}%",
+        "",
+        "## 3B Exact Protection Policy",
+        "",
+        f"TP / initial SL / protected SL: {exact['final_tp_pct']:.2f}% / {exact['initial_sl_pct']:.2f}% / {exact['trail_sl_pct']:.2f}%",
+        f"TP / initial SL / protected SL / time: {exact['tp_count']} / {exact['initial_sl_count']} / {exact['protected_sl_count']} / {exact['time_exit_count']}",
+        f"Net PnL: {exact['net_pnl_pct']:.4f}%",
+        "",
+        "## 3C Local Variants",
+        "",
+        f"Combinations tested: {artifact['stage3c_total_combinations_tested']}",
+        f"Best config: `{best.get('config_id')}`",
+        f"Best net PnL: {best.get('net_pnl_pct', 0):.4f}%",
+        "",
+        "| Config | TP | Initial SL | Protect | Trail SL | Net PnL | WR | PF |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    for row in artifact["optimal"]["top_5"]:
+        protect = f"{row['protect_trigger_pct']:.2f}%" if row.get("protect_trigger_pct") is not None else "off"
+        trail = f"{row['trail_sl_pct']:.2f}%" if row.get("trail_sl_pct") is not None else "off"
+        lines.append(
+            f"| `{row['config_id']}` | {row['final_tp_pct']:.2f}% | {row['initial_sl_pct']:.2f}% | "
+            f"{protect} | {trail} | {row['net_pnl_pct']:.4f}% | "
+            f"{row['wr']:.2f}% | {row['profit_factor']:.2f} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
-def _direction(row: dict[str, Any]) -> str:
-    direction = row.get("direction") or row.get("natural_direction")
-    if direction not in {"LONG", "SHORT"}:
-        raise ValueError(f"Stage 3 requires LONG/SHORT directions, got {direction!r}.")
-    return str(direction)
+def _ranking_key(row: dict[str, Any]) -> tuple[float, float, float, int]:
+    return (
+        float(row.get("net_pnl_pct", 0.0)),
+        float(row.get("profit_factor", 0.0)),
+        float(row.get("wr", 0.0)),
+        -int(row.get("initial_sl_count", 0)),
+    )
+
+
+def _target_price(entry: float, *, pct: float, direction: str) -> float:
+    return entry * (1 + pct / 100) if direction == "LONG" else entry * (1 - pct / 100)
+
+
+def _stop_price(entry: float, *, pct: float, direction: str) -> float:
+    return entry * (1 - pct / 100) if direction == "LONG" else entry * (1 + pct / 100)
+
+
+def _protected_stop_price(entry: float, *, pct: float, direction: str) -> float:
+    return entry * (1 + pct / 100) if direction == "LONG" else entry * (1 - pct / 100)
+
+
+def _tp_sl_hit(candle: dict[str, Any], *, tp: float, sl: float, direction: str) -> tuple[bool, bool]:
+    if direction == "LONG":
+        return candle["high"] >= tp, candle["low"] <= sl
+    return candle["low"] <= tp, candle["high"] >= sl
+
+
+def _price_hit(candle: dict[str, Any], price: float, *, direction: str) -> bool:
+    return candle["high"] >= price if direction == "LONG" else candle["low"] <= price
+
+
+def _body_favors_direction(body: float, *, direction: str) -> bool:
+    return body >= 0 if direction == "LONG" else body <= 0
+
+
+def _pnl_pct(entry: float, exit_price: float, *, direction: str) -> float:
+    if direction == "LONG":
+        return (exit_price - entry) / entry * 100
+    return (entry - exit_price) / entry * 100
+
+
+def _id_pct(value: float) -> str:
+    return f"{value:.4f}".rstrip("0").rstrip(".").replace(".", "p")
+
+
+def _candidate_id(row: dict[str, Any]) -> str:
+    base = f"numeric_{row['stage3_step']}_tp_{_id_pct(row['final_tp_pct'])}_sl_{_id_pct(row['initial_sl_pct'])}"
+    if not row.get("protection_enabled"):
+        return f"{base}_fixed"
+    return f"{base}_protect_{_id_pct(row['protect_trigger_pct'])}_trail_{_id_pct(row['trail_sl_pct'])}"
 
 
 def _session_artifact_root(*, workspace_root: Path, session: dict[str, Any]) -> Path:
@@ -307,11 +956,15 @@ def _coerce_candle(candle: Any) -> dict[str, Any]:
         }
     return {
         "timestamp": _coerce_datetime(candle.timestamp),
-        "open": float(candle.open if not isinstance(candle.open, Decimal) else str(candle.open)),
-        "high": float(candle.high if not isinstance(candle.high, Decimal) else str(candle.high)),
-        "low": float(candle.low if not isinstance(candle.low, Decimal) else str(candle.low)),
-        "close": float(candle.close if not isinstance(candle.close, Decimal) else str(candle.close)),
+        "open": _coerce_number(candle.open),
+        "high": _coerce_number(candle.high),
+        "low": _coerce_number(candle.low),
+        "close": _coerce_number(candle.close),
     }
+
+
+def _coerce_number(value: Any) -> float:
+    return float(str(value)) if isinstance(value, Decimal) else float(value)
 
 
 def _coerce_datetime(value: str | datetime | None) -> datetime:

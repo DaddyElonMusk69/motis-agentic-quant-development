@@ -11,7 +11,7 @@ from quant_terminal_worker.stage3.grid_search import DEFAULT_FORWARD_HOURS, DEFA
 
 
 DEFAULT_FEES_BPS_PER_SIDE = 5.0
-DEFAULT_SLIPPAGE_BPS_PER_SIDE = 3.0
+DEFAULT_SLIPPAGE_BPS_PER_SIDE = 0.0
 
 
 def run_stage4_realized_expectancy(
@@ -20,9 +20,18 @@ def run_stage4_realized_expectancy(
     session: dict[str, Any],
     signal_rows: list[dict[str, Any]],
     candles: list[Any],
+    initial_capital_usdt: float = 10_000.0,
+    margin_allocation_pct: float = 30.0,
+    leverage: float = DEFAULT_LEVERAGE,
     fees_bps_per_side: float = DEFAULT_FEES_BPS_PER_SIDE,
     slippage_bps_per_side: float = DEFAULT_SLIPPAGE_BPS_PER_SIDE,
 ) -> dict[str, Any]:
+    if initial_capital_usdt <= 0:
+        raise ValueError("initial_capital_usdt must be greater than zero")
+    if margin_allocation_pct <= 0 or margin_allocation_pct > 100:
+        raise ValueError("margin_allocation_pct must be between 0 and 100")
+    if leverage <= 0:
+        raise ValueError("leverage must be greater than zero")
     artifact_root = _session_artifact_root(workspace_root=workspace_root, session=session)
     promotion_root = artifact_root / "promotion"
     stage1_scores_path = promotion_root / "stage1a_canonical_full_cycle_scores.json"
@@ -48,6 +57,9 @@ def run_stage4_realized_expectancy(
             records=records,
             signals_by_id=signals_by_id,
             candles=candle_rows,
+            initial_capital_usdt=initial_capital_usdt,
+            margin_allocation_pct=margin_allocation_pct,
+            leverage=leverage,
             fees_bps_per_side=fees_bps_per_side,
             slippage_bps_per_side=slippage_bps_per_side,
             slice_windows=slice_windows,
@@ -61,11 +73,14 @@ def run_stage4_realized_expectancy(
             }
         )
     best = _choose_best_candidate(results)
-    created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    created_at_dt = datetime.now(UTC)
+    created_at = created_at_dt.isoformat().replace("+00:00", "Z")
+    run_id = _stage4_run_id(created_at_dt, promotion_root)
     ledger = {
         "schema_version": "0.1",
         "stage": "stage4_trade_ledger",
         "created_at": created_at,
+        "run_id": run_id,
         "session_id": session["session_id"],
         "candidates": ledger_candidates,
     }
@@ -74,6 +89,7 @@ def run_stage4_realized_expectancy(
         "stage": "stage4_realized_expectancy",
         "artifact_role": "stage4_realized_expectancy",
         "created_at": created_at,
+        "run_id": run_id,
         "session_id": session["session_id"],
         "asset": session.get("asset"),
         "strategy_id": session.get("strategy_id"),
@@ -83,8 +99,15 @@ def run_stage4_realized_expectancy(
         "stage1_scores_path": str(stage1_scores_path),
         "candidates_path": str(candidates_path),
         "cost_assumptions": {
+            "fee_source": "okx_usdt_margin_swap_level_1_default",
+            "fee_side": "taker",
             "fees_bps_per_side": fees_bps_per_side,
             "slippage_bps_per_side": slippage_bps_per_side,
+        },
+        "simulation_inputs": {
+            "initial_capital_usdt": initial_capital_usdt,
+            "margin_allocation_pct": margin_allocation_pct,
+            "leverage": leverage,
         },
         "slice_windows": [
             {"name": name, "start": start.isoformat().replace("+00:00", "Z"), "end": end.isoformat().replace("+00:00", "Z")}
@@ -96,16 +119,50 @@ def run_stage4_realized_expectancy(
         "ledger": ledger,
     }
     promotion_root.mkdir(parents=True, exist_ok=True)
+    run_root = promotion_root / "stage4_runs" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    run_realized_path = run_root / "stage4_realized_expectancy.json"
+    run_ledger_path = run_root / "stage4_trade_ledger.json"
+    run_optimal_path = run_root / "stage4_optimal.json"
+    run_summary_path = run_root / "stage4_summary.md"
+    payload["source_run_path"] = str(run_realized_path)
+    optimal_payload = {"criterion": "max_net_expectancy", "run_id": run_id, "best": best}
+    summary = _render_summary(payload)
+    run_realized_path.write_text(json.dumps(payload, indent=2) + "\n")
+    run_ledger_path.write_text(json.dumps(ledger, indent=2) + "\n")
+    run_optimal_path.write_text(json.dumps(optimal_payload, indent=2) + "\n")
+    run_summary_path.write_text(summary)
+
     realized_path = promotion_root / "stage4_realized_expectancy.json"
     ledger_path = promotion_root / "stage4_trade_ledger.json"
     optimal_path = promotion_root / "stage4_optimal.json"
     summary_path = promotion_root / "stage4_summary.md"
     realized_path.write_text(json.dumps(payload, indent=2) + "\n")
     ledger_path.write_text(json.dumps(ledger, indent=2) + "\n")
-    optimal_path.write_text(json.dumps({"criterion": "max_net_expectancy", "best": best}, indent=2) + "\n")
-    summary_path.write_text(_render_summary(payload))
+    optimal_path.write_text(json.dumps(optimal_payload, indent=2) + "\n")
+    summary_path.write_text(summary)
+    _update_stage4_runs_index(
+        promotion_root=promotion_root,
+        run={
+            "run_id": run_id,
+            "created_at": created_at,
+            "simulation_inputs": payload["simulation_inputs"],
+            "best_candidate_id": payload["best_candidate_id"],
+            "best_candidate": best,
+            "account": best.get("account", {}),
+            "realized_expectancy_path": str(run_realized_path),
+            "trade_ledger_path": str(run_ledger_path),
+            "optimal_path": str(run_optimal_path),
+            "summary_path": str(run_summary_path),
+        },
+    )
     return {
         **payload,
+        "run_root": str(run_root),
+        "run_realized_expectancy_path": str(run_realized_path),
+        "run_trade_ledger_path": str(run_ledger_path),
+        "run_optimal_path": str(run_optimal_path),
+        "run_summary_path": str(run_summary_path),
         "realized_expectancy_path": str(realized_path),
         "trade_ledger_path": str(ledger_path),
         "optimal_path": str(optimal_path),
@@ -119,11 +176,15 @@ def _score_candidate(
     records: list[dict[str, Any]],
     signals_by_id: dict[str, dict[str, Any]],
     candles: list[dict[str, Any]],
+    initial_capital_usdt: float,
+    margin_allocation_pct: float,
+    leverage: float,
     fees_bps_per_side: float,
     slippage_bps_per_side: float,
     slice_windows: list[tuple[str, datetime, datetime]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    trades = []
+    candidate = {**candidate, "leverage": float(leverage)}
+    inputs = []
     for record in records:
         signal_id = str(record["signal_id"])
         signal = _find_signal(signals_by_id, signal_id)
@@ -132,19 +193,65 @@ def _score_candidate(
         packet = _packet_from_signal(signal)
         signal_ts = _coerce_datetime(packet.get("timestamp") or signal["timestamp"])
         reference_price = get_reference_price(packet)
-        trades.append(
-            _simulate_candidate_trade(
-                record=record,
-                candidate=candidate,
-                signal_ts=signal_ts,
-                reference_price=reference_price,
-                candles=candles,
-                fees_bps_per_side=fees_bps_per_side,
-                slippage_bps_per_side=slippage_bps_per_side,
-                slice_name=_slice_name(signal_ts, slice_windows),
-            )
+        inputs.append(
+            {
+                "record": record,
+                "signal_id": signal_id,
+                "signal_ts": signal_ts,
+                "reference_price": reference_price,
+                "slice_name": _slice_name(signal_ts, slice_windows),
+                "direction": str(record.get("decision_direction") or record.get("agent_direction") or "").upper(),
+            }
         )
+    inputs.sort(key=lambda item: (item["signal_ts"], item["signal_id"]))
+
+    trades = []
+    equity = float(initial_capital_usdt)
+    index = 0
+    while index < len(inputs):
+        item = inputs[index]
+        if item["direction"] not in {"LONG", "SHORT"}:
+            trades.append(_skipped_decision(item=item, candidate=candidate, reason="no_trade_decision"))
+            index += 1
+            continue
+
+        trade = _simulate_account_position(
+            item=item,
+            candidate=candidate,
+            candles=candles,
+            equity_before=equity,
+            margin_allocation_pct=margin_allocation_pct,
+            leverage=leverage,
+            fees_bps_per_side=fees_bps_per_side,
+            slippage_bps_per_side=slippage_bps_per_side,
+        )
+        trades.append(trade)
+        equity = trade["equity_after"]
+
+        exit_ts = _coerce_datetime(trade["exit_ts"])
+        index += 1
+        while index < len(inputs) and inputs[index]["signal_ts"] <= exit_ts:
+            trades.append(
+                _skipped_decision(
+                    item=inputs[index],
+                    candidate=candidate,
+                    reason="position_open",
+                    active_position_id=trade["position_id"],
+                )
+            )
+            index += 1
+
     summary = _summarize_trades(trades, denominator=len(records))
+    account = _summarize_account(
+        initial_capital_usdt=initial_capital_usdt,
+        ending_equity_usdt=equity,
+        trades=trades,
+    )
+    if records:
+        summary["gross_pnl_pct"] = account["gross_return_pct"]
+        summary["net_pnl_pct"] = account["return_pct"]
+        summary["gross_expectancy_pct"] = round(account["gross_return_pct"] / len(records), 8)
+        summary["net_expectancy_pct"] = round(account["return_pct"] / len(records), 8)
     by_side = {
         side: _summarize_trades([trade for trade in trades if trade["decision_direction"] == side], denominator=len([trade for trade in trades if trade["decision_direction"] == side]))
         for side in ("LONG", "SHORT")
@@ -162,8 +269,10 @@ def _score_candidate(
             "entry_model": candidate["entry_model"],
             "tp_pct": candidate["tp_pct"],
             "sl_pct": candidate["sl_pct"],
-            "leverage": candidate["leverage"],
+            "leverage": leverage,
+            "margin_allocation_pct": margin_allocation_pct,
             "setup": candidate,
+            "account": account,
             **summary,
             "mismatch_cohort": _summarize_trades(mismatch_trades, denominator=len(mismatch_trades)),
             "by_side": by_side,
@@ -171,6 +280,322 @@ def _score_candidate(
         },
         trades,
     )
+
+
+def _stage4_run_id(created_at: datetime, promotion_root: Path) -> str:
+    base = f"stage4-{created_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    run_id = base
+    suffix = 2
+    while (promotion_root / "stage4_runs" / run_id).exists():
+        run_id = f"{base}-{suffix}"
+        suffix += 1
+    return run_id
+
+
+def _update_stage4_runs_index(*, promotion_root: Path, run: dict[str, Any]) -> None:
+    index_path = promotion_root / "stage4_runs" / "index.json"
+    existing = _read_json_if_exists(index_path) or {"schema_version": "0.1", "artifact_role": "stage4_run_index", "runs": []}
+    runs = [item for item in existing.get("runs", []) if item.get("run_id") != run["run_id"]]
+    runs.append(run)
+    index_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "artifact_role": "stage4_run_index",
+                "latest_run_id": run["run_id"],
+                "runs": runs,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def _simulate_account_position(
+    *,
+    item: dict[str, Any],
+    candidate: dict[str, Any],
+    candles: list[dict[str, Any]],
+    equity_before: float,
+    margin_allocation_pct: float,
+    leverage: float,
+    fees_bps_per_side: float,
+    slippage_bps_per_side: float,
+) -> dict[str, Any]:
+    direction = item["direction"]
+    signal_ts = item["signal_ts"]
+    entry_price = float(item["reference_price"])
+    max_legs = int((candidate.get("pyramid") or {}).get("max_legs", 1))
+    max_legs = max(1, max_legs)
+    position_margin_budget = equity_before * margin_allocation_pct / 100
+    per_leg_margin = position_margin_budget / max_legs
+    fee_rate = fees_bps_per_side / 10_000
+    slippage_rate = slippage_bps_per_side / 10_000
+    cutoff = signal_ts + timedelta(hours=candidate["max_hold_hours"])
+    tp_pct = candidate["tp_pct"]
+    sl_pct = candidate["sl_pct"]
+    protection_enabled = bool(candidate.get("protection_enabled", False))
+    protect_trigger_pct = candidate.get("protect_trigger_pct")
+    trail_sl_pct = candidate.get("trail_sl_pct")
+    pyramid = candidate.get("pyramid") or {}
+    step_pct = float(pyramid.get("step_pct", 999))
+    sl_breakeven = bool(pyramid.get("sl_breakeven", False))
+    sl_price = entry_price * (1 - sl_pct / 100) if direction == "LONG" else entry_price * (1 + sl_pct / 100)
+    protected_sl_price = _protected_stop_price(entry_price, pct=float(trail_sl_pct), direction=direction) if protection_enabled and trail_sl_pct is not None else None
+    protect_trigger_price = _target_price(entry_price, tp_pct=float(protect_trigger_pct), direction=direction) if protection_enabled and protect_trigger_pct is not None else None
+    protection_activated = False
+    active_sl_kind = "initial"
+    position_id = f"{candidate['candidate_id']}:{item['signal_id']}"
+    legs = [
+        _open_leg(
+            leg_number=1,
+            entry_price=entry_price,
+            entry_ts=signal_ts,
+            tp_pct=tp_pct,
+            direction=direction,
+            margin_usdt=per_leg_margin,
+            leverage=leverage,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+        )
+    ]
+    active = legs.copy()
+    last_candle = None
+
+    for candle in candles:
+        timestamp = candle["timestamp"]
+        if timestamp <= signal_ts:
+            continue
+        if timestamp > cutoff:
+            break
+        last_candle = candle
+
+        if len(legs) < max_legs:
+            next_entry = _next_entry(legs[-1]["entry_price"], step_pct=step_pct, direction=direction)
+            if _entry_hit(candle, next_entry, direction=direction):
+                leg = _open_leg(
+                    leg_number=len(legs) + 1,
+                    entry_price=next_entry,
+                    entry_ts=timestamp,
+                    tp_pct=tp_pct,
+                    direction=direction,
+                    margin_usdt=per_leg_margin,
+                    leverage=leverage,
+                    fee_rate=fee_rate,
+                    slippage_rate=slippage_rate,
+                )
+                legs.append(leg)
+                active.append(leg)
+                if sl_breakeven:
+                    sl_price = sum(leg_row["entry_price"] for leg_row in legs) / len(legs)
+                    active_sl_kind = "breakeven"
+
+        closed = []
+        for leg in active:
+            tp_hit, sl_hit = _tp_sl_hit(candle, tp=leg["tp_price"], sl=sl_price, direction=direction)
+            if not tp_hit and not sl_hit:
+                continue
+            exit_status = _resolve_dual_hit(candle, direction=direction) if tp_hit and sl_hit else "TP" if tp_hit else "SL"
+            if exit_status == "SL":
+                exit_status = "PROTECTED_SL" if active_sl_kind == "protected" else "INITIAL_SL"
+            exit_price = leg["tp_price"] if exit_status == "TP" else sl_price
+            closed.append((leg, exit_status, exit_price, timestamp))
+
+        for leg, exit_status, exit_price, exit_ts in closed:
+            _close_leg(
+                leg,
+                exit_status=exit_status,
+                exit_price=exit_price,
+                exit_ts=exit_ts,
+                direction=direction,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+            )
+        closed_leg_numbers = {leg["leg"] for leg, _, _, _ in closed}
+        active = [leg for leg in active if leg["leg"] not in closed_leg_numbers]
+        if not active:
+            break
+
+        if (
+            protection_enabled
+            and not protection_activated
+            and protect_trigger_price is not None
+            and protected_sl_price is not None
+            and _entry_hit(candle, protect_trigger_price, direction=direction)
+        ):
+            protection_activated = True
+            sl_price = protected_sl_price
+            active_sl_kind = "protected"
+
+    if active:
+        exit_ts = cutoff if last_candle is None else last_candle["timestamp"]
+        exit_price = entry_price if candidate["timeout_policy"] == "zero" or last_candle is None else last_candle["close"]
+        for leg in active:
+            _close_leg(
+                leg,
+                exit_status="HARD_EXIT",
+                exit_price=exit_price,
+                exit_ts=exit_ts,
+                direction=direction,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+            )
+
+    total_entry_fees = sum(leg["entry_fee_usdt"] for leg in legs)
+    total_exit_fees = sum(leg["exit_fee_usdt"] for leg in legs)
+    total_slippage = sum(leg["entry_slippage_usdt"] + leg["exit_slippage_usdt"] for leg in legs)
+    gross_pnl = sum(leg["gross_pnl_usdt"] for leg in legs)
+    total_cost = total_entry_fees + total_exit_fees + total_slippage
+    net_pnl = gross_pnl - total_cost
+    statuses = {leg["exit_status"] for leg in legs}
+    exit_status = next(iter(statuses)) if len(statuses) == 1 else "MIXED"
+    last_exit = max(legs, key=lambda leg: _coerce_datetime(leg["exit_ts"]))
+    base = _trade_base(item=item, candidate=candidate)
+    return {
+        **base,
+        "position_id": position_id,
+        "entry_status": "FILLED",
+        "exit_status": exit_status,
+        "entry_price": round(entry_price, 8),
+        "exit_price": round(last_exit["exit_price"], 8),
+        "exit_ts": last_exit["exit_ts"],
+        "filled_legs": len(legs),
+        "protection_enabled": protection_enabled,
+        "protection_activated": protection_activated,
+        "active_sl_kind": active_sl_kind,
+        "initial_sl_pct": sl_pct,
+        "protect_trigger_pct": protect_trigger_pct,
+        "trail_sl_pct": trail_sl_pct,
+        "gross_pnl_usdt": _round_money(gross_pnl),
+        "net_pnl_usdt": _round_money(net_pnl),
+        "total_fees_usdt": _round_money(total_entry_fees + total_exit_fees),
+        "total_entry_fees_usdt": _round_money(total_entry_fees),
+        "total_exit_fees_usdt": _round_money(total_exit_fees),
+        "total_slippage_usdt": _round_money(total_slippage),
+        "equity_before": _round_money(equity_before),
+        "equity_after": _round_money(equity_before + net_pnl),
+        "gross_pnl_pct": round(gross_pnl / equity_before * 100, 8) if equity_before else 0.0,
+        "net_pnl_pct": round(net_pnl / equity_before * 100, 8) if equity_before else 0.0,
+        "cost_pct": round(total_cost / equity_before * 100, 8) if equity_before else 0.0,
+        "leg_details": [_format_account_leg(leg) for leg in legs],
+    }
+
+
+def _open_leg(
+    *,
+    leg_number: int,
+    entry_price: float,
+    entry_ts: datetime,
+    tp_pct: float,
+    direction: str,
+    margin_usdt: float,
+    leverage: float,
+    fee_rate: float,
+    slippage_rate: float,
+) -> dict[str, Any]:
+    entry_notional = margin_usdt * leverage
+    quantity = entry_notional / entry_price
+    return {
+        "leg": leg_number,
+        "entry_price": entry_price,
+        "entry_ts": entry_ts.isoformat().replace("+00:00", "Z"),
+        "tp_price": _target_price(entry_price, tp_pct=tp_pct, direction=direction),
+        "margin_usdt": margin_usdt,
+        "entry_notional_usdt": entry_notional,
+        "quantity": quantity,
+        "entry_fee_usdt": entry_notional * fee_rate,
+        "entry_slippage_usdt": entry_notional * slippage_rate,
+    }
+
+
+def _close_leg(
+    leg: dict[str, Any],
+    *,
+    exit_status: str,
+    exit_price: float,
+    exit_ts: datetime,
+    direction: str,
+    fee_rate: float,
+    slippage_rate: float,
+) -> None:
+    exit_notional = leg["quantity"] * exit_price
+    gross_pnl = (exit_price - leg["entry_price"]) * leg["quantity"] if direction == "LONG" else (leg["entry_price"] - exit_price) * leg["quantity"]
+    leg.update(
+        {
+            "exit_status": exit_status,
+            "exit_price": exit_price,
+            "exit_ts": exit_ts.isoformat().replace("+00:00", "Z"),
+            "exit_notional_usdt": exit_notional,
+            "exit_fee_usdt": exit_notional * fee_rate,
+            "exit_slippage_usdt": exit_notional * slippage_rate,
+            "gross_pnl_usdt": gross_pnl,
+            "net_pnl_usdt": gross_pnl - leg["entry_fee_usdt"] - exit_notional * fee_rate - leg["entry_slippage_usdt"] - exit_notional * slippage_rate,
+            "move_pct": _direction_move_pct(direction, leg["entry_price"], exit_price),
+        }
+    )
+
+
+def _trade_base(*, item: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate["candidate_id"],
+        "signal_id": item["signal_id"],
+        "signal_ts": item["signal_ts"].isoformat().replace("+00:00", "Z"),
+        "slice_name": item["slice_name"],
+        "agreement": item["record"].get("agreement"),
+        "decision_direction": item["direction"],
+        "reference_price": round(float(item["reference_price"]), 8),
+    }
+
+
+def _skipped_decision(
+    *,
+    item: dict[str, Any],
+    candidate: dict[str, Any],
+    reason: str,
+    active_position_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        **_trade_base(item=item, candidate=candidate),
+        "position_id": active_position_id,
+        "entry_status": "SKIPPED",
+        "exit_status": "SKIPPED",
+        "skip_reason": reason,
+        "entry_price": None,
+        "exit_price": None,
+        "exit_ts": item["signal_ts"].isoformat().replace("+00:00", "Z"),
+        "filled_legs": 0,
+        "gross_pnl_usdt": 0.0,
+        "net_pnl_usdt": 0.0,
+        "total_fees_usdt": 0.0,
+        "total_entry_fees_usdt": 0.0,
+        "total_exit_fees_usdt": 0.0,
+        "total_slippage_usdt": 0.0,
+        "gross_pnl_pct": 0.0,
+        "net_pnl_pct": 0.0,
+        "cost_pct": 0.0,
+        "leg_details": [],
+    }
+
+
+def _summarize_account(*, initial_capital_usdt: float, ending_equity_usdt: float, trades: list[dict[str, Any]]) -> dict[str, Any]:
+    gross_pnl = sum(trade.get("gross_pnl_usdt", 0.0) for trade in trades)
+    total_entry_fees = sum(trade.get("total_entry_fees_usdt", 0.0) for trade in trades)
+    total_exit_fees = sum(trade.get("total_exit_fees_usdt", 0.0) for trade in trades)
+    total_slippage = sum(trade.get("total_slippage_usdt", 0.0) for trade in trades)
+    total_fees = total_entry_fees + total_exit_fees
+    net_pnl = ending_equity_usdt - initial_capital_usdt
+    return {
+        "initial_capital_usdt": _round_money(initial_capital_usdt),
+        "ending_equity_usdt": _round_money(ending_equity_usdt),
+        "gross_pnl_usdt": _round_money(gross_pnl),
+        "net_pnl_usdt": _round_money(net_pnl),
+        "total_fees_usdt": _round_money(total_fees),
+        "total_entry_fees_usdt": _round_money(total_entry_fees),
+        "total_exit_fees_usdt": _round_money(total_exit_fees),
+        "total_slippage_usdt": _round_money(total_slippage),
+        "return_pct": round(net_pnl / initial_capital_usdt * 100, 8) if initial_capital_usdt else 0.0,
+        "gross_return_pct": round(gross_pnl / initial_capital_usdt * 100, 8) if initial_capital_usdt else 0.0,
+    }
 
 
 def _simulate_candidate_trade(
@@ -363,11 +788,15 @@ def _summarize_trades(trades: list[dict[str, Any]], *, denominator: int) -> dict
         "total_decisions": denominator,
         "executed_trades": len(executed),
         "tp_hits": sum(1 for trade in trades if trade["exit_status"] == "TP"),
-        "sl_hits": sum(1 for trade in trades if trade["exit_status"] == "SL"),
+        "sl_hits": sum(1 for trade in trades if trade["exit_status"] in {"SL", "INITIAL_SL", "PROTECTED_SL"}),
+        "initial_sl_hits": sum(1 for trade in trades if trade["exit_status"] in {"SL", "INITIAL_SL"}),
+        "protected_sl_hits": sum(1 for trade in trades if trade["exit_status"] == "PROTECTED_SL"),
         "no_hit": sum(1 for trade in trades if trade["exit_status"] == "TIMEOUT"),
+        "hard_exits": sum(1 for trade in trades if trade["exit_status"] == "HARD_EXIT"),
         "mixed_exit": sum(1 for trade in trades if trade["exit_status"] == "MIXED"),
         "unfilled": sum(1 for trade in trades if trade["entry_status"] == "UNFILLED"),
         "skipped_decisions": sum(1 for trade in trades if trade["entry_status"] == "SKIPPED"),
+        "skipped_position_open": sum(1 for trade in trades if trade.get("skip_reason") == "position_open"),
         "profitable_trades": len(positive),
         "losing_trades": len(negative),
         "flat_trades": sum(1 for trade in executed if trade["net_pnl_pct"] == 0),
@@ -387,12 +816,20 @@ def _normalize_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
         candidate = {
             "candidate_id": row["candidate_id"],
             "entry_model": setup.get("entry_model", setup.get("entry_type", "market")),
-            "tp_pct": float(setup["tp_pct"]),
-            "sl_pct": float(setup["sl_pct"]),
+            "tp_pct": float(setup.get("final_tp_pct", setup["tp_pct"])),
+            "sl_pct": float(setup.get("initial_sl_pct", setup["sl_pct"])),
+            "final_tp_pct": float(setup.get("final_tp_pct", setup["tp_pct"])),
+            "initial_sl_pct": float(setup.get("initial_sl_pct", setup["sl_pct"])),
+            "protection_enabled": bool(setup.get("protection_enabled", False)),
             "timeout_policy": setup.get("timeout_policy", "close_at_cutoff"),
             "max_hold_hours": float(setup.get("max_hold_hours", DEFAULT_FORWARD_HOURS)),
             "leverage": float(setup.get("leverage", DEFAULT_LEVERAGE)),
         }
+        if candidate["protection_enabled"]:
+            if setup.get("protect_trigger_pct") is None or setup.get("trail_sl_pct") is None:
+                raise ValueError("Protected Stage 4 candidates require protect_trigger_pct and trail_sl_pct.")
+            candidate["protect_trigger_pct"] = float(setup["protect_trigger_pct"])
+            candidate["trail_sl_pct"] = float(setup["trail_sl_pct"])
         if setup.get("pyramid_step_pct") is not None:
             candidate["pyramid"] = {
                 "step_pct": float(setup["pyramid_step_pct"]),
@@ -409,15 +846,20 @@ def _choose_best_candidate(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def _render_summary(payload: dict[str, Any]) -> str:
     best = payload["best_candidate"]
+    account = best.get("account") or {}
     return "\n".join(
         [
             "# Stage 4 Realized Expectancy",
             "",
+            "Mode: `sequential_account_backtest`",
             f"Best candidate: `{best['candidate_id']}`",
             f"Net expectancy: `{best['net_expectancy_pct']:.4f}%` per decision",
             f"Gross expectancy: `{best['gross_expectancy_pct']:.4f}%` per decision",
+            f"Ending equity: `${account.get('ending_equity_usdt', 0):.4f}`",
+            f"Net PnL: `${account.get('net_pnl_usdt', 0):.4f}`",
+            f"Total OKX taker fees: `${account.get('total_fees_usdt', 0):.4f}`",
             f"Executed trades: `{best['executed_trades']}` / `{best['total_decisions']}` decisions",
-            f"TP / SL / TIMEOUT / UNFILLED / SKIPPED: `{best['tp_hits']}` / `{best['sl_hits']}` / `{best['no_hit']}` / `{best['unfilled']}` / `{best['skipped_decisions']}`",
+            f"TP / SL / HARD_EXIT / UNFILLED / SKIPPED: `{best['tp_hits']}` / `{best['sl_hits']}` / `{best.get('hard_exits', 0)}` / `{best['unfilled']}` / `{best['skipped_decisions']}`",
             f"Profit factor: `{best['profit_factor']:.4f}`",
             "",
         ]
@@ -477,6 +919,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
 def _coerce_candle(candle: Any) -> dict[str, Any]:
     if isinstance(candle, dict):
         return {
@@ -506,6 +952,10 @@ def _coerce_datetime(value: str | datetime | None) -> datetime:
 
 def _target_price(entry: float, *, tp_pct: float, direction: str) -> float:
     return entry * (1 + tp_pct / 100) if direction == "LONG" else entry * (1 - tp_pct / 100)
+
+
+def _protected_stop_price(entry: float, *, pct: float, direction: str) -> float:
+    return entry * (1 + pct / 100) if direction == "LONG" else entry * (1 - pct / 100)
 
 
 def _next_entry(entry: float, *, step_pct: float, direction: str) -> float:
@@ -543,3 +993,28 @@ def _format_leg_detail(leg: dict[str, Any]) -> dict[str, Any]:
         "exit_status": leg["exit_status"],
         "move_pct": round(leg["move_pct"], 8),
     }
+
+
+def _format_account_leg(leg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "leg": leg["leg"],
+        "entry_ts": leg["entry_ts"],
+        "exit_ts": leg["exit_ts"],
+        "entry_price": round(leg["entry_price"], 8),
+        "exit_price": round(leg["exit_price"], 8),
+        "tp_price": round(leg["tp_price"], 8),
+        "exit_status": leg["exit_status"],
+        "margin_usdt": _round_money(leg["margin_usdt"]),
+        "entry_notional_usdt": _round_money(leg["entry_notional_usdt"]),
+        "exit_notional_usdt": _round_money(leg["exit_notional_usdt"]),
+        "quantity": round(leg["quantity"], 10),
+        "entry_fee_usdt": _round_money(leg["entry_fee_usdt"]),
+        "exit_fee_usdt": _round_money(leg["exit_fee_usdt"]),
+        "gross_pnl_usdt": _round_money(leg["gross_pnl_usdt"]),
+        "net_pnl_usdt": _round_money(leg["net_pnl_usdt"]),
+        "move_pct": round(leg["move_pct"], 8),
+    }
+
+
+def _round_money(value: float) -> float:
+    return round(float(value), 4)

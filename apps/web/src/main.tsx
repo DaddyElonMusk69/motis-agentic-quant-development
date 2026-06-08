@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider, useMutation, useQuery } from "@tanstack/react-query";
-import { Activity, ChevronRight, Database, FlaskConical, Lock, Play, RefreshCw, Radar, Shield, Terminal, Trash2, UploadCloud } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, ChevronRight, Clock, Database, FlaskConical, Lock, Play, Radar, RefreshCw, Search, Send, Shield, Square, Terminal, Trash2, UploadCloud } from "lucide-react";
 import "./styles.css";
 
 const queryClient = new QueryClient();
@@ -458,6 +458,150 @@ type DevelopmentQueueRow = {
   next_action: DevelopmentNextAction;
 };
 
+type ExecutionBundle = {
+  bundle_id: string;
+  asset: string;
+  instrument: string;
+  signal_engine_id: string;
+  signal_engine_version: string;
+  strategy_id: string;
+  strategy_version: string;
+  source_stage1_session_id: string;
+  source_stage4_result_path: string;
+  bundle_uri: string;
+  strategy_module_ref: string;
+  execution_setup: Record<string, unknown>;
+  risk_limits: Record<string, unknown>;
+  evidence_refs: Record<string, unknown>;
+  content_hash: string;
+  status: string;
+  created_at?: string;
+};
+
+type DeploymentRoute = {
+  route_id: string;
+  active_bundle_id: string | null;
+  strategy_id: string;
+  strategy_version: string;
+  signal_engine_id: string;
+  signal_engine_version: string;
+  asset: string;
+  instrument: string;
+  account_mode: string;
+  execution_adapter: string;
+  exchange_account: string;
+  cron_interval_minutes: number;
+  margin_allocation_pct: number;
+  leverage: number;
+  scheduler_status: string;
+  auto_submit_enabled: boolean;
+  last_wake_at?: string | null;
+  last_wake_id?: string | null;
+  next_wake_at?: string | null;
+  last_lifecycle_error?: Record<string, unknown>;
+  risk_limits: Record<string, unknown>;
+  promoted: boolean;
+  data_warmed: boolean;
+  manually_armed: boolean;
+  enabled: boolean;
+  blockers: string[];
+  active_bundle?: ExecutionBundle | null;
+  created_at?: string;
+};
+
+type ExchangeHealth = {
+  route_id: string;
+  adapter: string;
+  account_mode: string;
+  exchange_account: string;
+  instrument: string;
+  cli_path: string | null;
+  checked_at: string;
+  status: "connected" | "disconnected" | "blocked" | string;
+  connected: boolean;
+  readiness_blockers: string[];
+  snapshot: {
+    position_count?: number;
+    open_order_count?: number;
+    protection_order_count?: number;
+    recent_fill_count?: number;
+    has_balance?: boolean;
+  };
+  error: string | null;
+};
+
+type WakeRun = {
+  wake_id: string;
+  route_id: string;
+  bundle_id?: string | null;
+  status: string;
+  branch: string;
+  blockers: string[];
+  signal_scan_result: Record<string, unknown>;
+  exchange_snapshot?: Record<string, unknown>;
+  strategy_decision?: Record<string, unknown>;
+  order_intents: OrderIntent[];
+  adapter_results: unknown[];
+  error: Record<string, unknown>;
+  started_at?: string;
+  completed_at?: string | null;
+};
+
+type WarmupRequirement = {
+  data_type?: string;
+  origin?: string;
+  timeframe?: string;
+  status: string;
+  reason?: string;
+  dataset_id?: string;
+  fill_result?: {
+    status?: string;
+    rows_added?: number;
+    derived_rebuilt?: unknown[];
+    end_ts?: string;
+  };
+};
+
+type DataWarmupReport = {
+  status: "warmed" | "blocked" | "skipped";
+  route_id: string;
+  asset?: string;
+  signal_engine_id?: string;
+  reason?: string;
+  requirements?: WarmupRequirement[];
+};
+
+type OrderIntent = {
+  intent_id?: string;
+  status?: string;
+  action?: string;
+  side?: string;
+  quantity?: string;
+  notional_usd?: number;
+  reduce_only?: boolean;
+  client_order_id?: string;
+  signal_id?: string;
+};
+
+type SubmitWakeOrdersResult = {
+  status: "submitted" | "blocked";
+  submitted_count: number;
+  blockers: string[];
+  wake: WakeRun;
+  route: DeploymentRoute;
+  adapter_results: unknown[];
+};
+
+type RouteLifecycleResult = {
+  cycle?: {
+    warmup?: DataWarmupReport;
+    signal_update?: Record<string, unknown>;
+    wake?: WakeRun | null;
+    submission?: Record<string, unknown>;
+  };
+  route: DeploymentRoute;
+};
+
 async function fetchCatalog(): Promise<CatalogResponse> {
   const response = await fetch(`${API_BASE_URL}/api/v1/market-data/catalog`);
   if (!response.ok) {
@@ -797,6 +941,158 @@ async function runStage4RealizedExpectancy(request: {
   return response.json();
 }
 
+async function promoteExecutionBundle(request: {
+  session_id: string;
+}): Promise<{ bundle: ExecutionBundle; route: DeploymentRoute }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/research/stage1-sessions/${request.session_id}/promote-execution-bundle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ account_mode: "live", execution_adapter: "okx" })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    const detail = typeof payload?.detail === "string" ? payload.detail : payload?.detail?.message;
+    throw new Error(detail ?? "Failed to promote execution bundle");
+  }
+  return response.json();
+}
+
+async function fetchTradingRoutes(): Promise<{ routes: DeploymentRoute[] }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes`);
+  if (!response.ok) {
+    throw new Error("Failed to load trading routes");
+  }
+  return response.json();
+}
+
+async function fetchRouteWakes(routeId: string): Promise<{ wakes: WakeRun[] }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${routeId}/wakes`);
+  if (!response.ok) {
+    throw new Error("Failed to load wake history");
+  }
+  return response.json();
+}
+
+async function fetchRouteExchangeHealth(routeId: string): Promise<ExchangeHealth> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${routeId}/exchange-health`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to check exchange connection");
+  }
+  return response.json();
+}
+
+async function updateRouteGate(request: {
+  route_id: string;
+  action: "enable" | "disable" | "arm" | "disarm";
+}): Promise<{ route: DeploymentRoute }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/${request.action}`, {
+    method: "POST"
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to update deployment route");
+  }
+  return response.json();
+}
+
+async function updateRouteSettings(request: {
+  route_id: string;
+  cron_interval_minutes: number;
+  execution_adapter: string;
+  exchange_account: string;
+  margin_allocation_pct: number;
+  leverage: number;
+  auto_submit_enabled: boolean;
+}): Promise<{ route: DeploymentRoute }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/settings`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      cron_interval_minutes: request.cron_interval_minutes,
+      execution_adapter: request.execution_adapter,
+      exchange_account: request.exchange_account,
+      margin_allocation_pct: request.margin_allocation_pct,
+      leverage: request.leverage,
+      auto_submit_enabled: request.auto_submit_enabled,
+    })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to update route settings");
+  }
+  return response.json();
+}
+
+async function startRouteLifecycle(request: {
+  route_id: string;
+  confirm_live: boolean;
+  auto_submit_enabled: boolean;
+}): Promise<RouteLifecycleResult> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirm_live: request.confirm_live,
+      auto_submit_enabled: request.auto_submit_enabled,
+    })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to start route lifecycle");
+  }
+  return response.json();
+}
+
+async function stopRouteLifecycle(request: {
+  route_id: string;
+}): Promise<{ route: DeploymentRoute }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/stop`, {
+    method: "POST"
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to stop route lifecycle");
+  }
+  return response.json();
+}
+
+async function runRouteWake(request: {
+  route_id: string;
+}): Promise<{ warmup: DataWarmupReport; wake: WakeRun; route: DeploymentRoute }> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/wake`, {
+    method: "POST"
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to run route wake");
+  }
+  return response.json();
+}
+
+async function submitWakeOrders(request: {
+  route_id: string;
+  wake_id: string;
+  confirm_live: boolean;
+  quantity?: string;
+  notional_usd?: number;
+}): Promise<SubmitWakeOrdersResult> {
+  const response = await fetch(`${API_BASE_URL}/api/v1/trading/routes/${request.route_id}/wakes/${request.wake_id}/submit-orders`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      confirm_live: request.confirm_live,
+      quantity: request.quantity,
+      notional_usd: request.notional_usd,
+    })
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => undefined);
+    throw new Error(payload?.detail ?? "Failed to submit wake orders");
+  }
+  return response.json();
+}
+
 async function scoreStage1TrainingIteration(request: {
   session_id: string;
   iteration_id: string;
@@ -867,6 +1163,7 @@ function TerminalApp() {
   const signalEnginesQuery = useQuery({ queryKey: ["signal-engines"], queryFn: fetchSignalEngines });
   const stage0UniverseRunsQuery = useQuery({ queryKey: ["stage0-universe-runs"], queryFn: fetchStage0UniverseRuns });
   const stage1SessionsQuery = useQuery({ queryKey: ["stage1-sessions"], queryFn: fetchStage1ResearchSessions });
+  const tradingRoutesQuery = useQuery({ queryKey: ["trading-routes"], queryFn: fetchTradingRoutes });
   const refreshMutation = useMutation({
     mutationFn: refreshDataset,
     onSuccess: () => {
@@ -987,6 +1284,56 @@ function TerminalApp() {
       void queryClient.invalidateQueries({ queryKey: ["development-queue"] });
     }
   });
+  const promoteExecutionBundleMutation = useMutation({
+    mutationFn: promoteExecutionBundle,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["stage1-gate", variables.session_id] });
+      void queryClient.invalidateQueries({ queryKey: ["development-queue"] });
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+    }
+  });
+  const updateRouteGateMutation = useMutation({
+    mutationFn: updateRouteGate,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
+  const updateRouteSettingsMutation = useMutation({
+    mutationFn: updateRouteSettings,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
+  const startRouteLifecycleMutation = useMutation({
+    mutationFn: startRouteLifecycle,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
+  const stopRouteLifecycleMutation = useMutation({
+    mutationFn: stopRouteLifecycle,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
+  const runRouteWakeMutation = useMutation({
+    mutationFn: runRouteWake,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
+  const submitWakeOrdersMutation = useMutation({
+    mutationFn: submitWakeOrders,
+    onSuccess: (_data, variables) => {
+      void queryClient.invalidateQueries({ queryKey: ["trading-routes"] });
+      void queryClient.invalidateQueries({ queryKey: ["route-wakes", variables.route_id] });
+    }
+  });
   const catalog = catalogQuery.data;
   const dynamicMetrics = [
     {
@@ -1059,11 +1406,10 @@ function TerminalApp() {
           </div>
           <div className="topbar-actions">
             <button type="button" onClick={() => catalogQuery.refetch()}><RefreshCw size={16} />Sync Data</button>
-            <button type="button" className="primary"><Play size={16} />Run Cycle</button>
           </div>
         </section>
 
-        {activeView !== "research" && (
+        {activeView !== "research" && activeView !== "trading" && (
           <section className="metric-grid" aria-label="System metrics">
             {dynamicMetrics.map((metric) => (
               <article className="metric" key={metric.label}>
@@ -1164,23 +1510,24 @@ function TerminalApp() {
                 runStage3GridMutation={runStage3GridMutation}
                 runStage3PyramidMutation={runStage3PyramidMutation}
                 runStage4RealizedExpectancyMutation={runStage4RealizedExpectancyMutation}
+                promoteExecutionBundleMutation={promoteExecutionBundleMutation}
               />
             )}
           </section>
         )}
 
         {activeView === "trading" && (
-          <section className="content-grid">
-            <article className="panel" id="trading">
-              <div className="panel-header">
-                <h2>Live Executing Strategies</h2>
-                <span className="pill red">not wired</span>
-              </div>
-              <p className="panel-copy">
-                No deployment-route API is exposed yet, so this tab is intentionally empty instead of showing placeholder routes.
-              </p>
-            </article>
-          </section>
+          <TradingPanel
+            routes={tradingRoutesQuery.data?.routes}
+            loading={tradingRoutesQuery.isLoading}
+            error={tradingRoutesQuery.error}
+            updateRouteGateMutation={updateRouteGateMutation}
+            updateRouteSettingsMutation={updateRouteSettingsMutation}
+            startRouteLifecycleMutation={startRouteLifecycleMutation}
+            stopRouteLifecycleMutation={stopRouteLifecycleMutation}
+            runRouteWakeMutation={runRouteWakeMutation}
+            submitWakeOrdersMutation={submitWakeOrdersMutation}
+          />
         )}
       </main>
     </div>
@@ -1586,6 +1933,7 @@ function DevelopmentPanel({
   runStage3GridMutation,
   runStage3PyramidMutation,
   runStage4RealizedExpectancyMutation,
+  promoteExecutionBundleMutation,
 }: {
   universeRuns?: Stage0UniverseRun[];
   focusedRunId?: string;
@@ -1642,6 +1990,9 @@ function DevelopmentPanel({
     session_id: string;
   }>>;
   runStage4RealizedExpectancyMutation: ReturnType<typeof useMutation<{ stage4_realized_expectancy: Stage4RealizedExpectancyState; gate: Stage1GateSummary }, Error, {
+    session_id: string;
+  }>>;
+  promoteExecutionBundleMutation: ReturnType<typeof useMutation<{ bundle: ExecutionBundle; route: DeploymentRoute }, Error, {
     session_id: string;
   }>>;
 }) {
@@ -1896,6 +2247,7 @@ function DevelopmentPanel({
           {runStage3GridMutation.error && <p className="panel-copy error-text">{runStage3GridMutation.error.message}</p>}
           {runStage3PyramidMutation.error && <p className="panel-copy error-text">{runStage3PyramidMutation.error.message}</p>}
           {runStage4RealizedExpectancyMutation.error && <p className="panel-copy error-text">{runStage4RealizedExpectancyMutation.error.message}</p>}
+          {promoteExecutionBundleMutation.error && <p className="panel-copy error-text">{promoteExecutionBundleMutation.error.message}</p>}
           <div className="dev-workspace-header">
             <div>
               <h2>{selectedRow ? `${selectedRow.asset} / ${selectedRow.signal_engine_id}` : "Select a candidate"}</h2>
@@ -2015,6 +2367,8 @@ function DevelopmentPanel({
               gate={gate}
               running={runStage4RealizedExpectancyMutation.isPending}
               onRun={() => selectedSession && runStage4RealizedExpectancyMutation.mutate({ session_id: selectedSession.session_id })}
+              promoting={promoteExecutionBundleMutation.isPending}
+              onPromote={() => selectedSession && promoteExecutionBundleMutation.mutate({ session_id: selectedSession.session_id })}
             />
           )}
         </section>
@@ -2554,10 +2908,14 @@ function DevelopmentStage4Panel({
   gate,
   running,
   onRun,
+  promoting,
+  onPromote,
 }: {
   gate: Stage1GateSummary | null;
   running: boolean;
   onRun: () => void;
+  promoting: boolean;
+  onPromote: () => void;
 }) {
   const pyramidComplete = Boolean(gate?.stage3_pyramid.exists);
   const stage4 = gate?.stage4_realized_expectancy;
@@ -2570,9 +2928,14 @@ function DevelopmentStage4Panel({
           <h2>Stage 4: Realized Expectancy</h2>
           <p className="panel-copy">Test shortlisted execution setups on every frozen Stage 1 decision, including skipped/flat decisions and costs.</p>
         </div>
-        <button type="button" className="primary" disabled={!pyramidComplete || complete || running} onClick={onRun}>
-          <Play size={16} />{complete ? "Stage 4 Complete" : running ? "Running..." : "Run Realized Expectancy"}
-        </button>
+        <div className="stage-action-row">
+          <button type="button" className="primary" disabled={!pyramidComplete || complete || running} onClick={onRun}>
+            <Play size={16} />{complete ? "Stage 4 Complete" : running ? "Running..." : "Run Realized Expectancy"}
+          </button>
+          <button type="button" disabled={!complete || promoting} onClick={onPromote}>
+            <UploadCloud size={16} />{promoting ? "Promoting..." : "Promote Bundle"}
+          </button>
+        </div>
       </div>
       {!pyramidComplete && <p className="panel-copy">Locked until Stage 3 grid and pyramid artifacts are complete.</p>}
       {pyramidComplete && !complete && (
@@ -2629,6 +2992,952 @@ function DevelopmentStage4Panel({
       )}
     </section>
   );
+}
+
+function TradingPanel({
+  routes,
+  loading,
+  error,
+  updateRouteGateMutation,
+  updateRouteSettingsMutation,
+  startRouteLifecycleMutation,
+  stopRouteLifecycleMutation,
+  runRouteWakeMutation,
+  submitWakeOrdersMutation,
+}: {
+  routes?: DeploymentRoute[];
+  loading: boolean;
+  error: Error | null;
+  updateRouteGateMutation: ReturnType<typeof useMutation<{ route: DeploymentRoute }, Error, {
+    route_id: string;
+    action: "enable" | "disable" | "arm" | "disarm";
+  }>>;
+  updateRouteSettingsMutation: ReturnType<typeof useMutation<{ route: DeploymentRoute }, Error, {
+    route_id: string;
+    cron_interval_minutes: number;
+    execution_adapter: string;
+    exchange_account: string;
+    margin_allocation_pct: number;
+    leverage: number;
+    auto_submit_enabled: boolean;
+  }>>;
+  startRouteLifecycleMutation: ReturnType<typeof useMutation<RouteLifecycleResult, Error, {
+    route_id: string;
+    confirm_live: boolean;
+    auto_submit_enabled: boolean;
+  }>>;
+  stopRouteLifecycleMutation: ReturnType<typeof useMutation<{ route: DeploymentRoute }, Error, {
+    route_id: string;
+  }>>;
+  runRouteWakeMutation: ReturnType<typeof useMutation<{ warmup: DataWarmupReport; wake: WakeRun; route: DeploymentRoute }, Error, {
+    route_id: string;
+  }>>;
+  submitWakeOrdersMutation: ReturnType<typeof useMutation<SubmitWakeOrdersResult, Error, {
+    route_id: string;
+    wake_id: string;
+    confirm_live: boolean;
+    quantity?: string;
+    notional_usd?: number;
+  }>>;
+}) {
+  const [selectedRouteId, setSelectedRouteId] = React.useState<string | null>(null);
+  const [routeSearch, setRouteSearch] = React.useState("");
+  const [routeStateFilter, setRouteStateFilter] = React.useState("all");
+  const [accountModeFilter, setAccountModeFilter] = React.useState("all");
+  const [showBlockedOnly, setShowBlockedOnly] = React.useState(false);
+  const [routeActionState, setRouteActionState] = React.useState<{ routeId: string | null; message: string | null; error: string | null }>({
+    routeId: null,
+    message: null,
+    error: null,
+  });
+  const [submitSizing, setSubmitSizing] = React.useState<Record<string, { quantity: string; notionalUsd: string }>>({});
+  const routeRows = routes ?? [];
+  const filteredRoutes = routeRows.filter((route) => {
+    const query = routeSearch.trim().toLowerCase();
+    const state = routeStatus(route).state;
+    const matchesQuery = !query || [
+      route.asset,
+      route.instrument,
+      route.signal_engine_id,
+      route.strategy_id,
+      route.account_mode,
+      route.execution_adapter,
+    ].some((value) => String(value ?? "").toLowerCase().includes(query));
+    const matchesState = routeStateFilter === "all" || state === routeStateFilter;
+    const matchesAccount = accountModeFilter === "all" || route.account_mode === accountModeFilter;
+    const matchesBlocked = !showBlockedOnly || route.blockers.length > 0;
+    return matchesQuery && matchesState && matchesAccount && matchesBlocked;
+  });
+  const selectedRoute = filteredRoutes.find((route) => route.route_id === selectedRouteId)
+    ?? routeRows.find((route) => route.route_id === selectedRouteId)
+    ?? filteredRoutes[0]
+    ?? routeRows[0]
+    ?? null;
+  const wakesQuery = useQuery({
+    queryKey: ["route-wakes", selectedRoute?.route_id],
+    queryFn: () => fetchRouteWakes(selectedRoute?.route_id ?? ""),
+    enabled: Boolean(selectedRoute?.route_id)
+  });
+  const exchangeHealthQuery = useQuery({
+    queryKey: ["route-exchange-health", selectedRoute?.route_id],
+    queryFn: () => fetchRouteExchangeHealth(selectedRoute?.route_id ?? ""),
+    enabled: Boolean(selectedRoute?.route_id),
+  });
+  const wakes = wakesQuery.data?.wakes ?? [];
+  const latestWake = wakes[0] ?? null;
+  const pendingWake = wakes.find((wake) => wake.order_intents.some((intent) => intent.status === "intent_only")) ?? null;
+  const pendingIntent = pendingWake?.order_intents.find((intent) => intent.status === "intent_only") ?? pendingWake?.order_intents[0] ?? null;
+  const pendingAction = String(pendingIntent?.action ?? "").toUpperCase();
+  const pendingRequiresNotional = !["EXIT", "REDUCE", "UPDATE_PROTECTION"].includes(pendingAction) && !pendingIntent?.reduce_only;
+  const accountModes = Array.from(new Set(routeRows.map((route) => route.account_mode))).sort();
+
+  React.useEffect(() => {
+    if (!selectedRouteId && filteredRoutes[0]?.route_id) {
+      setSelectedRouteId(filteredRoutes[0].route_id);
+    }
+    if (selectedRouteId && filteredRoutes.length && !filteredRoutes.some((route) => route.route_id === selectedRouteId)) {
+      setSelectedRouteId(filteredRoutes[0].route_id);
+    }
+  }, [filteredRoutes, selectedRouteId]);
+
+  const toggleRouteLifecycle = async (route: DeploymentRoute) => {
+    if (routeActionState.routeId) {
+      return;
+    }
+    try {
+      if (route.scheduler_status === "running") {
+        setRouteActionState({ routeId: route.route_id, message: "Stopping scheduler...", error: null });
+        await stopRouteLifecycleMutation.mutateAsync({ route_id: route.route_id });
+        setRouteActionState({ routeId: null, message: null, error: null });
+        return;
+      }
+
+      const liveMessage = route.auto_submit_enabled
+        ? `Start LIVE auto-submit execution for ${route.instrument}? This will arm the route, warm data, refresh signals, and allow OKX order placement.`
+        : `Start LIVE intent-only execution for ${route.instrument}? This will arm the route, warm data, refresh signals, and run scheduled decisions.`;
+      if (route.account_mode === "live" && !window.confirm(liveMessage)) {
+        return;
+      }
+      setRouteActionState({ routeId: route.route_id, message: "Starting lifecycle...", error: null });
+      await startRouteLifecycleMutation.mutateAsync({
+        route_id: route.route_id,
+        confirm_live: route.account_mode === "live",
+        auto_submit_enabled: route.auto_submit_enabled,
+      });
+      setRouteActionState({ routeId: null, message: null, error: null });
+    } catch (caught) {
+      setRouteActionState({
+        routeId: null,
+        message: null,
+        error: caught instanceof Error ? caught.message : "Failed to start execution",
+      });
+    }
+  };
+
+  const submitWake = (wake: WakeRun) => {
+    if (!selectedRoute) {
+      return;
+    }
+    const intent = wake.order_intents.find((item) => item.status === "intent_only") ?? wake.order_intents[0];
+    const action = String(intent?.action ?? "").toUpperCase();
+    const requiresNotional = !["EXIT", "REDUCE", "UPDATE_PROTECTION"].includes(action) && !intent?.reduce_only;
+    const sizing = submitSizing[wake.wake_id] ?? { quantity: "", notionalUsd: "" };
+    const quantity = sizing.quantity.trim() || String(intent?.quantity ?? "").trim();
+    const notionalUsd = Number(sizing.notionalUsd);
+    if (!quantity) {
+      window.alert("Enter OKX size before submitting.");
+      return;
+    }
+    if (requiresNotional && (!Number.isFinite(notionalUsd) || notionalUsd <= 0)) {
+      window.alert("Enter audited USD notional before submitting.");
+      return;
+    }
+    if (
+      selectedRoute.account_mode === "live"
+      && !window.confirm(`Submit LIVE ${selectedRoute.instrument} order intent from ${wake.wake_id}?`)
+    ) {
+      return;
+    }
+    submitWakeOrdersMutation.mutate({
+      route_id: selectedRoute.route_id,
+      wake_id: wake.wake_id,
+      confirm_live: selectedRoute.account_mode === "live",
+      quantity,
+      notional_usd: requiresNotional ? notionalUsd : undefined,
+    });
+  };
+
+  return (
+    <article className="trading-page" id="trading">
+      <section className="trading-toolbar" aria-label="Trading route filters">
+        <label className="trading-search">
+          <Search size={16} />
+          <input
+            aria-label="Search promoted execution routes"
+            placeholder="Search ticker, strategy, or engine"
+            value={routeSearch}
+            onChange={(event) => setRouteSearch(event.target.value)}
+          />
+        </label>
+        <select aria-label="Route state filter" value={routeStateFilter} onChange={(event) => setRouteStateFilter(event.target.value)}>
+          <option value="all">State: All</option>
+          <option value="running">Running</option>
+          <option value="blocked">Blocked</option>
+          <option value="idle">Idle</option>
+        </select>
+        <select aria-label="Account mode filter" value={accountModeFilter} onChange={(event) => setAccountModeFilter(event.target.value)}>
+          <option value="all">Account: All</option>
+          {accountModes.map((mode) => <option key={mode} value={mode}>{mode}</option>)}
+        </select>
+        <label className="trading-checkbox">
+          <input type="checkbox" checked={showBlockedOnly} onChange={(event) => setShowBlockedOnly(event.target.checked)} />
+          Blocked only
+        </label>
+        <button type="button" onClick={() => void wakesQuery.refetch()} disabled={!selectedRoute}>
+          <RefreshCw size={15} /> Refresh
+        </button>
+      </section>
+      {loading && <p className="panel-copy">Loading deployment routes...</p>}
+      {error && <p className="panel-copy error-text">{error.message}</p>}
+      {routeActionState.error && <p className="panel-copy error-text">{routeActionState.error}</p>}
+      {updateRouteGateMutation.error && <p className="panel-copy error-text">{updateRouteGateMutation.error.message}</p>}
+      {updateRouteSettingsMutation.error && <p className="panel-copy error-text">{updateRouteSettingsMutation.error.message}</p>}
+      {startRouteLifecycleMutation.error && <p className="panel-copy error-text">{startRouteLifecycleMutation.error.message}</p>}
+      {stopRouteLifecycleMutation.error && <p className="panel-copy error-text">{stopRouteLifecycleMutation.error.message}</p>}
+      {runRouteWakeMutation.error && <p className="panel-copy error-text">{runRouteWakeMutation.error.message}</p>}
+      {submitWakeOrdersMutation.error && <p className="panel-copy error-text">{submitWakeOrdersMutation.error.message}</p>}
+      {!loading && routeRows.length === 0 && (
+        <section className="panel trading-empty">
+          <h2>No promoted execution routes</h2>
+          <p className="panel-copy">Complete Stage 4 in R&amp;D, then promote a bundle to create a route here.</p>
+        </section>
+      )}
+      {routeRows.length > 0 && (
+        <div className="trading-grid">
+          <section className="trading-route-list" aria-label="Promoted execution routes">
+            <div className="trading-route-list-header">
+              <h2>Promoted Execution Routes</h2>
+              <span className={filteredRoutes.length ? "pill" : "pill amber"}>{formatNumber(filteredRoutes.length)} shown</span>
+            </div>
+            {filteredRoutes.length === 0 && (
+              <p className="panel-copy">No routes match the current filters.</p>
+            )}
+            {filteredRoutes.map((route) => (
+              <TradingRouteCard
+                key={route.route_id}
+                route={route}
+                selected={route.route_id === selectedRoute?.route_id}
+                latestWake={route.route_id === selectedRoute?.route_id ? latestWake : null}
+                exchangeHealth={route.route_id === selectedRoute?.route_id ? exchangeHealthQuery.data ?? null : null}
+                exchangeHealthLoading={route.route_id === selectedRoute?.route_id && exchangeHealthQuery.isLoading}
+                actionBusy={
+                  routeActionState.routeId === route.route_id
+                  || (startRouteLifecycleMutation.isPending && selectedRoute?.route_id === route.route_id)
+                  || (stopRouteLifecycleMutation.isPending && selectedRoute?.route_id === route.route_id)
+                }
+                actionMessage={routeActionState.routeId === route.route_id ? routeActionState.message : null}
+                warmup={
+                  startRouteLifecycleMutation.data?.route?.route_id === route.route_id
+                    ? startRouteLifecycleMutation.data.cycle?.warmup ?? null
+                    : runRouteWakeMutation.data?.route?.route_id === route.route_id
+                      ? runRouteWakeMutation.data.warmup
+                      : null
+                }
+                settingsSaving={updateRouteSettingsMutation.isPending}
+                onSelect={() => setSelectedRouteId(route.route_id)}
+                onRun={() => void toggleRouteLifecycle(route)}
+                onSaveSettings={(settings) => updateRouteSettingsMutation.mutate({
+                  route_id: route.route_id,
+                  ...settings,
+                })}
+              />
+            ))}
+          </section>
+          <section className="trading-detail-panel">
+            {selectedRoute && (
+              <>
+                <div className="trading-detail-header">
+                  <div>
+                    <span className="stage-kicker">Route Details</span>
+                    <h2>{selectedRoute.asset} / {selectedRoute.signal_engine_id}</h2>
+                    <small>{selectedRoute.strategy_id} · {selectedRoute.account_mode}</small>
+                  </div>
+                  <RouteStateBadge route={selectedRoute} />
+                </div>
+                <section className="trading-detail-grid">
+                  <DetailItem label="Cron Interval" value={executionInterval(selectedRoute)} />
+                  <DetailItem label="Execution Account" value={executionAccount(selectedRoute)} />
+                  <DetailItem label="Instrument" value={selectedRoute.instrument} />
+                  <DetailItem label="Strategy Version" value={selectedRoute.strategy_version} />
+                  <DetailItem label="Signal Engine" value={`${selectedRoute.signal_engine_id} ${selectedRoute.signal_engine_version}`} />
+                  <DetailItem label="Active Bundle" value={selectedRoute.active_bundle_id ?? "none"} />
+                </section>
+                <section className="trading-exchange-health-panel">
+                  <ExchangeHealthIndicator health={exchangeHealthQuery.data ?? null} loading={exchangeHealthQuery.isLoading} />
+                  <button type="button" onClick={() => void exchangeHealthQuery.refetch()} disabled={exchangeHealthQuery.isFetching}>
+                    <RefreshCw size={15} /> {exchangeHealthQuery.isFetching ? "Checking..." : "Check CLI"}
+                  </button>
+                </section>
+                {exchangeHealthQuery.error && <p className="panel-copy error-text">{exchangeHealthQuery.error.message}</p>}
+                <section className="trading-blocker-panel">
+                  <div>
+                    <h3>Blockers</h3>
+                    <p className={selectedRoute.blockers.length ? "error-text" : "pass-text"}>
+                      {selectedRoute.blockers.length ? selectedRoute.blockers.map(formatBlocker).join(", ") : "No blockers"}
+                    </p>
+                  </div>
+                  <div className="trading-gate-row">
+                    <GateDot label="Enabled" active={selectedRoute.enabled} />
+                    <GateDot label="Promoted" active={selectedRoute.promoted} />
+                    <GateDot label="Data" active={selectedRoute.data_warmed} />
+                    <GateDot label="Armed" active={selectedRoute.account_mode !== "live" || selectedRoute.manually_armed} />
+                  </div>
+                </section>
+                {pendingWake && (
+                  <section className="pending-submit-panel">
+                    <div>
+                      <span>Pending Order Intent</span>
+                      <strong>{pendingAction || "ORDER"} · {pendingWake.wake_id}</strong>
+                      <small>{pendingRequiresNotional ? "Review the wake output, then submit with explicit sizing." : "Review the wake output, then submit the prepared protection or reduce-only intent."}</small>
+                    </div>
+                    <div className="pending-submit-controls">
+                      <input
+                        aria-label={`OKX size for ${pendingWake.wake_id}`}
+                        placeholder="OKX sz"
+                        value={(submitSizing[pendingWake.wake_id] ?? { quantity: pendingIntent?.quantity ?? "", notionalUsd: "" }).quantity}
+                        onChange={(event) => setSubmitSizing((current) => ({
+                          ...current,
+                          [pendingWake.wake_id]: {
+                            quantity: event.target.value,
+                            notionalUsd: current[pendingWake.wake_id]?.notionalUsd ?? "",
+                          },
+                        }))}
+                      />
+                      <input
+                        aria-label={`Notional USD for ${pendingWake.wake_id}`}
+                        placeholder={pendingRequiresNotional ? "USD notional" : "Not required"}
+                        disabled={!pendingRequiresNotional}
+                        value={(submitSizing[pendingWake.wake_id] ?? { quantity: "", notionalUsd: "" }).notionalUsd}
+                        onChange={(event) => setSubmitSizing((current) => ({
+                          ...current,
+                          [pendingWake.wake_id]: {
+                            quantity: current[pendingWake.wake_id]?.quantity ?? "",
+                            notionalUsd: event.target.value,
+                          },
+                        }))}
+                      />
+                      <button
+                        type="button"
+                        className="primary"
+                        disabled={submitWakeOrdersMutation.isPending}
+                        onClick={() => submitWake(pendingWake)}
+                      >
+                        <Send size={15} />{submitWakeOrdersMutation.isPending ? "Submitting..." : "Submit"}
+                      </button>
+                    </div>
+                  </section>
+                )}
+                <section className="trading-detail-section">
+                  <div className="panel-header compact">
+                    <h3>Latest Wake</h3>
+                    <button type="button" onClick={() => wakesQuery.refetch()}><RefreshCw size={15} /></button>
+                  </div>
+                  {wakesQuery.isLoading && <p className="panel-copy">Loading wake history...</p>}
+                  {wakesQuery.error && <p className="panel-copy error-text">{wakesQuery.error.message}</p>}
+                  {!wakesQuery.isLoading && !latestWake && <p className="panel-copy">No wake has run for this route yet.</p>}
+                  {latestWake && <LatestWakeSummary wake={latestWake} />}
+                </section>
+                <section className="trading-detail-section">
+                  <div className="panel-header compact">
+                    <h3>Exchange Snapshot</h3>
+                    <small>{latestWake?.completed_at ? formatTimestamp(latestWake.completed_at) : "No snapshot yet"}</small>
+                  </div>
+                  <ExchangeSnapshot snapshot={latestWake?.exchange_snapshot} />
+                </section>
+                <section className="trading-detail-section">
+                  <div className="panel-header compact">
+                    <h3>Recent Decisions</h3>
+                    <span className="pill">{formatNumber(wakes.length)} wakes</span>
+                  </div>
+                  <div className="trading-decision-list">
+                    {wakes.slice(0, 6).map((wake) => (
+                      <div className="trading-decision-row" key={wake.wake_id}>
+                        <span>{formatTimestamp(wake.completed_at ?? wake.started_at ?? null)}</span>
+                        <strong>{formatDecision(wake)}</strong>
+                        <small>{wake.branch} · {formatSignalScan(wake)}</small>
+                      </div>
+                    ))}
+                    {wakes.length === 0 && <p className="panel-copy">No decisions yet.</p>}
+                  </div>
+                </section>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function TradingRouteCard({
+  route,
+  selected,
+  latestWake,
+  exchangeHealth,
+  exchangeHealthLoading,
+  actionBusy,
+  actionMessage,
+  warmup,
+  settingsSaving,
+  onSelect,
+  onRun,
+  onSaveSettings,
+}: {
+  route: DeploymentRoute;
+  selected: boolean;
+  latestWake: WakeRun | null;
+  exchangeHealth: ExchangeHealth | null;
+  exchangeHealthLoading: boolean;
+  actionBusy: boolean;
+  actionMessage: string | null;
+  warmup: DataWarmupReport | null;
+  settingsSaving: boolean;
+  onSelect: () => void;
+  onRun: () => void;
+  onSaveSettings: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; auto_submit_enabled: boolean }) => void;
+}) {
+  const status = routeStatus(route);
+  const latestSignal = latestWake?.signal_scan_result?.signal_id;
+  return (
+    <article className={selected ? "trading-route-card selected" : "trading-route-card"}>
+      <button type="button" className="trading-route-select" onClick={onSelect}>
+        <div className="trading-route-title">
+          <div>
+            <strong>{route.asset} / {route.signal_engine_id}</strong>
+            <small>{route.strategy_id} · {route.account_mode}</small>
+          </div>
+          <RouteStateBadge route={route} />
+        </div>
+        {selected && <ExchangeHealthIndicator health={exchangeHealth} loading={exchangeHealthLoading} compact />}
+        <div className="trading-route-facts">
+          <DetailItem label="Cron" value={executionInterval(route)} />
+          <DetailItem label="Account" value={executionAccount(route)} />
+          <DetailItem label="Margin" value={`${formatPercentValue(route.margin_allocation_pct)} full`} />
+          <DetailItem label="Leverage" value={`${formatNumber(route.leverage)}x`} />
+          <DetailItem label="Instrument" value={route.instrument} />
+          <DetailItem label="Latest Wake" value={latestWake?.completed_at ? formatTimestamp(latestWake.completed_at) : "Not run"} />
+        </div>
+        <BundleSetupStrip route={route} latestWake={latestWake} />
+      </button>
+      <ExecutionSettingsForm
+        compact
+        route={route}
+        saving={settingsSaving}
+        onSave={onSaveSettings}
+      />
+      <div className="execution-sequence">
+        {executionSteps(route, warmup, latestWake).map((step, index) => (
+          <React.Fragment key={step.label}>
+            <span className={`execution-step ${step.state}`}>
+              {step.state === "done" ? <CheckCircle2 size={14} /> : step.state === "blocked" ? <AlertTriangle size={14} /> : <Clock size={14} />}
+              {step.label}
+            </span>
+            {index < executionSteps(route, warmup, latestWake).length - 1 && <i aria-hidden="true" />}
+          </React.Fragment>
+        ))}
+      </div>
+      <div className="trading-card-footer">
+        <span className={status.state === "blocked" ? "error-text" : status.state === "running" ? "pass-text" : ""}>
+          {status.detail}
+        </span>
+        <button
+          type="button"
+          className={status.state === "blocked" ? "" : "primary"}
+          disabled={actionBusy || (route.scheduler_status !== "running" && hasHardBlockers(route))}
+          onClick={onRun}
+        >
+          <Play size={15} />{actionBusy ? actionMessage ?? "Starting..." : routeActionLabel(route)}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function ExecutionSettingsForm({
+  compact = false,
+  route,
+  saving,
+  onSave,
+}: {
+  compact?: boolean;
+  route: DeploymentRoute;
+  saving: boolean;
+  onSave: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; auto_submit_enabled: boolean }) => void;
+}) {
+  const [cronInterval, setCronInterval] = React.useState(String(route.cron_interval_minutes ?? 15));
+  const [executionAdapter, setExecutionAdapter] = React.useState(route.execution_adapter ?? "okx");
+  const [exchangeAccount, setExchangeAccount] = React.useState(route.exchange_account ?? "default");
+  const [marginAllocationPct, setMarginAllocationPct] = React.useState(Number(route.margin_allocation_pct ?? 10));
+  const [leverage, setLeverage] = React.useState(Number(route.leverage ?? 1));
+  const [autoSubmitEnabled, setAutoSubmitEnabled] = React.useState(Boolean(route.auto_submit_enabled));
+
+  React.useEffect(() => {
+    setCronInterval(String(route.cron_interval_minutes ?? 15));
+    setExecutionAdapter(route.execution_adapter ?? "okx");
+    setExchangeAccount(route.exchange_account ?? "default");
+    setMarginAllocationPct(Number(route.margin_allocation_pct ?? 10));
+    setLeverage(Number(route.leverage ?? 1));
+    setAutoSubmitEnabled(Boolean(route.auto_submit_enabled));
+  }, [route.route_id, route.cron_interval_minutes, route.execution_adapter, route.exchange_account, route.margin_allocation_pct, route.leverage, route.auto_submit_enabled]);
+
+  const cronMinutes = Number(cronInterval);
+  const dirty = cronMinutes !== route.cron_interval_minutes
+    || executionAdapter !== route.execution_adapter
+    || exchangeAccount !== route.exchange_account
+    || marginAllocationPct !== route.margin_allocation_pct
+    || leverage !== route.leverage
+    || autoSubmitEnabled !== route.auto_submit_enabled;
+  const valid = Number.isInteger(cronMinutes)
+    && cronMinutes >= 1
+    && cronMinutes <= 1440
+    && marginAllocationPct >= 0.1
+    && marginAllocationPct <= 100
+    && leverage >= 1
+    && leverage <= 125
+    && executionAdapter.trim() !== ""
+    && exchangeAccount.trim() !== "";
+  const setup = routeSetup(route);
+  const legs = pyramidMaxLegs(route);
+
+  return (
+    <section className={compact ? "execution-settings-panel compact" : "execution-settings-panel"} aria-label="Execution setup">
+      {!compact && (
+        <div>
+          <span className="stage-kicker">Execution Setup</span>
+          <h3>Scheduler and account</h3>
+        </div>
+      )}
+      <label>
+        <span>Cron</span>
+        <input
+          aria-label="Cron interval minutes"
+          inputMode="numeric"
+          min="1"
+          max="1440"
+          type="number"
+          value={cronInterval}
+          onChange={(event) => setCronInterval(event.target.value)}
+        />
+      </label>
+      <label>
+        <span>Exchange</span>
+        <select
+          aria-label="Execution exchange"
+          value={executionAdapter}
+          onChange={(event) => setExecutionAdapter(event.target.value)}
+        >
+          <option value="okx">OKX</option>
+        </select>
+      </label>
+      <label>
+        <span>Account</span>
+        <input
+          aria-label="Exchange account profile"
+          placeholder="default"
+          value={exchangeAccount}
+          onChange={(event) => setExchangeAccount(event.target.value)}
+        />
+      </label>
+      <label className="execution-slider">
+        <span>Full Margin {formatPercentValue(marginAllocationPct)}</span>
+        <input
+          aria-label="Full position margin allocation percent"
+          min="1"
+          max="100"
+          step="1"
+          type="range"
+          value={marginAllocationPct}
+          onChange={(event) => setMarginAllocationPct(Number(event.target.value))}
+        />
+      </label>
+      <label className="execution-slider">
+        <span>Leverage {formatNumber(leverage)}x</span>
+        <input
+          aria-label="Route leverage"
+          min="1"
+          max="20"
+          step="1"
+          type="range"
+          value={leverage}
+          onChange={(event) => setLeverage(Number(event.target.value))}
+        />
+      </label>
+      <label className="execution-auto-submit">
+        <span>Live Orders</span>
+        <input
+          aria-label="Enable automatic order submission"
+          type="checkbox"
+          checked={autoSubmitEnabled}
+          onChange={(event) => setAutoSubmitEnabled(event.target.checked)}
+        />
+      </label>
+      <button
+        type="button"
+        disabled={!dirty || !valid || saving}
+        onClick={() => onSave({
+          cron_interval_minutes: cronMinutes,
+          execution_adapter: executionAdapter.trim(),
+          exchange_account: exchangeAccount.trim(),
+          margin_allocation_pct: marginAllocationPct,
+          leverage,
+          auto_submit_enabled: autoSubmitEnabled,
+        })}
+      >
+        {saving ? "Saving..." : "Save"}
+      </button>
+      <div className="execution-sizing-note">
+        Full {formatPercentValue(marginAllocationPct)} margin split across {formatNumber(legs)} {legs === 1 ? "leg" : "legs"} · TP {formatSetupValue(setup.tp_pct, "%")} · SL {formatSetupValue(setup.sl_pct, "%")}
+      </div>
+    </section>
+  );
+}
+
+function BundleSetupStrip({ route, latestWake }: { route: DeploymentRoute; latestWake: WakeRun | null }) {
+  const setup = routeSetup(route);
+  const legs = pyramidMaxLegs(route);
+  const equity = accountEquityUsd(latestWake?.exchange_snapshot);
+  const perLegMargin = equity > 0 ? equity * Number(route.margin_allocation_pct ?? 0) / 100 / legs : null;
+  const perLegNotional = perLegMargin !== null ? perLegMargin * Number(route.leverage ?? 1) : null;
+  return (
+    <div className="bundle-setup-strip">
+      <DetailItem label="TP / SL" value={`${formatSetupValue(setup.tp_pct, "%")} / ${formatSetupValue(setup.sl_pct, "%")}`} />
+      <DetailItem label="Pyramid" value={`${formatNumber(legs)} ${legs === 1 ? "leg" : "legs"}`} />
+      <DetailItem label="Hold Gate" value={formatSetupValue(setup.max_hold_hours ?? readRecordValue(route.active_bundle?.execution_setup, "hard_exit_after_hours"), "h")} />
+      <DetailItem label="Entry Leg" value={perLegMargin !== null && perLegNotional !== null ? `$${formatNumber(perLegMargin)} margin / $${formatNumber(perLegNotional)} notional` : "Needs snapshot"} />
+    </div>
+  );
+}
+
+function RouteStateBadge({ route }: { route: DeploymentRoute }) {
+  const status = routeStatus(route);
+  const className = status.state === "running" ? "status-badge pass" : status.state === "blocked" ? "status-badge warn" : "status-badge muted";
+  return <span className={className}>{status.label}</span>;
+}
+
+function ExchangeHealthIndicator({
+  health,
+  loading,
+  compact = false,
+}: {
+  health: ExchangeHealth | null;
+  loading: boolean;
+  compact?: boolean;
+}) {
+  const connected = Boolean(health?.connected);
+  const blocked = health?.status === "blocked";
+  const className = connected ? "exchange-health connected" : blocked ? "exchange-health blocked" : "exchange-health disconnected";
+  const label = loading ? "Checking OKX CLI" : connected ? "OKX CLI Connected" : blocked ? "OKX CLI Blocked" : "OKX CLI Disconnected";
+  const detail = loading
+    ? "Backend is checking exchange access"
+    : connected
+      ? `${health?.account_mode ?? "unknown"} · ${health?.exchange_account ?? "default"} · ${formatNumber(health?.snapshot?.recent_fill_count ?? 0)} fills visible`
+      : health?.error ?? "No backend exchange health check has completed";
+  return (
+    <div className={compact ? `${className} compact` : className}>
+      <span>{connected ? <CheckCircle2 size={15} /> : loading ? <Clock size={15} /> : <AlertTriangle size={15} />}</span>
+      <div>
+        <strong>{label}</strong>
+        {!compact && <small>{detail}</small>}
+        {!compact && health?.cli_path && <small>{health.cli_path}</small>}
+      </div>
+    </div>
+  );
+}
+
+function DetailItem({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div className="detail-item">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function GateDot({ label, active }: { label: string; active: boolean }) {
+  return (
+    <span className={active ? "gate-dot active" : "gate-dot"}>
+      {active ? <CheckCircle2 size={14} /> : <AlertTriangle size={14} />}
+      {label}
+    </span>
+  );
+}
+
+function LatestWakeSummary({ wake }: { wake: WakeRun }) {
+  const rows = [
+    ["Wake", wake.wake_id],
+    ["Status", wake.status],
+    ["Branch", wake.branch],
+    ["Signal", formatSignalScan(wake)],
+    ["Decision", formatDecision(wake)],
+    ["Order Intents", wake.order_intents.length ? `${formatNumber(wake.order_intents.length)} prepared` : "None"],
+  ];
+  return (
+    <div className="latest-wake-summary">
+      {rows.map(([label, value]) => (
+        <DetailItem key={label} label={label} value={value} />
+      ))}
+      {wake.blockers.length > 0 && (
+        <p className="error-text">Blocked by {wake.blockers.map(formatBlocker).join(", ")}</p>
+      )}
+    </div>
+  );
+}
+
+function ExchangeSnapshot({ snapshot }: { snapshot?: Record<string, unknown> }) {
+  if (!snapshot) {
+    return <p className="panel-copy">No exchange snapshot has been captured yet.</p>;
+  }
+  const openOrders = Array.isArray(snapshot.open_orders) ? snapshot.open_orders.length : 0;
+  const positions = positionSummary(snapshot);
+  return (
+    <div className="exchange-snapshot-grid">
+      <DetailItem label="Position" value={positions} />
+      <DetailItem label="Open Orders" value={formatNumber(openOrders)} />
+      <DetailItem label="Balance" value={formatSnapshotValue(snapshot.balance)} />
+      <DetailItem label="Recent Fills" value={Array.isArray(snapshot.recent_fills) ? formatNumber(snapshot.recent_fills.length) : "n/a"} />
+    </div>
+  );
+}
+
+const STARTABLE_ROUTE_BLOCKERS = new Set(["route_disabled", "data_not_warmed", "route_not_manually_armed"]);
+
+function routeStatus(route: DeploymentRoute): { state: "running" | "blocked" | "idle"; label: string; detail: string } {
+  if (route.scheduler_status === "running") {
+    return {
+      state: "running",
+      label: "Running",
+      detail: route.auto_submit_enabled ? "Scheduler is running with live order submission" : "Scheduler is running in intent-only mode",
+    };
+  }
+  const hardBlockers = route.blockers.filter((blocker) => !STARTABLE_ROUTE_BLOCKERS.has(blocker));
+  if (hardBlockers.length > 0) {
+    return {
+      state: "blocked",
+      label: "Blocked",
+      detail: hardBlockers.map(formatBlocker).join(", "),
+    };
+  }
+  if (route.enabled && route.data_warmed && (route.account_mode !== "live" || route.manually_armed)) {
+    return {
+      state: "idle",
+      label: "Ready",
+      detail: "Route gates are open",
+    };
+  }
+  return {
+    state: "idle",
+    label: "Idle",
+    detail: route.blockers.length ? `Start will handle ${route.blockers.map(formatBlocker).join(", ")}` : "Ready to start",
+  };
+}
+
+function hasHardBlockers(route: DeploymentRoute): boolean {
+  return route.blockers.some((blocker) => !STARTABLE_ROUTE_BLOCKERS.has(blocker));
+}
+
+function routeActionLabel(route: DeploymentRoute): string {
+  if (route.scheduler_status === "running") {
+    return "Stop Execution";
+  }
+  const status = routeStatus(route);
+  if (status.state === "blocked") {
+    return "Resolve Blocker";
+  }
+  return "Start Execution";
+}
+
+function executionInterval(route: DeploymentRoute): string {
+  if (typeof route.cron_interval_minutes === "number" && route.cron_interval_minutes > 0) {
+    return `${route.cron_interval_minutes}m`;
+  }
+  const setup = route.active_bundle?.execution_setup;
+  const direct = readRecordValue(setup, "cron_interval") ?? readRecordValue(setup, "cron_interval_minutes");
+  const nestedSetup = setup && typeof setup === "object" ? (setup as Record<string, unknown>).setup : undefined;
+  const nested = readRecordValue(nestedSetup, "cron_interval") ?? readRecordValue(nestedSetup, "cron_interval_minutes");
+  const value = direct ?? nested;
+  if (typeof value === "number") {
+    return `${value}m`;
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+  return "15m";
+}
+
+function executionAccount(route: DeploymentRoute): string {
+  const account = route.exchange_account && route.exchange_account !== "default" ? route.exchange_account : route.account_mode;
+  return `${route.execution_adapter} / ${account}`;
+}
+
+function executionSteps(route: DeploymentRoute, warmup: DataWarmupReport | null, latestWake: WakeRun | null): Array<{ label: string; state: "done" | "pending" | "blocked" }> {
+  const hardBlocked = hasHardBlockers(route);
+  return [
+    { label: "Warm Data", state: route.data_warmed || warmup?.status === "warmed" ? "done" : hardBlocked ? "blocked" : "pending" },
+    { label: "Generate Signals", state: latestWake ? "done" : "pending" },
+    { label: "Check Exchange", state: latestWake?.exchange_snapshot ? "done" : "pending" },
+    { label: "Evaluate Strategy", state: latestWake?.strategy_decision ? "done" : "pending" },
+    { label: latestWake?.branch === "position_management" ? "Manage Position" : "Route Action", state: latestWake ? "done" : "pending" },
+  ];
+}
+
+function formatBlocker(value: string): string {
+  const labels: Record<string, string> = {
+    route_disabled: "route disabled",
+    missing_active_bundle: "missing active bundle",
+    route_not_promoted: "route not promoted",
+    data_not_warmed: "data not warmed",
+    route_not_manually_armed: "live route not armed",
+  };
+  return labels[value] ?? value.replaceAll("_", " ");
+}
+
+function formatSignalScan(wake: WakeRun): string {
+  const status = wake.signal_scan_result?.status;
+  const signalId = wake.signal_scan_result?.signal_id;
+  if (signalId) {
+    return String(signalId);
+  }
+  return status ? String(status).replaceAll("_", " ") : "not scanned";
+}
+
+function formatDecision(wake: WakeRun): string {
+  const decision = wake.strategy_decision ?? {};
+  const action = decision.action ?? decision.trade_action;
+  const reason = decision.reason_code;
+  if (action && reason) {
+    return `${String(action)} · ${String(reason)}`;
+  }
+  if (action) {
+    return String(action);
+  }
+  return wake.status === "blocked" ? "Blocked" : "No decision";
+}
+
+function positionSummary(snapshot?: Record<string, unknown>): string {
+  if (!snapshot || !Array.isArray(snapshot.positions) || snapshot.positions.length === 0) {
+    return "Flat";
+  }
+  const activePositions = snapshot.positions
+    .filter((position) => typeof position === "object" && position !== null)
+    .map((position) => position as Record<string, unknown>)
+    .filter((position) => Number(position.pos ?? position.size ?? position.sz ?? 0) !== 0);
+  if (activePositions.length === 0) {
+    return "Flat";
+  }
+  return activePositions.map((position) => {
+    const size = position.pos ?? position.size ?? position.sz ?? "n/a";
+    const side = position.posSide ?? position.side ?? "";
+    return `${String(side || "Position")} ${String(size)}`;
+  }).join(", ");
+}
+
+function formatSnapshotValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "n/a";
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return `${formatNumber(value.length)} rows`;
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) {
+      return "empty";
+    }
+    return entries.slice(0, 2).map(([key, item]) => `${key}: ${String(item)}`).join(" · ");
+  }
+  return String(value);
+}
+
+function readRecordValue(value: unknown, key: string): unknown {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  return (value as Record<string, unknown>)[key];
+}
+
+function routeSetup(route: DeploymentRoute): Record<string, unknown> {
+  const setup = route.active_bundle?.execution_setup;
+  const nested = readRecordValue(setup, "setup");
+  return nested && typeof nested === "object" ? nested as Record<string, unknown> : {};
+}
+
+function pyramidMaxLegs(route: DeploymentRoute): number {
+  const setup = routeSetup(route);
+  const pyramid = readRecordValue(setup, "pyramid");
+  const raw = pyramid && typeof pyramid === "object"
+    ? readRecordValue(pyramid, "max_legs")
+    : readRecordValue(setup, "max_legs");
+  const legs = Number(raw ?? 1);
+  return Number.isFinite(legs) && legs > 0 ? Math.max(1, Math.round(legs)) : 1;
+}
+
+function accountEquityUsd(snapshot?: Record<string, unknown>): number {
+  const balance = snapshot?.balance;
+  const candidates: unknown[] = [];
+  const rows: Record<string, unknown>[] = [];
+  if (balance && typeof balance === "object") {
+    if (Array.isArray(balance)) {
+      rows.push(...balance.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object"));
+    } else {
+      const record = balance as Record<string, unknown>;
+      candidates.push(record.totalEq, record.eq, record.availEq, record.availBal);
+      if (Array.isArray(record.data)) {
+        rows.push(...record.data.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === "object"));
+      }
+    }
+  }
+  rows.forEach((item) => {
+    if (!item.ccy || item.ccy === "USDT" || item.ccy === "USD") {
+      candidates.push(item.totalEq, item.eq, item.availEq, item.availBal);
+    }
+    if (Array.isArray(item.details)) {
+      item.details.forEach((detail) => {
+        if (!detail || typeof detail !== "object") {
+          return;
+        }
+        const detailRecord = detail as Record<string, unknown>;
+        if (!detailRecord.ccy || detailRecord.ccy === "USDT" || detailRecord.ccy === "USD") {
+          candidates.push(detailRecord.eqUsd, detailRecord.eq, detailRecord.availEq, detailRecord.availBal);
+        }
+      });
+    }
+  });
+  for (const candidate of candidates) {
+    const value = Number(candidate);
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return 0;
+}
+
+function formatSetupValue(value: unknown, suffix = ""): string {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "n/a";
+  }
+  return `${formatNumber(number)}${suffix}`;
+}
+
+function formatPercentValue(value: unknown): string {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "n/a";
+  }
+  return `${formatNumber(number)}%`;
 }
 
 function Stage1AgentPromptModal({

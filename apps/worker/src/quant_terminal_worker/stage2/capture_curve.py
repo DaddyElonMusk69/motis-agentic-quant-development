@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_TP_LEVELS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+DEFAULT_TP_LEVELS = [round(index / 10, 1) for index in range(1, 51)]
 DEFAULT_FORWARD_HOURS = 36
+DEFAULT_STAGE3_MIN_MATCH_CAPTURE_PCT = 40.0
+DEFAULT_STAGE3_MIN_ALL_TRADE_CAPTURE_PCT = 20.0
+DEFAULT_STAGE3_FALLBACK_TP_MAX_PCT = 1.0
 
 
 def run_stage2_capture_curve(
@@ -24,30 +28,36 @@ def run_stage2_capture_curve(
     promotion_root = artifact_root / "promotion"
     canonical_scores_path = promotion_root / "stage1a_canonical_full_cycle_scores.json"
     canonical_scores = _read_json(canonical_scores_path)
-    match_set = [
-        item
-        for item in canonical_scores.get("match_set", [])
-        if isinstance(item, dict) and item.get("signal_id")
-    ]
-    if not match_set:
-        raise ValueError("Stage 2 requires a non-empty canonical Stage 1A MATCH set.")
+    trade_decisions = _trade_decisions(canonical_scores)
+    if not trade_decisions:
+        raise ValueError("Stage 2 requires a non-empty canonical Stage 1A executable trade decision set.")
+    match_decisions = [decision for decision in trade_decisions if decision.get("agreement") == "MATCH"]
+    if not match_decisions:
+        raise ValueError("Stage 2 requires at least one MATCH Stage 1A trade decision.")
 
     levels = tp_levels or DEFAULT_TP_LEVELS
     signals_by_id = _index_signals(signal_rows)
     candle_rows = [_coerce_candle(candle) for candle in candles]
     candle_rows.sort(key=lambda row: row["timestamp"])
 
-    per_signal = []
-    for match in match_set:
-        signal = _find_signal(signals_by_id, str(match["signal_id"]))
+    stage3_trade_inputs = []
+    for decision in trade_decisions:
+        signal = _find_signal(signals_by_id, str(decision["signal_id"]))
         if signal is None:
-            raise ValueError(f"Canonical Stage 1A MATCH signal not found in signal rows: {match['signal_id']}")
+            raise ValueError(f"Canonical Stage 1A trade decision signal not found in signal rows: {decision['signal_id']}")
+        stage3_trade_inputs.append(_stage3_trade_input(decision=decision, signal=signal))
+
+    per_signal = []
+    for decision in match_decisions:
+        signal = _find_signal(signals_by_id, str(decision["signal_id"]))
+        if signal is None:
+            raise ValueError(f"Canonical Stage 1A trade decision signal not found in signal rows: {decision['signal_id']}")
         packet = _packet_from_signal(signal)
-        direction = _match_direction(match)
         capture = _walk_signal_capture(
-            signal_id=str(match["signal_id"]),
-            sample_role=str(match.get("sample_role") or "full_cycle"),
-            direction=direction,
+            signal_id=str(decision["signal_id"]),
+            sample_role=str(decision.get("sample_role") or "full_cycle"),
+            direction=str(decision["decision_direction"]).upper(),
+            agreement=str(decision.get("agreement") or "unknown").upper(),
             packet=packet,
             signal_timestamp=_coerce_datetime(packet.get("timestamp") or signal["timestamp"]),
             candles=candle_rows,
@@ -60,20 +70,25 @@ def run_stage2_capture_curve(
         session=session,
         canonical_scores_path=canonical_scores_path,
         per_signal=per_signal,
+        trade_decisions=trade_decisions,
         tp_levels=levels,
         forward_hours=forward_hours,
     )
     promotion_root.mkdir(parents=True, exist_ok=True)
+    _clear_stage2_downstream_artifacts(promotion_root)
     capture_path = promotion_root / "stage2_capture_curve.json"
     per_signal_path = promotion_root / "stage2_capture_per_signal.json"
+    stage3_inputs_path = promotion_root / "stage3_trade_inputs.json"
     summary_path = promotion_root / "stage2_summary.md"
     capture_path.write_text(json.dumps(result, indent=2) + "\n")
     per_signal_path.write_text(json.dumps(per_signal, indent=2) + "\n")
+    stage3_inputs_path.write_text(json.dumps(stage3_trade_inputs, indent=2) + "\n")
     summary_path.write_text(_render_summary(result))
     return {
         **result,
         "capture_curve_path": str(capture_path),
         "per_signal_path": str(per_signal_path),
+        "stage3_trade_inputs_path": str(stage3_inputs_path),
         "summary_path": str(summary_path),
     }
 
@@ -121,6 +136,7 @@ def _walk_signal_capture(
     signal_id: str,
     sample_role: str,
     direction: str,
+    agreement: str,
     packet: dict[str, Any],
     signal_timestamp: datetime,
     candles: list[dict[str, Any]],
@@ -131,6 +147,9 @@ def _walk_signal_capture(
     cutoff = signal_timestamp + timedelta(hours=forward_hours)
     reached = {level: False for level in tp_levels}
     first_tp_reached: float | None = None
+    first_tp_timestamp: datetime | None = None
+    max_favorable = 0.0
+    max_adverse = 0.0
 
     for candle in candles:
         timestamp = candle["timestamp"]
@@ -138,6 +157,9 @@ def _walk_signal_capture(
             continue
         if timestamp > cutoff:
             break
+        favorable, adverse = _excursions(candle, reference_price=reference_price, direction=direction)
+        max_favorable = max(max_favorable, favorable)
+        max_adverse = max(max_adverse, adverse)
         for level in tp_levels:
             if reached[level]:
                 continue
@@ -147,14 +169,20 @@ def _walk_signal_capture(
                 reached[level] = True
                 if first_tp_reached is None:
                     first_tp_reached = level
+                    first_tp_timestamp = timestamp
 
     return {
         "signal_id": signal_id,
         "sample_role": sample_role,
         "direction": direction,
+        "decision_direction": direction,
+        "agreement": agreement,
         "signal_ts": signal_timestamp.isoformat().replace("+00:00", "Z"),
         "reference_price": reference_price,
         "first_tp_reached": first_tp_reached,
+        "time_to_first_tp_minutes": round((first_tp_timestamp - signal_timestamp).total_seconds() / 60, 4) if first_tp_timestamp else None,
+        "max_favorable_excursion_pct": round(max_favorable, 4),
+        "max_adverse_excursion_pct": round(max_adverse, 4),
         "tp_reached": {f"{level:.1f}": reached[level] for level in tp_levels},
     }
 
@@ -164,6 +192,7 @@ def _build_result(
     session: dict[str, Any],
     canonical_scores_path: Path,
     per_signal: list[dict[str, Any]],
+    trade_decisions: list[dict[str, Any]],
     tp_levels: list[float],
     forward_hours: int,
 ) -> dict[str, Any]:
@@ -181,6 +210,14 @@ def _build_result(
                 "total": total,
                 "rate": round(reached / total * 100, 1) if total else 0.0,
             }
+    cohorts = {
+        cohort: _capture_rates(
+            [item for item in per_signal if cohort == "full_cycle" or item.get("agreement") == cohort],
+            tp_levels=tp_levels,
+        )
+        for cohort in ("MATCH", "MISMATCH", "full_cycle")
+    }
+    recommended_tp_max = _recommended_tp_max(tp_levels=tp_levels, cohorts=cohorts)
 
     return {
         "schema_version": "0.1",
@@ -198,13 +235,22 @@ def _build_result(
         "tp_levels": tp_levels,
         "metrics": {
             "total_match_signals": len(per_signal),
+            "total_trade_decisions": len(trade_decisions),
+            "match_count": sum(1 for item in trade_decisions if item.get("agreement") == "MATCH"),
+            "mismatch_count": sum(1 for item in trade_decisions if item.get("agreement") == "MISMATCH"),
+            "stage2_profiled_match_count": len(per_signal),
             "slice_counts": {role: sum(1 for item in per_signal if item["sample_role"] == role) for role in roles},
         },
         "results": results,
+        "cohorts": cohorts,
         "per_signal": per_signal,
         "stage3_input": {
             "role": "tp_range_evidence",
-            "description": "Use this capture curve to narrow Stage 3 TP/SL/management grids on the same frozen Stage 1A MATCH set.",
+            "description": "Use this MATCH-only travel profile to narrow Stage 3 TP/SL/management grids on the frozen Stage 1 decision set.",
+            "tp_range_source": "stage2_trade_profile",
+            "recommended_tp_min_pct": 0.1,
+            "recommended_tp_max_pct": recommended_tp_max,
+            "min_match_capture_pct": DEFAULT_STAGE3_MIN_MATCH_CAPTURE_PCT,
         },
     }
 
@@ -233,6 +279,109 @@ def _render_summary(result: dict[str, Any]) -> str:
 def _rate(rows: dict[str, dict[str, Any]], role: str) -> str:
     row = rows.get(role, {"rate": 0.0, "reached": 0, "total": 0})
     return f"{row['rate']:.1f}% ({row['reached']}/{row['total']})"
+
+
+def _clear_stage2_downstream_artifacts(promotion_root: Path) -> None:
+    for artifact in [
+        "stage3_grid_results.json",
+        "stage3_optimal.json",
+        "stage3_summary.md",
+        "stage3_pyramid_results.json",
+        "stage3_pyramid_optimal.json",
+        "stage3_pyramid_summary.md",
+        "stage4_candidates.json",
+        "stage4_realized_expectancy.json",
+        "stage4_trade_ledger.json",
+        "stage4_optimal.json",
+        "stage4_summary.md",
+    ]:
+        (promotion_root / artifact).unlink(missing_ok=True)
+    shutil.rmtree(promotion_root / "stage4_runs", ignore_errors=True)
+
+
+def _trade_decisions(canonical_scores: dict[str, Any]) -> list[dict[str, Any]]:
+    source = canonical_scores.get("records")
+    if not isinstance(source, list) or not source:
+        source = canonical_scores.get("match_set", [])
+    decisions = []
+    for item in source:
+        if not isinstance(item, dict) or not item.get("signal_id"):
+            continue
+        direction = str(item.get("decision_direction") or item.get("ground_truth_direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            continue
+        decisions.append(
+            {
+                **item,
+                "decision_direction": direction,
+                "agreement": _agreement(item),
+            }
+        )
+    return decisions
+
+
+def _stage3_trade_input(*, decision: dict[str, Any], signal: dict[str, Any]) -> dict[str, Any]:
+    packet = _packet_from_signal(signal)
+    timestamp = _coerce_datetime(packet.get("timestamp") or signal["timestamp"])
+    direction = str(decision["decision_direction"]).upper()
+    return {
+        "signal_id": str(decision["signal_id"]),
+        "sample_role": str(decision.get("sample_role") or "full_cycle"),
+        "direction": direction,
+        "decision_direction": direction,
+        "agreement": str(decision.get("agreement") or "unknown").upper(),
+        "signal_ts": timestamp.isoformat().replace("+00:00", "Z"),
+        "reference_price": get_reference_price(packet),
+    }
+
+
+def _agreement(item: dict[str, Any]) -> str:
+    agreement = str(item.get("agreement") or "").upper()
+    if agreement:
+        return agreement
+    decision = str(item.get("decision_direction") or "").upper()
+    truth = str(item.get("ground_truth_direction") or "").upper()
+    if decision in {"LONG", "SHORT"} and truth in {"LONG", "SHORT"}:
+        return "MATCH" if decision == truth else "MISMATCH"
+    return "MATCH"
+
+
+def _capture_rates(rows: list[dict[str, Any]], *, tp_levels: list[float]) -> dict[str, dict[str, float | int]]:
+    rates = {}
+    for level in tp_levels:
+        key = f"{level:.1f}"
+        reached = sum(1 for item in rows if item["tp_reached"][key])
+        total = len(rows)
+        rates[key] = {
+            "reached": reached,
+            "total": total,
+            "rate": round(reached / total * 100, 1) if total else 0.0,
+        }
+    return rates
+
+
+def _recommended_tp_max(*, tp_levels: list[float], cohorts: dict[str, dict[str, dict[str, float | int]]]) -> float:
+    recommended: float | None = None
+    match_rates = cohorts.get("MATCH", {})
+    full_rates = cohorts.get("full_cycle", {})
+    for level in tp_levels:
+        key = f"{level:.1f}"
+        if (
+            float(match_rates.get(key, {}).get("rate", 0.0)) >= DEFAULT_STAGE3_MIN_MATCH_CAPTURE_PCT
+            and float(full_rates.get(key, {}).get("rate", 0.0)) >= DEFAULT_STAGE3_MIN_ALL_TRADE_CAPTURE_PCT
+        ):
+            recommended = level
+    return round(recommended if recommended is not None else DEFAULT_STAGE3_FALLBACK_TP_MAX_PCT, 1)
+
+
+def _excursions(candle: dict[str, Any], *, reference_price: float, direction: str) -> tuple[float, float]:
+    if direction == "LONG":
+        favorable = max(0.0, (candle["high"] - reference_price) / reference_price * 100)
+        adverse = max(0.0, (reference_price - candle["low"]) / reference_price * 100)
+        return favorable, adverse
+    favorable = max(0.0, (reference_price - candle["low"]) / reference_price * 100)
+    adverse = max(0.0, (candle["high"] - reference_price) / reference_price * 100)
+    return favorable, adverse
 
 
 def _session_artifact_root(*, workspace_root: Path, session: dict[str, Any]) -> Path:

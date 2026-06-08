@@ -1,7 +1,99 @@
+from datetime import UTC, datetime
+
 from sqlalchemy import create_engine, insert, select, update
 
 from quant_terminal_api.db.models import decisions, metadata, signal_sets, signals, stage1_research_sessions
 from quant_terminal_api.repositories.runtime import RuntimeRepository
+
+
+def test_runtime_repository_persists_signal_engine_required_data():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    required_data = [
+        {
+            "data_type": "candles",
+            "origin": "raw",
+            "timeframe": "5m",
+            "lookback_bars": 20000,
+            "freshness_tolerance_seconds": 300,
+        },
+        {
+            "data_type": "candles",
+            "origin": "derived",
+            "timeframe": "2h",
+            "lookback_bars": 676,
+            "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+        },
+    ]
+
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema",
+            "name": "Vegas EMA",
+            "description": "",
+            "version": "0.1",
+            "code_ref": {},
+            "supported_input_data_types": ["candles"],
+            "required_data": required_data,
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
+            "configuration_schema": {},
+        }
+    )
+
+    assert repository.list_signal_engines()[0]["required_data"] == required_data
+
+
+def test_runtime_repository_serializes_datetime_values_inside_wake_json_payloads():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    now = datetime(2026, 6, 6, 4, 12, 21, tzinfo=UTC)
+
+    stored = repository.record_wake_run(
+        {
+            "wake_id": "wake-json-safe",
+            "route_id": "route-1",
+            "bundle_id": "bundle-1",
+            "status": "completed",
+            "branch": "position_management",
+            "blockers": [],
+            "exchange_snapshot": {"positions": [{"opened_at": now}]},
+            "signal_scan_result": {"status": "skipped_position_open", "checked_at": now},
+            "strategy_decision": {"action": "HOLD", "diagnostics": {"created_at": now}},
+            "order_intents": [{"intent_id": "intent-1", "created_at": now}],
+            "adapter_results": [{"checked_at": now}],
+            "error": {},
+            "completed_at": now,
+        }
+    )
+
+    assert stored["strategy_decision"]["diagnostics"]["created_at"] == "2026-06-06T04:12:21Z"
+    assert stored["exchange_snapshot"]["positions"][0]["opened_at"] == "2026-06-06T04:12:21Z"
+
+
+def test_runtime_repository_refreshes_signal_engine_required_data_on_reregistration():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    base_registration = {
+        "signal_engine_id": "vegas_ema",
+        "name": "Vegas EMA",
+        "description": "",
+        "version": "0.1",
+        "code_ref": {},
+        "supported_input_data_types": ["candles"],
+        "output_envelope_version": "signal_packet.v2",
+        "runtime_entrypoint": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
+        "configuration_schema": {},
+    }
+    required_data = [{"data_type": "candles", "origin": "raw", "timeframe": "5m"}]
+
+    repository.register_signal_engine(base_registration)
+    repository.register_signal_engine({**base_registration, "required_data": required_data})
+
+    assert repository.list_signal_engines()[0]["required_data"] == required_data
 
 
 def test_runtime_repository_registers_modules_and_persists_backtest_result():
@@ -888,3 +980,277 @@ def test_runtime_repository_window_queries_dedupe_duplicate_signal_rows():
     assert [signal["signal_id"] for signal in signals_in_window] == [
         "vegas_ema:AAVE:AAVE-vegas_ema-canonical:20260501T000000Z"
     ]
+
+
+def test_runtime_repository_persists_execution_bundle_route_wake_and_signal_consumption():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = {
+        "bundle_id": "aave-vegas_ema-strategy-abc123",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "strategy_id": "aave-vegas-tunnel-v01",
+        "strategy_version": "v0.1",
+        "source_stage1_session_id": "stage1-aave",
+        "source_stage4_result_path": "dev/training_sessions/aave/promotion/stage4_realized_expectancy.json",
+        "bundle_uri": "artifacts/execution_bundles/aave-vegas_ema-strategy-abc123",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-vegas_ema-strategy-abc123/strategy.py",
+        "execution_setup": {"stage4_candidate_id": "candidate-1"},
+        "risk_limits": {"max_notional_usd": 1000, "max_daily_loss_usd": 250},
+        "evidence_refs": {"stage4_optimal": "stage4_optimal.json"},
+        "content_hash": "abc123",
+        "status": "promoted",
+    }
+
+    stored_bundle = repository.create_execution_bundle(bundle)
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=stored_bundle,
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    wake = repository.record_wake_run(
+        {
+            "wake_id": "wake-1",
+            "route_id": route["route_id"],
+            "bundle_id": stored_bundle["bundle_id"],
+            "status": "blocked",
+            "branch": "route_gate",
+            "blockers": route["blockers"],
+            "exchange_snapshot": {},
+            "signal_scan_result": {"status": "not_run"},
+            "strategy_decision": {},
+            "order_intents": [],
+            "adapter_results": [],
+            "error": {},
+            "completed_at": "2026-06-05T00:00:00Z",
+        }
+    )
+    assert stored_bundle["status"] == "promoted"
+    assert route["route_id"] == "aave-live"
+    assert route["enabled"] is False
+    assert route["manually_armed"] is False
+    assert route["cron_interval_minutes"] == 15
+    assert route["exchange_account"] == "default"
+    assert route["margin_allocation_pct"] == 10.0
+    assert route["leverage"] == 1.0
+    assert route["active_bundle_id"] == stored_bundle["bundle_id"]
+    assert route["blockers"] == ["route_disabled", "data_not_warmed", "route_not_manually_armed"]
+    enabled_route = repository.update_deployment_route_gate(
+        route["route_id"],
+        enabled=True,
+        data_warmed=True,
+        manually_armed=True,
+    )
+    assert enabled_route["blockers"] == []
+    settings_route = repository.update_deployment_route_gate(
+        route["route_id"],
+        cron_interval_minutes=30,
+        execution_adapter="okx",
+        exchange_account="main-live-01",
+        margin_allocation_pct=30.0,
+        leverage=5.0,
+    )
+    assert settings_route["cron_interval_minutes"] == 30
+    assert settings_route["exchange_account"] == "main-live-01"
+    assert settings_route["margin_allocation_pct"] == 30.0
+    assert settings_route["leverage"] == 5.0
+    assert repository.list_wake_runs(route["route_id"])[0]["wake_id"] == "wake-1"
+
+    updated_wake = repository.update_wake_execution_results(
+        wake_id=wake["wake_id"],
+        order_intents=[{"intent_id": "intent-1", "status": "submitted"}],
+        adapter_results=[{"ordId": "order-1"}],
+    )
+    owner_state = repository.create_owner_state(
+        {
+            "owner_state_id": "owner-1",
+            "route_id": route["route_id"],
+            "bundle_id": stored_bundle["bundle_id"],
+            "position_instance_id": "pos-1",
+            "asset": "AAVE",
+            "instrument": "AAVE-USDT-SWAP",
+            "account_mode": "live",
+            "owner_strategy_id": "aave-vegas-tunnel-v01",
+            "owner_strategy_version": "v0.1",
+            "opened_from_signal_id": "signal-1",
+            "status": "open",
+            "position_state": {"direction": "LONG", "legs": [{"leg": 1, "status": "submitted"}]},
+        }
+    )
+    appended_owner_state = repository.append_owner_state_leg(
+        "owner-1",
+        {"leg": 2, "status": "submitted", "entry_price": "101"},
+    )
+    closed_owner_state = repository.close_open_owner_state(route["route_id"], reason="exchange_position_flat")
+
+    assert updated_wake["order_intents"] == [{"intent_id": "intent-1", "status": "submitted"}]
+    assert updated_wake["adapter_results"] == [{"ordId": "order-1"}]
+    assert owner_state["owner_state_id"] == "owner-1"
+    assert owner_state["position_instance_id"] == "pos-1"
+    assert appended_owner_state["position_state"]["legs"][-1]["leg"] == 2
+    assert appended_owner_state["position_state"]["protection_refresh_required"] is True
+    assert closed_owner_state["status"] == "closed"
+    assert closed_owner_state["position_state"]["close_reason"] == "exchange_position_flat"
+    assert repository.get_open_owner_state(route["route_id"]) is None
+
+
+def test_runtime_repository_reuses_one_deployment_route_per_asset_account():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    first_bundle = {
+        "bundle_id": "aave-vegas-bundle",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "strategy_id": "aave-vegas",
+        "strategy_version": "v0.1",
+        "source_stage1_session_id": "stage1-aave-vegas",
+        "source_stage4_result_path": "stage4-vegas.json",
+        "bundle_uri": "artifacts/execution_bundles/aave-vegas",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-vegas/strategy.py",
+        "execution_setup": {},
+        "risk_limits": {"max_notional_usd": 1000},
+        "evidence_refs": {},
+        "content_hash": "vegas",
+        "status": "promoted",
+    }
+    second_bundle = {
+        **first_bundle,
+        "bundle_id": "aave-bollinger-bundle",
+        "signal_engine_id": "bollinger",
+        "signal_engine_version": "0.2",
+        "strategy_id": "aave-bollinger",
+        "source_stage1_session_id": "stage1-aave-bollinger",
+        "bundle_uri": "artifacts/execution_bundles/aave-bollinger",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-bollinger/strategy.py",
+        "content_hash": "bollinger",
+    }
+
+    first_route = repository.upsert_deployment_route_for_bundle(
+        bundle=repository.create_execution_bundle(first_bundle),
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    second_route = repository.upsert_deployment_route_for_bundle(
+        bundle=repository.create_execution_bundle(second_bundle),
+        account_mode="live",
+        execution_adapter="okx",
+    )
+
+    routes = repository.list_deployment_routes()
+    assert first_route["route_id"] == "aave-live"
+    assert second_route["route_id"] == "aave-live"
+    assert len(routes) == 1
+    assert routes[0]["active_bundle_id"] == "aave-bollinger-bundle"
+    assert routes[0]["signal_engine_id"] == "bollinger"
+    assert routes[0]["strategy_id"] == "aave-bollinger"
+    assert routes[0]["cron_interval_minutes"] == 15
+
+
+def test_runtime_repository_archives_deployment_routes_out_of_active_list():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = {
+        "bundle_id": "aave-vegas-bundle",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "strategy_id": "aave-vegas",
+        "strategy_version": "v0.1",
+        "source_stage1_session_id": "stage1-aave-vegas",
+        "source_stage4_result_path": "stage4-vegas.json",
+        "bundle_uri": "artifacts/execution_bundles/aave-vegas",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-vegas/strategy.py",
+        "execution_setup": {},
+        "risk_limits": {"max_notional_usd": 1000},
+        "evidence_refs": {},
+        "content_hash": "vegas",
+        "status": "promoted",
+    }
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=repository.create_execution_bundle(bundle),
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    repository.update_deployment_route_gate(
+        route["route_id"],
+        enabled=True,
+        manually_armed=True,
+        scheduler_status="running",
+        auto_submit_enabled=True,
+        next_wake_at="2026-06-06T05:00:00Z",
+    )
+
+    archived = repository.archive_deployment_route(route["route_id"], archived_at="2026-06-06T06:00:00Z")
+
+    assert repository.list_deployment_routes() == []
+    archived_routes = repository.list_deployment_routes(include_archived=True)
+    assert len(archived_routes) == 1
+    assert archived_routes[0]["route_id"] == route["route_id"]
+    assert archived_routes[0]["archived"] is True
+    assert archived_routes[0]["archived_at"].isoformat() == "2026-06-06T06:00:00+00:00"
+    assert archived["enabled"] is False
+    assert archived["scheduler_status"] == "stopped"
+    assert archived["auto_submit_enabled"] is False
+    assert archived["next_wake_at"] is None
+
+
+def test_runtime_repository_paginates_wake_runs_and_counts_total():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = {
+        "bundle_id": "aave-vegas-bundle",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "strategy_id": "aave-vegas",
+        "strategy_version": "v0.1",
+        "source_stage1_session_id": "stage1-aave-vegas",
+        "source_stage4_result_path": "stage4-vegas.json",
+        "bundle_uri": "artifacts/execution_bundles/aave-vegas",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-vegas/strategy.py",
+        "execution_setup": {},
+        "risk_limits": {"max_notional_usd": 1000},
+        "evidence_refs": {},
+        "content_hash": "vegas-page",
+        "status": "promoted",
+    }
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=repository.create_execution_bundle(bundle),
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    for index in range(5):
+        repository.record_wake_run(
+            {
+                "wake_id": f"wake-{index}",
+                "route_id": route["route_id"],
+                "bundle_id": bundle["bundle_id"],
+                "status": "completed",
+                "branch": "entry_scan",
+                "blockers": [],
+                "exchange_snapshot": {},
+                "signal_scan_result": {},
+                "strategy_decision": {},
+                "order_intents": [],
+                "adapter_results": [],
+                "error": {},
+                "completed_at": f"2026-06-06T00:0{index}:00Z",
+            }
+        )
+
+    page = repository.list_wake_run_page(route["route_id"], limit=2, offset=2)
+
+    assert [wake["wake_id"] for wake in page["wakes"]] == ["wake-2", "wake-1"]
+    assert page["total"] == 5
+    assert page["limit"] == 2
+    assert page["offset"] == 2

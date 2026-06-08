@@ -75,3 +75,147 @@ def test_run_stage2_capture_curve_scores_match_set_by_slice(tmp_path: Path):
     assert (promotion_root / "stage2_capture_curve.json").exists()
     assert (promotion_root / "stage2_capture_per_signal.json").exists()
     assert "Stage 2 Travel Capture" in (promotion_root / "stage2_summary.md").read_text()
+
+
+def test_run_stage2_capture_curve_profiles_match_decisions_and_writes_stage3_all_trade_inputs(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "session_id": "stage1-aave",
+                "records": [
+                    {
+                        "signal_id": "sig-match-long",
+                        "sample_role": "training",
+                        "decision_direction": "LONG",
+                        "agreement": "MATCH",
+                    },
+                    {
+                        "signal_id": "sig-mismatch-long",
+                        "sample_role": "walk_forward_test",
+                        "decision_direction": "LONG",
+                        "agreement": "MISMATCH",
+                    },
+                    {
+                        "signal_id": "sig-flat",
+                        "sample_role": "training",
+                        "decision_direction": "FLAT",
+                        "agreement": "NEUTRAL",
+                    },
+                ],
+            }
+        )
+    )
+    session = {
+        "session_id": "stage1-aave",
+        "artifact_root": str(artifact_root),
+        "asset": "AAVE",
+        "strategy_id": "aave-vegas",
+        "strategy_version": "v0.1",
+        "signal_engine_id": "vegas_ema",
+        "signal_set_id": "AAVE-vegas_ema-canonical",
+    }
+    signal_rows = [
+        {
+            "signal_id": "sig-match-long",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "payload": {"active_timeframes": ["2h"], "interactions": {"2h": [{"market_price": 100}]}},
+        },
+        {
+            "signal_id": "sig-mismatch-long",
+            "timestamp": "2026-05-02T00:00:00Z",
+            "payload": {"active_timeframes": ["2h"], "interactions": {"2h": [{"market_price": 100}]}},
+        },
+        {
+            "signal_id": "sig-flat",
+            "timestamp": "2026-05-03T00:00:00Z",
+            "payload": {"active_timeframes": ["2h"], "interactions": {"2h": [{"market_price": 100}]}},
+        },
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 100.6, "low": 99.7, "close": 100.4},
+        {"timestamp": "2026-05-01T00:10:00Z", "open": 100.4, "high": 100.8, "low": 100.1, "close": 100.7},
+        {"timestamp": "2026-05-02T00:05:00Z", "open": 100, "high": 100.3, "low": 98.8, "close": 99.0},
+        {"timestamp": "2026-05-02T00:10:00Z", "open": 99, "high": 99.4, "low": 98.5, "close": 98.7},
+    ]
+
+    result = run_stage2_capture_curve(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signal_rows,
+        candles=candles,
+        forward_hours=1,
+    )
+
+    assert result["tp_levels"][:5] == [0.1, 0.2, 0.3, 0.4, 0.5]
+    assert result["tp_levels"][-1] == 5.0
+    assert result["metrics"]["total_trade_decisions"] == 2
+    assert result["metrics"]["match_count"] == 1
+    assert result["metrics"]["mismatch_count"] == 1
+    assert result["metrics"]["stage2_profiled_match_count"] == 1
+    assert {row["signal_id"] for row in result["per_signal"]} == {"sig-match-long"}
+    assert result["per_signal"][0]["agreement"] == "MATCH"
+    assert result["per_signal"][0]["max_favorable_excursion_pct"] == 0.8
+    assert result["per_signal"][0]["max_adverse_excursion_pct"] == 0.3
+    assert result["per_signal"][0]["time_to_first_tp_minutes"] == 5.0
+    assert result["cohorts"]["MATCH"]["0.4"] == {"reached": 1, "total": 1, "rate": 100.0}
+    assert result["cohorts"]["MISMATCH"]["0.4"] == {"reached": 0, "total": 0, "rate": 0.0}
+    assert result["stage3_input"]["recommended_tp_min_pct"] == 0.1
+    assert result["stage3_input"]["recommended_tp_max_pct"] == 0.8
+    stage3_inputs = json.loads((promotion_root / "stage3_trade_inputs.json").read_text())
+    assert {row["signal_id"] for row in stage3_inputs} == {"sig-match-long", "sig-mismatch-long"}
+    assert {row["agreement"] for row in stage3_inputs} == {"MATCH", "MISMATCH"}
+
+
+def test_stage2_rerun_clears_downstream_stage3_and_stage4_artifacts(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "signal_id": "sig-long",
+                        "sample_role": "training",
+                        "decision_direction": "LONG",
+                        "agreement": "MATCH",
+                    }
+                ]
+            }
+        )
+    )
+    for artifact in [
+        "stage3_grid_results.json",
+        "stage3_optimal.json",
+        "stage3_pyramid_results.json",
+        "stage3_pyramid_optimal.json",
+        "stage4_candidates.json",
+        "stage4_realized_expectancy.json",
+        "stage4_trade_ledger.json",
+        "stage4_optimal.json",
+        "stage4_summary.md",
+    ]:
+        (promotion_root / artifact).write_text("{}")
+    stage4_run_dir = promotion_root / "stage4_runs" / "old-run"
+    stage4_run_dir.mkdir(parents=True)
+    (stage4_run_dir / "stage4_realized_expectancy.json").write_text("{}")
+    session = {"session_id": "stage1-aave", "artifact_root": str(artifact_root)}
+    signal_rows = [
+        {
+            "signal_id": "sig-long",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "payload": {"active_timeframes": ["2h"], "interactions": {"2h": [{"market_price": 100}]}},
+        }
+    ]
+    candles = [{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 100.5, "low": 99.8, "close": 100.4}]
+
+    run_stage2_capture_curve(workspace_root=tmp_path, session=session, signal_rows=signal_rows, candles=candles)
+
+    assert not (promotion_root / "stage3_grid_results.json").exists()
+    assert not (promotion_root / "stage3_pyramid_results.json").exists()
+    assert not (promotion_root / "stage4_realized_expectancy.json").exists()
+    assert not (promotion_root / "stage4_runs").exists()

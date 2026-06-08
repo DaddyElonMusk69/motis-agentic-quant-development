@@ -1,0 +1,33 @@
+:root {
+  color-scheme: dark;
+  --surface-base: oklch(17% 0.024 205);
+  --surface-sidebar: oklch(14.5% 0.026 210);
+  --surface-workspace: oklch(18.5% 0.023 205);
+  --surface-list: oklch(17% 0.023 204);
+  --surface-panel: oklch(21.5% 0.023 206);
+  --surface-raised: oklch(24% 0.025 205);
+  --surface-selected: oklch(29% 0.048 192);
+  --ink-primary: oklch(93% 0.012 210);
+  --ink-secondary: oklch(75% 0.03 215);
+  --ink-muted: oklch(60% 0.034 218);
+  --line-subtle: oklch(35% 0.032 206);
+  --line-grid: oklch(39% 0.039 196);
+  --line-strong: oklch(50% 0.055 192);
+  --status-pass: oklch(78% 0.13 153);
+  --status-warn: oklch(79% 0.12 76);
+  --status-risk: oklch(68% 0.15 24);
+  --status-info: oklch(72% 0.11 221);
+  --status-live: oklch(75% 0.13 176);
+  --status-idle: oklch(66% 0.035 214);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --sidebar-width: 184px;
+}

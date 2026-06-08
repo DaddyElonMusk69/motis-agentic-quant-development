@@ -9,6 +9,28 @@ from typing import Any
 from quant_terminal_api.repositories.runtime import RuntimeRepository
 
 
+_RAW_5M_REQUIREMENT = {
+    "data_type": "candles",
+    "origin": "raw",
+    "timeframe": "5m",
+    "lookback_bars": 20000,
+    "freshness_tolerance_seconds": 300,
+}
+VEGAS_REQUIRED_DATA = [
+    _RAW_5M_REQUIREMENT,
+    *[
+        {
+            "data_type": "candles",
+            "origin": "derived",
+            "timeframe": timeframe,
+            "lookback_bars": 676,
+            "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+        }
+        for timeframe in ["2h", "4h", "8h", "12h", "1d"]
+    ],
+]
+
+
 def import_legacy_signal_sets(
     *,
     root: Path,
@@ -143,6 +165,7 @@ def _register_known_engine(signal_engine_id: str, repository: RuntimeRepository)
                 "version": "unknown",
                 "code_ref": {},
                 "supported_input_data_types": ["candles"],
+                "required_data": [],
                 "output_envelope_version": "unknown",
                 "runtime_entrypoint": "",
                 "live_scanner_entrypoint": None,
@@ -163,6 +186,7 @@ def _register_known_engine(signal_engine_id: str, repository: RuntimeRepository)
                 "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py",
             },
             "supported_input_data_types": ["candles"],
+            "required_data": VEGAS_REQUIRED_DATA,
             "output_envelope_version": "signal_packet.v2",
             "runtime_entrypoint": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
             "live_scanner_entrypoint": "artifacts/signal_engine/scripts/signals/scan_okx_live_signals.py",

@@ -4,8 +4,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
 
+import quant_terminal_api.main as api_main
+from quant_terminal_api.db.models import metadata
 from quant_terminal_api.main import create_app
+from quant_terminal_api.repositories.runtime import RuntimeRepository
 
 
 class StubRuntimeRepository:
@@ -230,6 +234,9 @@ class StubRuntimeRepository:
             for session in self.stage1_sessions
         ]
 
+    def delete_stage1_research_session(self, session_id):
+        self.stage1_sessions = [session for session in self.stage1_sessions if session["session_id"] != session_id]
+
     def list_signals_for_signal_set_window(self, **kwargs):
         self.window_requests.append(kwargs)
         if self.window_signals is not None:
@@ -445,6 +452,7 @@ def test_stage0_universe_endpoint_builds_candidates_and_allows_repeat_same_confi
     client = TestClient(create_app(runtime_repository=repository))
     request = {
         "universe_run_id": "universe-march-may-vegas",
+        "name": "March-May Vegas Training Pool",
         "window_start": "2026-03-01T00:00:00Z",
         "window_end": "2026-05-30T11:55:00Z",
         "train_start": "2026-03-01",
@@ -465,6 +473,7 @@ def test_stage0_universe_endpoint_builds_candidates_and_allows_repeat_same_confi
     assert response.status_code == 200
     payload = response.json()
     assert payload["run"]["status"] == "created"
+    assert payload["run"]["name"] == "March-May Vegas Training Pool"
     assert payload["run"]["train_start"] == "2026-03-01"
     assert payload["run"]["train_end"] == "2026-04-30"
     assert payload["run"]["walk_forward_start"] == "2026-05-25"
@@ -979,6 +988,116 @@ def test_stage1_session_endpoint_seeds_from_signal_engine_base_when_pair_has_no_
     assert session["seed_strategy_source_type"] == "engine_base"
     assert session["seed_strategy_source_path"] == str(base_strategy_path)
     assert session["manifest"]["seed_strategy"]["source_version"] == "0.1"
+
+
+def test_stage1_session_endpoint_can_force_engine_base_over_latest_pair_seed(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    repository.universe_run = _queue_universe_run()
+    repository.universe_candidates = [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)]
+    prior_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave-old"
+    frozen_strategy_path = prior_root / "promotion/frozen_stage1a_strategy_module/strategy.py"
+    frozen_strategy_path.parent.mkdir(parents=True)
+    frozen_strategy_path.write_text("def decide(context):\n    return {'seed': 'latest-frozen'}\n")
+    base_strategy_path = tmp_path / "engine_templates/vegas_ema/strategy.py"
+    base_strategy_path.parent.mkdir(parents=True)
+    base_strategy_path.write_text("def decide(context):\n    return {'seed': 'engine-base'}\n")
+    repository.signal_engines = [
+        {
+            "signal_engine_id": "vegas_ema",
+            "name": "Vegas EMA Tunnel",
+            "description": "Legacy engine",
+            "version": "0.1",
+            "code_ref": {"base_strategy_path": str(base_strategy_path)},
+            "runtime_entrypoint": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
+            "live_scanner_entrypoint": "artifacts/signal_engine/scripts/signals/scan_okx_live_signals.py",
+            "signal_set_count": 1,
+            "packet_count": 340,
+        }
+    ]
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave-old",
+            "artifact_root": str(prior_root),
+            "source_candidate_id": "candidate-prior",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-01-01",
+            "train_end": "2026-02-28",
+            "walk_forward_start": "2026-03-16",
+            "walk_forward_end": "2026-03-31",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave-old"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        "/api/v1/research/stage1-sessions",
+        json={
+            "source_candidate_id": "candidate-aave",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.2",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "seed_strategy_preference": "engine_base",
+        },
+    )
+
+    assert response.status_code == 200
+    session = response.json()["session"]
+    strategy_path = Path(session["artifact_root"]) / "strategy_module" / "strategy.py"
+    assert strategy_path.read_text() == base_strategy_path.read_text()
+    assert session["seed_strategy_source_type"] == "engine_base"
+    assert session["seed_strategy_source_path"] == str(base_strategy_path)
+
+
+def test_stage1_session_reset_endpoint_returns_candidate_to_clean_slate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    (artifact_root / "strategy_module").mkdir(parents=True)
+    (artifact_root / "strategy_module" / "strategy.py").write_text("def decide(context):\n    return {}\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "source_universe_run_id": "universe-a",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "draft",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.delete("/api/v1/research/stage1-sessions/stage1-aave")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "deleted",
+        "session_id": "stage1-aave",
+        "source_candidate_id": "candidate-aave",
+    }
+    assert repository.stage1_sessions == []
+    assert not artifact_root.exists()
 
 
 def test_stage1_session_endpoint_inherits_windows_from_stage0_batch():
@@ -1642,6 +1761,105 @@ def test_stage1_canonical_endpoint_blocks_until_gate_passes(tmp_path, monkeypatc
     assert response.json()["detail"]["message"].startswith("Stage 1A canonical readout requires")
 
 
+def test_stage1_canonical_endpoint_allows_forced_freeze_below_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    stage0_root = tmp_path / "dev/stage0/aave"
+    packet_root = tmp_path / "dev/signals/vegas_ema/AAVE/2026-AAVE-2h-dedupe-vote2/packets"
+    strategy_root = artifact_root / "strategy_module"
+    (stage0_root / "scores/ground_truth").mkdir(parents=True)
+    packet_root.mkdir(parents=True)
+    strategy_root.mkdir(parents=True)
+    (stage0_root / "scores/ground_truth/sig-1.json").write_text(
+        json.dumps({"signal_id": "sig-1", "natural_direction": "LONG"})
+    )
+    (packet_root / "sig-1.json").write_text(json.dumps({"signal_id": "sig-1", "payload": {}}))
+    (strategy_root / "__init__.py").write_text("")
+    (strategy_root / "strategy.py").write_text(
+        """
+def decide(context):
+    return {
+        "decision_id": "canonical-api",
+        "strategy_id": "aave-vegas-tunnel-v01",
+        "strategy_version": "v0.1",
+        "signal_id": context["signal"]["signal_id"],
+        "trade_action": "ENTER",
+        "action": "ENTER",
+        "direction": "LONG",
+        "confidence": 0.8,
+        "reason_code": "api_canonical",
+        "diagnostics": {},
+    }
+"""
+    )
+    for index, (role, score_name, passes) in enumerate(
+        (
+            ("training", "stage1a_directional_scores.json", True),
+            ("walk_forward_test", "stage1a_walk_forward_scores.json", False),
+        ),
+        start=1,
+    ):
+        iteration_root = artifact_root / "iterations" / f"iter_{index:03d}_v0.1"
+        (iteration_root / "scores").mkdir(parents=True)
+        (iteration_root / "decisions").mkdir()
+        (iteration_root / "summaries").mkdir()
+        (iteration_root / "manifest.json").write_text(
+            json.dumps({"iteration_id": f"iter_{index:03d}_v0.1", "sample_method": role, "signal_count": 1})
+        )
+        (iteration_root / "signal_sample.json").write_text("{}")
+        (iteration_root / "agent_prompt.md").write_text("prompt")
+        (iteration_root / "scores" / score_name).write_text(
+            json.dumps(
+                {
+                    "metrics": {
+                        "directional_agreement": 1.0 if passes else 0.4,
+                        "matches": 1 if passes else 0,
+                        "mismatches": 0 if passes else 1,
+                        "neutral": 0,
+                        "scoreable": 1,
+                        "total": 1,
+                        "promotion_threshold_pct": 55.0,
+                        "passes_threshold": passes,
+                    }
+                }
+            )
+        )
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "stage0_artifact_root": str(stage0_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "draft",
+            "manifest": {"session_id": "stage1-aave", "stage0_artifact_root": str(stage0_root)},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/canonical-stage1a",
+        json={"force": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["forced"] is True
+    assert payload["gate"]["canonical_readout"]["exists"] is True
+    assert repository.updated_stage1_session["status"] == "stage1a_frozen"
+
+
 def test_stage1_canonical_endpoint_writes_readout_and_freezes_session(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
@@ -1723,6 +1941,111 @@ def decide(context):
     assert (tmp_path / readout["decisions_path"]).exists()
     assert repository.updated_stage1_session["status"] == "stage1a_frozen"
     assert len(repository.window_requests) == 2
+
+
+def test_stage1_iteration_detail_endpoint_returns_records_and_monthly_clusters(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    iteration_root = artifact_root / "iterations" / "iter_001_v0.1"
+    (iteration_root / "scores").mkdir(parents=True)
+    (iteration_root / "decisions").mkdir()
+    (iteration_root / "summaries").mkdir()
+    (iteration_root / "manifest.json").write_text(
+        json.dumps({"iteration_id": "iter_001_v0.1", "sample_method": "training", "signal_count": 3})
+    )
+    (iteration_root / "signal_sample.json").write_text(
+        json.dumps(
+            {
+                "signals": [
+                    {"signal_id": "sig-1", "timestamp": "2026-03-02T00:00:00Z", "packet_path": "dev/signals/a.json"},
+                    {"signal_id": "sig-2", "timestamp": "2026-03-18T00:00:00Z", "packet_path": "dev/signals/b.json"},
+                    {"signal_id": "sig-3", "timestamp": "2026-04-02T00:00:00Z", "packet_path": "dev/signals/c.json"},
+                ]
+            }
+        )
+    )
+    (iteration_root / "agent_prompt.md").write_text("prompt")
+    (iteration_root / "scores/stage1a_directional_scores.json").write_text(
+        json.dumps(
+            {
+                "metrics": {
+                    "total": 3,
+                    "matches": 1,
+                    "mismatches": 1,
+                    "neutral": 1,
+                    "scoreable": 2,
+                    "directional_agreement": 0.5,
+                    "promotion_threshold_pct": 55.0,
+                    "passes_threshold": False,
+                },
+                "records": [
+                    {
+                        "signal_id": "sig-1",
+                        "ground_truth_direction": "LONG",
+                        "decision_direction": "LONG",
+                        "agreement": "MATCH",
+                        "status": "CORRECT",
+                        "confidence": 0.7,
+                        "reason_code": "trend_match",
+                    },
+                    {
+                        "signal_id": "sig-2",
+                        "ground_truth_direction": "SHORT",
+                        "decision_direction": "LONG",
+                        "agreement": "MISMATCH",
+                        "status": "INCORRECT",
+                        "confidence": 0.6,
+                        "reason_code": "wrong_side",
+                    },
+                    {
+                        "signal_id": "sig-3",
+                        "ground_truth_direction": "LONG",
+                        "decision_direction": "FLAT",
+                        "agreement": "NEUTRAL",
+                        "status": "NEUTRAL",
+                        "confidence": 0.4,
+                        "reason_code": "skip",
+                    },
+                ],
+            }
+        )
+    )
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "draft",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get("/api/v1/research/stage1-sessions/stage1-aave/iterations/iter_001_v0.1/details")
+
+    assert response.status_code == 200
+    detail = response.json()["detail"]
+    assert detail["iteration_id"] == "iter_001_v0.1"
+    assert detail["sample_role"] == "training"
+    assert detail["metrics"]["matches"] == 1
+    assert len(detail["records"]) == 3
+    assert detail["records"][0]["timestamp"] == "2026-03-02T00:00:00Z"
+    assert detail["monthly"][0]["month"] == "2026-03"
+    assert detail["monthly"][0]["metrics"]["total"] == 2
+    assert detail["monthly"][1]["month"] == "2026-04"
+    assert detail["monthly"][1]["metrics"]["neutral"] == 1
 
 
 def test_stage2_capture_endpoint_rejects_unfrozen_session(tmp_path, monkeypatch):
@@ -1852,6 +2175,63 @@ def test_stage2_capture_endpoint_writes_curve_from_canonical_match_set(tmp_path,
     assert len(repository.window_requests) == 2
 
 
+def test_stage2_exit_policy_endpoint_writes_policy_and_updates_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {}\n")
+    (promotion_root / "stage1a_canonical_full_cycle_decisions.json").write_text("{}")
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
+    )
+    (promotion_root / "stage2_capture_curve.json").write_text(
+        json.dumps(
+            {
+                "tp_levels": [0.5, 1.0, 1.5],
+                "metrics": {"total_match_signals": 1},
+                "results": {"0.5": {}, "1.0": {}, "1.5": {}},
+            }
+        )
+    )
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
+    (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/stage2/exit-policy",
+        json={"lock_profit_pct": 1.0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+    )
+
+    assert response.status_code == 200
+    policy = response.json()["stage2_exit_policy"]
+    assert policy["exists"] is True
+    assert policy["policy"]["lock_profit_pct"] == 1.0
+    assert policy["policy"]["protect_trigger_pct"] == 0.5
+    assert policy["policy"]["trail_sl_pct"] == 0.5
+    assert (promotion_root / "stage2_exit_policy.json").exists()
+    assert response.json()["gate"]["stage2_exit_policy"]["exists"] is True
+
+
 def test_stage3_grid_endpoint_rejects_until_stage2_complete(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
@@ -1892,7 +2272,7 @@ def test_stage3_grid_endpoint_rejects_until_stage2_complete(tmp_path, monkeypatc
     assert response.json()["detail"] == "Stage 3 requires completed Stage 2 travel capture"
 
 
-def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkeypatch):
+def test_stage3_grid_endpoint_rejects_until_stage2_exit_policy_promoted(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
     artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
@@ -1904,22 +2284,90 @@ def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkey
     (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
         json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
     )
-    (promotion_root / "stage2_capture_curve.json").write_text(
-        json.dumps({"metrics": {"total_match_signals": 1}, "results": {}})
+    (promotion_root / "stage2_capture_curve.json").write_text(json.dumps({"tp_levels": [1.0], "metrics": {"total_match_signals": 1}, "results": {"1.0": {}}}))
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
+    (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post("/api/v1/research/stage1-sessions/stage1-aave/stage3/grid-search")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Stage 3 requires promoted Stage 2 exit policy"
+
+
+def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    stage0_root = tmp_path / "dev/stage0/universe-1/vegas_ema/AAVE/2026-AAVE-2h-dedupe-vote2"
+    (stage0_root / "scores").mkdir(parents=True)
+    (stage0_root / "scores" / "ground_truth_summary.json").write_text(
+        json.dumps({"metrics": {"significance_threshold_pct": 1.0, "forward_hours": 36}})
     )
-    (promotion_root / "stage2_capture_per_signal.json").write_text(
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {}\n")
+    (promotion_root / "stage1a_canonical_full_cycle_decisions.json").write_text("{}")
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
+    )
+    (promotion_root / "stage2_capture_curve.json").write_text(
+        json.dumps(
+                {
+                    "tp_levels": [0.5, 1.0],
+                    "metrics": {"total_match_signals": 1, "total_trade_decisions": 1, "match_count": 1, "mismatch_count": 0},
+                    "results": {},
+                "stage3_input": {
+                    "tp_range_source": "stage2_trade_profile",
+                    "recommended_tp_min_pct": 0.1,
+                    "recommended_tp_max_pct": 1.0,
+                },
+            }
+        )
+    )
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text(
         json.dumps(
             [
                 {
                     "signal_id": "sig-1",
                     "sample_role": "walk_forward_test",
+                    "decision_direction": "LONG",
                     "direction": "LONG",
+                    "agreement": "MATCH",
                     "signal_ts": "2026-05-01T00:00:00Z",
                     "reference_price": 100,
                 }
             ]
         )
     )
+    (promotion_root / "stage2_exit_policy.json").write_text(
+        json.dumps(
+                {
+                    "schema_version": "0.1",
+                    "artifact_role": "stage2_exit_policy",
+                    "policy": {"lock_profit_pct": 1.0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+                }
+            )
+        )
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     storage_uri = tmp_path / "data/market/source=okx/type=candles/asset=AAVE/timeframe=5m/origin=raw"
     parquet_path = storage_uri / "year=2026/month=05/data.parquet"
@@ -1960,11 +2408,12 @@ def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkey
             "train_start": "2026-03-01",
             "train_end": "2026-04-30",
             "walk_forward_start": "2026-05-01",
-            "walk_forward_end": "2026-05-31",
-            "status": "stage1a_frozen",
-            "manifest": {"session_id": "stage1-aave"},
-        }
-    ]
+                "walk_forward_end": "2026-05-31",
+                "status": "stage1a_frozen",
+                "stage0_artifact_root": str(stage0_root),
+                "manifest": {"session_id": "stage1-aave"},
+            }
+        ]
     client = TestClient(create_app(runtime_repository=repository))
 
     response = client.post("/api/v1/research/stage1-sessions/stage1-aave/stage3/grid-search")
@@ -1990,9 +2439,20 @@ def test_stage3_pyramid_endpoint_requires_grid_search(tmp_path, monkeypatch):
         json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
     )
     (promotion_root / "stage2_capture_curve.json").write_text(
-        json.dumps({"metrics": {"total_match_signals": 1}, "results": {}})
+        json.dumps(
+            {
+                "metrics": {"total_match_signals": 1, "total_trade_decisions": 1, "match_count": 1, "mismatch_count": 0},
+                "results": {},
+                "stage3_input": {
+                    "tp_range_source": "stage2_trade_profile",
+                    "recommended_tp_min_pct": 0.1,
+                    "recommended_tp_max_pct": 1.0,
+                },
+            }
+        )
     )
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     repository.stage1_sessions = [
         {
@@ -2019,7 +2479,7 @@ def test_stage3_pyramid_endpoint_requires_grid_search(tmp_path, monkeypatch):
     response = client.post("/api/v1/research/stage1-sessions/stage1-aave/stage3/pyramid")
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Stage 3 pyramid requires completed Stage 3 grid search"
+    assert response.json()["detail"] == "Stage 3 pyramid requires completed Stage 3 policy test"
 
 
 def test_stage3_pyramid_endpoint_writes_pyramid_and_stage4_candidate(tmp_path, monkeypatch):
@@ -2035,15 +2495,18 @@ def test_stage3_pyramid_endpoint_writes_pyramid_and_stage4_candidate(tmp_path, m
         json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
     )
     (promotion_root / "stage2_capture_curve.json").write_text(
-        json.dumps({"metrics": {"total_match_signals": 1}, "results": {}})
+        json.dumps({"tp_levels": [0.5, 1.0], "metrics": {"total_match_signals": 1}, "results": {}})
     )
-    (promotion_root / "stage2_capture_per_signal.json").write_text(
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text(
         json.dumps(
             [
                 {
                     "signal_id": "sig-1",
                     "sample_role": "walk_forward_test",
+                    "decision_direction": "LONG",
                     "direction": "LONG",
+                    "agreement": "MATCH",
                     "signal_ts": "2026-05-01T00:00:00Z",
                     "reference_price": 100,
                 }
@@ -2056,7 +2519,16 @@ def test_stage3_pyramid_endpoint_writes_pyramid_and_stage4_candidate(tmp_path, m
     )
     (promotion_root / "stage3_optimal.json").write_text(json.dumps({"best": {"tp": 1.0, "sl": 1.0}}))
     (promotion_root / "stage4_candidates.json").write_text(
-        json.dumps({"candidates": [{"candidate_id": "market_tp_1p0_sl_1p0", "setup": {"entry_model": "market"}}]})
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "numeric_exact_tp_1p0_sl_1p0",
+                        "setup": {"entry_model": "market", "tp_pct": 1.0, "sl_pct": 1.0, "protect_trigger_pct": 0.5},
+                    }
+                ]
+            }
+        )
     )
     (promotion_root / "stage3_summary.md").write_text("# Stage 3 Grid Search\n")
     storage_uri = tmp_path / "data/market/source=okx/type=candles/asset=AAVE/timeframe=5m/origin=raw"
@@ -2118,11 +2590,14 @@ def test_stage3_pyramid_endpoint_writes_pyramid_and_stage4_candidate(tmp_path, m
 
     assert response.status_code == 200
     pyramid = response.json()["stage3_pyramid"]
-    assert pyramid["baseline"]["pnl_pct"] == 5.0
+    assert pyramid["baseline"]["pnl_pct"] == 0.9
     assert pyramid["optimal"]["best"]["comparison"] == "BETTER"
     assert pyramid["stage4_candidates_path"].endswith("promotion/stage4_candidates.json")
     candidates = json.loads((tmp_path / pyramid["stage4_candidates_path"]).read_text())["candidates"]
-    assert candidates[-1]["setup"]["max_legs"] == 3
+    pyramid_candidates = [candidate for candidate in candidates if candidate["candidate_id"].startswith("pyramid_")]
+    assert pyramid_candidates
+    assert {candidate["setup"]["pyramid_step_pct"] for candidate in pyramid_candidates} <= {0.1, 0.2, 0.3, 0.4, 0.5}
+    assert {candidate["setup"]["max_legs"] for candidate in pyramid_candidates} <= {2, 3}
 
 
 def test_stage4_endpoint_requires_stage3_pyramid(tmp_path, monkeypatch):
@@ -2154,7 +2629,10 @@ def test_stage4_endpoint_requires_stage3_pyramid(tmp_path, monkeypatch):
     ]
     client = TestClient(create_app(runtime_repository=repository))
 
-    response = client.post("/api/v1/research/stage1-sessions/stage1-aave/stage4/realized-expectancy")
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/stage4/realized-expectancy",
+        json={"initial_capital_usdt": 1000, "margin_allocation_pct": 30, "leverage": 5},
+    )
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Stage 4 requires completed Stage 3 pyramid"
@@ -2283,14 +2761,22 @@ def test_stage4_endpoint_writes_realized_expectancy_from_full_decision_set(tmp_p
     ]
     client = TestClient(create_app(runtime_repository=repository))
 
-    response = client.post("/api/v1/research/stage1-sessions/stage1-aave/stage4/realized-expectancy")
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/stage4/realized-expectancy",
+        json={"initial_capital_usdt": 1000, "margin_allocation_pct": 30, "leverage": 5},
+    )
 
     assert response.status_code == 200
     stage4 = response.json()["stage4_realized_expectancy"]
     assert stage4["best_candidate"]["total_decisions"] == 2
     assert stage4["best_candidate"]["skipped_decisions"] == 1
+    assert stage4["best_candidate"]["account"]["initial_capital_usdt"] == 1000
+    assert stage4["run_id"]
     assert stage4["realized_expectancy_path"].endswith("promotion/stage4_realized_expectancy.json")
     assert (tmp_path / stage4["optimal_path"]).exists()
+    gate_stage4 = response.json()["gate"]["stage4_realized_expectancy"]
+    assert gate_stage4["latest_run_id"] == stage4["run_id"]
+    assert len(gate_stage4["stage4_runs"]) == 1
 
 
 def test_stage1_score_endpoint_rejects_frozen_session(tmp_path, monkeypatch):
@@ -2515,7 +3001,7 @@ def test_development_queue_canonical_readout_marks_stage1_frozen(tmp_path, monke
     assert row["stage1_gate"]["canonical_readout"]["exists"] is True
 
 
-def test_development_queue_stage2_capture_complete_locks_stage3_until_runner_exists(tmp_path, monkeypatch):
+def test_development_queue_stage2_capture_complete_requests_exit_policy_promotion(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
     repository.universe_run = _queue_universe_run()
@@ -2535,6 +3021,7 @@ def test_development_queue_stage2_capture_complete_locks_stage3_until_runner_exi
         json.dumps({"metrics": {"total_match_signals": 1}, "results": {}})
     )
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     repository.stage1_sessions = [session]
     client = TestClient(create_app(runtime_repository=repository))
@@ -2544,8 +3031,8 @@ def test_development_queue_stage2_capture_complete_locks_stage3_until_runner_exi
     assert response.status_code == 200
     row = response.json()["queue"][0]
     assert row["development_status"] == "stage2_complete"
-    assert row["current_stage"] == "stage3_ready"
-    assert row["next_action"]["type"] == "run_stage3_grid_search"
+    assert row["current_stage"] == "stage2_policy_ready"
+    assert row["next_action"]["type"] == "promote_stage2_exit_policy"
     assert row["stage1_gate"]["stage2_capture"]["exists"] is True
 
 
@@ -2565,6 +3052,7 @@ def test_development_queue_stage3_grid_complete_requests_pyramid(tmp_path, monke
     )
     (promotion_root / "stage2_capture_curve.json").write_text(json.dumps({"metrics": {"total_match_signals": 1}}))
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     (promotion_root / "stage3_grid_results.json").write_text(
         json.dumps({"total_signals": 1, "optimal": {"best": {"tp": 2.5, "sl": 1.0}}})
@@ -2602,6 +3090,7 @@ def test_development_queue_stage3_pyramid_complete_requests_stage4(tmp_path, mon
     )
     (promotion_root / "stage2_capture_curve.json").write_text(json.dumps({"metrics": {"total_match_signals": 1}}))
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     (promotion_root / "stage3_grid_results.json").write_text(
         json.dumps({"total_signals": 1, "optimal": {"best": {"tp": 2.5, "sl": 1.0}}})
@@ -2672,6 +3161,438 @@ def test_development_queue_includes_watchlist_and_pending_as_non_startable(tmp_p
     assert rows["candidate-btc"]["next_action"]["disabled"] is True
     assert rows["candidate-eth"]["development_status"] == "watchlist_not_startable"
     assert rows["candidate-eth"]["next_action"]["disabled"] is True
+
+
+def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True, exist_ok=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {'trade_action': 'SKIP'}\n")
+    (promotion_root / "stage4_realized_expectancy.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": "pyramid",
+                "best_candidate": {"candidate_id": "pyramid", "net_expectancy_pct": 0.24},
+                "cost_assumptions": {"fees_bps_per_side": 5},
+                "slice_windows": [],
+                "candidates": [],
+            }
+        )
+    )
+    (promotion_root / "stage4_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (promotion_root / "stage4_optimal.json").write_text(
+        json.dumps({"best": {"candidate_id": "pyramid", "setup": {"tp_pct": 2.0, "sl_pct": 1.0}}})
+    )
+    (promotion_root / "stage4_summary.md").write_text("# Stage 4 Realized Expectancy\n")
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    promote_response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+    routes_response = client.get("/api/v1/trading/routes")
+    settings_response = client.patch(
+        "/api/v1/trading/routes/aave-live/settings",
+        json={
+            "cron_interval_minutes": 30,
+            "execution_adapter": "okx",
+            "exchange_account": "main-live-01",
+            "margin_allocation_pct": 30,
+            "leverage": 5,
+        },
+    )
+    wake_response = client.post("/api/v1/trading/routes/aave-live/wake")
+
+    assert promote_response.status_code == 200
+    promoted = promote_response.json()
+    assert promoted["bundle"]["status"] == "promoted"
+    assert promoted["bundle"]["execution_setup"]["forward_hours"] == 36
+    assert promoted["bundle"]["execution_setup"]["hard_exit_after_hours"] == 36
+    assert promoted["route"]["route_id"] == "aave-live"
+    assert promoted["route"]["enabled"] is False
+    assert promoted["route"]["blockers"] == ["route_disabled", "data_not_warmed", "route_not_manually_armed"]
+    assert (tmp_path / promoted["bundle"]["bundle_uri"] / "bundle.json").exists()
+    assert routes_response.status_code == 200
+    assert routes_response.json()["routes"][0]["active_bundle_id"] == promoted["bundle"]["bundle_id"]
+    assert settings_response.status_code == 200
+    assert settings_response.json()["route"]["cron_interval_minutes"] == 30
+    assert settings_response.json()["route"]["exchange_account"] == "main-live-01"
+    assert settings_response.json()["route"]["margin_allocation_pct"] == 30
+    assert settings_response.json()["route"]["leverage"] == 5
+    assert wake_response.status_code == 200
+    assert wake_response.json()["wake"]["status"] == "blocked"
+    assert wake_response.json()["wake"]["branch"] == "route_gate"
+
+
+def test_trading_route_archive_hides_route_and_lists_archived_strategy(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'archive.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = repository.create_execution_bundle(_execution_bundle(tmp_path))
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=bundle,
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    repository.update_deployment_route_gate(
+        route["route_id"],
+        enabled=True,
+        manually_armed=True,
+        scheduler_status="running",
+        auto_submit_enabled=True,
+        next_wake_at="2026-06-06T05:00:00Z",
+    )
+    client = TestClient(create_app(runtime_repository=repository))
+
+    archive_response = client.post(f"/api/v1/trading/routes/{route['route_id']}/archive")
+    active_response = client.get("/api/v1/trading/routes")
+    archived_response = client.get("/api/v1/trading/routes/archived")
+    direct_response = client.get(f"/api/v1/trading/routes/{route['route_id']}")
+
+    assert archive_response.status_code == 200
+    archived_route = archive_response.json()["route"]
+    assert archived_route["archived"] is True
+    assert archived_route["archived_at"] is not None
+    assert archived_route["enabled"] is False
+    assert archived_route["scheduler_status"] == "stopped"
+    assert archived_route["auto_submit_enabled"] is False
+    assert archived_route["next_wake_at"] is None
+    assert active_response.status_code == 200
+    assert active_response.json()["routes"] == []
+    assert archived_response.status_code == 200
+    assert archived_response.json()["routes"][0]["route_id"] == route["route_id"]
+    assert direct_response.status_code == 200
+    assert direct_response.json()["route"]["archived"] is True
+
+
+def test_trading_route_wakes_endpoint_paginates_history(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'wake-pagination.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = repository.create_execution_bundle(_execution_bundle(tmp_path))
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=bundle,
+        account_mode="demo",
+        execution_adapter="okx",
+    )
+    for index in range(4):
+        repository.record_wake_run(
+            {
+                "wake_id": f"wake-page-{index}",
+                "route_id": route["route_id"],
+                "bundle_id": bundle["bundle_id"],
+                "status": "completed",
+                "branch": "entry_scan",
+                "blockers": [],
+                "exchange_snapshot": {},
+                "signal_scan_result": {},
+                "strategy_decision": {},
+                "order_intents": [],
+                "adapter_results": [],
+                "error": {},
+                "completed_at": f"2026-06-06T00:0{index}:00Z",
+            }
+        )
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(f"/api/v1/trading/routes/{route['route_id']}/wakes?limit=2&offset=1")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [wake["wake_id"] for wake in payload["wakes"]] == ["wake-page-2", "wake-page-1"]
+    assert payload["total"] == 4
+    assert payload["limit"] == 2
+    assert payload["offset"] == 1
+
+
+def test_trading_wake_auto_warms_required_market_data(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'warmup.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema",
+            "name": "Vegas EMA",
+            "description": "",
+            "version": "0.1",
+            "code_ref": {},
+            "supported_input_data_types": ["candles"],
+            "required_data": [{"data_type": "candles", "origin": "raw", "timeframe": "5m"}],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
+            "configuration_schema": {},
+        }
+    )
+    bundle = _execution_bundle(tmp_path)
+    stored_bundle = repository.create_execution_bundle(bundle)
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=stored_bundle,
+        account_mode="demo",
+        execution_adapter="okx",
+    )
+    repository.update_deployment_route_gate(route["route_id"], enabled=True, manually_armed=True)
+
+    class FakeMarketDataRepository:
+        def get_raw_candle_ref(self, asset, timeframe="5m"):
+            return {
+                "dataset_id": f"{asset.lower()}-raw-{timeframe}",
+                "asset": asset,
+                "instrument": f"{asset}-USDT-SWAP",
+                "data_type": "candles",
+                "timeframe": timeframe,
+                "data_origin": "raw",
+                "start_ts": "2026-03-01T00:00:00Z",
+                "end_ts": "2026-06-01T00:00:00Z",
+                "row_count": 100,
+                "storage_uri": str(tmp_path / "market-data"),
+            }
+
+        def list_derived_refs_for_raw(self, registration):
+            return []
+
+    fill_calls = []
+
+    def fake_fill_service(*, registration, repository, adapter):
+        fill_calls.append(registration["dataset_id"])
+        return {
+            "dataset_id": registration["dataset_id"],
+            "status": "current",
+            "rows_added": 0,
+            "derived_rebuilt": [],
+        }
+
+    signal_extension_calls = []
+
+    def fake_signal_extender(*, workspace_root, repository, signal_engine_id, asset, target_end):
+        signal_extension_calls.append((signal_engine_id, asset, target_end))
+        return {
+            "status": "noop",
+            "signal_engine_id": signal_engine_id,
+            "asset": asset,
+            "appended_packet_count": 0,
+        }
+
+    class FakeOKXAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def readiness_blockers(self):
+            return []
+
+        def snapshot(self, instrument):
+            return {"instrument": instrument, "positions": [], "open_orders": []}
+
+    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    client = TestClient(
+        create_app(
+            runtime_repository=repository,
+            market_data_repository=FakeMarketDataRepository(),
+            market_data_fill_service=fake_fill_service,
+            signal_pool_extension_service=fake_signal_extender,
+            live_signal_scan_service=lambda **kwargs: None,
+        )
+    )
+
+    response = client.post(f"/api/v1/trading/routes/{route['route_id']}/wake")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["warmup"]["status"] == "warmed"
+    assert payload["route"]["data_warmed"] is True
+    assert payload["wake"]["status"] == "completed"
+    assert payload["wake"]["signal_scan_result"]["status"] == "no_fresh_signal"
+    assert fill_calls == ["aave-raw-5m"]
+    assert signal_extension_calls == [("vegas_ema", "AAVE", None)]
+
+
+def test_submit_wake_orders_places_order_and_persists_owner_state(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'submit.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = _execution_bundle(tmp_path)
+    stored_bundle = repository.create_execution_bundle(bundle)
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=stored_bundle,
+        account_mode="demo",
+        execution_adapter="okx",
+    )
+    repository.update_deployment_route_gate(route["route_id"], enabled=True, data_warmed=True, manually_armed=True)
+    wake = repository.record_wake_run(
+        {
+            "wake_id": "wake-submit-1",
+            "route_id": route["route_id"],
+            "bundle_id": stored_bundle["bundle_id"],
+            "status": "completed",
+            "branch": "entry_scan",
+            "blockers": [],
+            "exchange_snapshot": {},
+            "signal_scan_result": {"status": "evaluated", "signal_id": "signal-1"},
+            "strategy_decision": {"action": "ENTER"},
+            "order_intents": [
+                {
+                    "intent_id": "wake-submit-1:0",
+                    "route_id": route["route_id"],
+                    "asset": "AAVE",
+                    "instrument": "AAVE-USDT-SWAP",
+                    "signal_id": "signal-1",
+                    "side": "buy",
+                    "direction": "LONG",
+                    "order_type": "market",
+                    "quantity": "1.25",
+                    "notional_usd": 10,
+                    "trade_mode": "isolated",
+                    "reduce_only": False,
+                    "client_order_id": "motis-submit-1",
+                    "status": "intent_only",
+                }
+            ],
+            "adapter_results": [],
+            "error": {},
+            "completed_at": "2026-06-05T00:00:00Z",
+        }
+    )
+
+    class FakeOKXAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def place_swap_order(self, request):
+            return {"ordId": "okx-order-1", "clOrdId": request.client_order_id}
+
+    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        f"/api/v1/trading/routes/{route['route_id']}/wakes/{wake['wake_id']}/submit-orders",
+        json={"confirm_live": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "submitted"
+    assert payload["submitted_count"] == 1
+    assert payload["wake"]["order_intents"][0]["status"] == "submitted"
+    assert payload["wake"]["adapter_results"][0]["ordId"] == "okx-order-1"
+    assert repository.get_open_owner_state(route["route_id"])["opened_from_signal_id"] == "signal-1"
+
+
+def test_trading_route_exchange_health_reports_connected_backend_adapter(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'exchange-health.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = repository.create_execution_bundle(_execution_bundle(tmp_path))
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=bundle,
+        account_mode="live",
+        execution_adapter="okx",
+    )
+    repository.update_deployment_route_gate(route["route_id"], exchange_account="live")
+
+    class FakeOKXAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def readiness_blockers(self):
+            return []
+
+        def snapshot(self, instrument):
+            return {
+                "instrument": instrument,
+                "positions": [{"instId": instrument, "pos": "0.01"}],
+                "open_orders": [],
+                "protection_orders": [],
+                "recent_fills": [{"instId": instrument, "ordId": "fill-1"}],
+                "balance": {"data": [{"ccy": "USDT", "eqUsd": "100"}]},
+            }
+
+        def _cli_path(self):
+            return "/opt/homebrew/bin/okx"
+
+    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(f"/api/v1/trading/routes/{route['route_id']}/exchange-health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "connected"
+    assert payload["connected"] is True
+    assert payload["adapter"] == "okx"
+    assert payload["account_mode"] == "live"
+    assert payload["exchange_account"] == "live"
+    assert payload["instrument"] == "AAVE-USDT-SWAP"
+    assert payload["cli_path"].endswith("okx")
+    assert payload["snapshot"]["position_count"] == 1
+    assert payload["snapshot"]["recent_fill_count"] == 1
+    assert payload["error"] is None
+
+
+def test_trading_route_exchange_health_reports_sanitized_adapter_failure(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'exchange-health-failure.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = repository.create_execution_bundle(_execution_bundle(tmp_path))
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=bundle,
+        account_mode="live",
+        execution_adapter="okx",
+    )
+
+    class FakeOKXAdapter:
+        def __init__(self, config):
+            self.config = config
+
+        def readiness_blockers(self):
+            return []
+
+        def snapshot(self, instrument):
+            raise api_main.OKXCLIError("Error: Not logged in\nsecret_key=should-not-leak")
+
+        def _cli_path(self):
+            return "/opt/homebrew/bin/okx"
+
+    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(f"/api/v1/trading/routes/{route['route_id']}/exchange-health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "disconnected"
+    assert payload["connected"] is False
+    assert payload["error"] == "Error: Not logged in"
+    assert "secret" not in payload["error"]
+    assert payload["snapshot"] == {}
+
+
+def _execution_bundle(tmp_path):
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    strategy_path = bundle_root / "strategy.py"
+    strategy_path.write_text("def decide(context):\n    return {'trade_action': 'SKIP'}\n")
+    return {
+        "bundle_id": "aave-vegas_ema-strategy-submit",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "strategy_id": "aave-vegas-tunnel-v01",
+        "strategy_version": "v0.1",
+        "source_stage1_session_id": "stage1-aave",
+        "source_stage4_result_path": "dev/training_sessions/aave/promotion/stage4_realized_expectancy.json",
+        "bundle_uri": str(bundle_root),
+        "strategy_module_ref": str(strategy_path),
+        "execution_setup": {"stage4_candidate_id": "candidate-1"},
+        "risk_limits": {"max_notional_usd": 1000, "max_daily_loss_usd": 250},
+        "evidence_refs": {"stage4_optimal": "stage4_optimal.json"},
+        "content_hash": "submit",
+        "status": "promoted",
+    }
 
 
 def _queue_universe_run():

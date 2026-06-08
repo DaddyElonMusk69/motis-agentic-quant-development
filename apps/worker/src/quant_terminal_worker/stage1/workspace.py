@@ -189,6 +189,64 @@ def list_stage1_iterations(*, workspace_root: Path, session: dict[str, Any]) -> 
     ]
 
 
+def read_stage1_iteration_detail(*, workspace_root: Path, session: dict[str, Any], iteration_id: str) -> dict[str, Any]:
+    artifact_root = _artifact_root(workspace_root, session)
+    iteration_root = artifact_root / "iterations" / iteration_id
+    if not iteration_root.is_dir():
+        raise FileNotFoundError(f"Stage 1 iteration not found: {iteration_id}")
+
+    summary = _summarize_iteration(iteration_root=iteration_root)
+    sample_role = summary.get("sample_method") if summary.get("sample_method") in SAMPLE_ROLE_ARTIFACTS else "training"
+    score_path = iteration_root / "scores" / SAMPLE_ROLE_ARTIFACTS[sample_role]["scores"]
+    score_payload = _read_json_if_exists(score_path)
+    if score_payload is None:
+        raise ValueError(f"Stage 1 iteration has not been scored for {sample_role}")
+
+    sample_payload = json.loads((iteration_root / "signal_sample.json").read_text())
+    signal_items = sample_payload.get("signals", []) if isinstance(sample_payload, dict) else []
+    sample_by_signal_id = {
+        str(item.get("signal_id")): item
+        for item in signal_items
+        if isinstance(item, dict) and item.get("signal_id")
+    }
+
+    records = []
+    monthly_groups: dict[str, list[dict[str, Any]]] = {}
+    for record in score_payload.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        sample_item = sample_by_signal_id.get(str(record.get("signal_id")), {})
+        timestamp = sample_item.get("timestamp")
+        detailed_record = {
+            **record,
+            "timestamp": timestamp,
+            "packet_path": sample_item.get("packet_path"),
+        }
+        records.append(detailed_record)
+        month_key = timestamp[:7] if isinstance(timestamp, str) and len(timestamp) >= 7 else "unknown"
+        monthly_groups.setdefault(month_key, []).append(detailed_record)
+
+    monthly = [
+        {
+            "month": month,
+            "metrics": _detail_metrics(items),
+        }
+        for month, items in sorted(monthly_groups.items(), key=lambda item: item[0])
+    ]
+
+    return {
+        "iteration_id": summary["iteration_id"],
+        "sample_role": sample_role,
+        "bundle_role": summary.get("bundle_role"),
+        "signal_count": summary.get("signal_count", len(records)),
+        "metrics": score_payload.get("metrics", {}),
+        "records": records,
+        "monthly": monthly,
+        "score_path": str(score_path),
+        "signal_sample_path": summary.get("signal_sample_path"),
+    }
+
+
 def repair_stage1_iteration_bundle(*, workspace_root: Path, iteration_root: Path) -> dict[str, Any]:
     artifact_root = iteration_root.parent.parent
     session_manifest = _read_json_if_exists(artifact_root / "manifest.json") or {}
@@ -291,6 +349,7 @@ def build_stage1_gate_summary(*, workspace_root: Path, session: dict[str, Any]) 
     ready_to_freeze = not blockers
     canonical = _canonical_readout_state(artifact_root)
     stage2_capture = _stage2_capture_state(artifact_root)
+    stage2_exit_policy = _stage2_exit_policy_state(artifact_root)
     stage3_grid = _stage3_grid_state(artifact_root)
     stage3_pyramid = _stage3_pyramid_state(artifact_root)
     stage4_realized_expectancy = _stage4_realized_expectancy_state(artifact_root)
@@ -305,6 +364,7 @@ def build_stage1_gate_summary(*, workspace_root: Path, session: dict[str, Any]) 
         "roles": roles,
         "canonical_readout": canonical,
         "stage2_capture": stage2_capture,
+        "stage2_exit_policy": stage2_exit_policy,
         "stage3_grid": stage3_grid,
         "stage3_pyramid": stage3_pyramid,
         "stage4_realized_expectancy": stage4_realized_expectancy,
@@ -381,15 +441,36 @@ def _canonical_readout_state(artifact_root: Path) -> dict[str, Any]:
 def _stage2_capture_state(artifact_root: Path) -> dict[str, Any]:
     capture_path = artifact_root / "promotion" / "stage2_capture_curve.json"
     per_signal_path = artifact_root / "promotion" / "stage2_capture_per_signal.json"
+    stage3_inputs_path = artifact_root / "promotion" / "stage3_trade_inputs.json"
     summary_path = artifact_root / "promotion" / "stage2_summary.md"
     capture = _read_json_if_exists(capture_path)
     return {
-        "exists": capture is not None and per_signal_path.exists() and summary_path.exists(),
+        "exists": capture is not None and per_signal_path.exists() and stage3_inputs_path.exists() and summary_path.exists(),
         "capture_curve_path": str(capture_path) if capture_path.exists() else None,
         "per_signal_path": str(per_signal_path) if per_signal_path.exists() else None,
+        "stage3_trade_inputs_path": str(stage3_inputs_path) if stage3_inputs_path.exists() else None,
         "summary_path": str(summary_path) if summary_path.exists() else None,
         "metrics": capture.get("metrics", {}) if capture else {},
         "results": capture.get("results", {}) if capture else {},
+        "cohorts": capture.get("cohorts", {}) if capture else {},
+        "stage3_input": capture.get("stage3_input", {}) if capture else {},
+        "tp_levels": capture.get("tp_levels", []) if capture else [],
+        "total_trade_decisions": (capture.get("metrics") or {}).get("total_trade_decisions", 0) if capture else 0,
+        "match_count": (capture.get("metrics") or {}).get("match_count", 0) if capture else 0,
+        "mismatch_count": (capture.get("metrics") or {}).get("mismatch_count", 0) if capture else 0,
+        "recommended_tp_min_pct": (capture.get("stage3_input") or {}).get("recommended_tp_min_pct") if capture else None,
+        "recommended_tp_max_pct": (capture.get("stage3_input") or {}).get("recommended_tp_max_pct") if capture else None,
+    }
+
+
+def _stage2_exit_policy_state(artifact_root: Path) -> dict[str, Any]:
+    policy_path = artifact_root / "promotion" / "stage2_exit_policy.json"
+    policy = _read_json_if_exists(policy_path)
+    return {
+        "exists": policy is not None,
+        "policy_path": str(policy_path) if policy_path.exists() else None,
+        "policy": policy.get("policy", {}) if policy else {},
+        "created_at": policy.get("created_at") if policy else None,
     }
 
 
@@ -405,15 +486,38 @@ def _stage3_grid_state(artifact_root: Path) -> dict[str, Any]:
         best = optimal.get("best")
     if best is None and grid:
         best = (grid.get("optimal") or {}).get("best")
+    fixed_complete = bool(grid and grid.get("fixed_sl_complete")) or bool(grid and grid.get("fixed_sl_baseline_result"))
+    exact_complete = bool(grid and grid.get("exact_protection_complete")) or bool(
+        grid and (grid.get("exact_protection_result") or grid.get("exact_policy_result"))
+    )
+    local_complete = bool(grid and grid.get("local_variants_complete")) or bool(
+        grid is not None and optimal is not None and candidates_path.exists() and summary_path.exists()
+    )
     return {
-        "exists": grid is not None and optimal is not None and candidates_path.exists() and summary_path.exists(),
+        "exists": local_complete,
+        "fixed_sl_complete": fixed_complete,
+        "exact_protection_complete": exact_complete,
+        "local_variants_complete": local_complete,
         "grid_results_path": str(grid_path) if grid_path.exists() else None,
         "optimal_path": str(optimal_path) if optimal_path.exists() else None,
         "stage4_candidates_path": str(candidates_path) if candidates_path.exists() else None,
         "summary_path": str(summary_path) if summary_path.exists() else None,
         "total_signals": grid.get("total_signals", 0) if grid else 0,
+        "total_executable_decisions": grid.get("total_executable_decisions", grid.get("total_signals", 0)) if grid else 0,
         "forward_hours": grid.get("forward_hours") if grid else None,
         "leverage": grid.get("leverage") if grid else None,
+        "tp_range_source": grid.get("tp_range_source") if grid else None,
+        "tp_values": grid.get("tp_values", []) if grid else [],
+        "sl_values": grid.get("sl_values", []) if grid else [],
+        "fees_bps_per_side": grid.get("fees_bps_per_side") if grid else None,
+        "stage0_risk_policy": grid.get("stage0_risk_policy", {}) if grid else {},
+        "stage2_exit_policy": grid.get("stage2_exit_policy", {}) if grid else {},
+        "fixed_sl_baseline_result": grid.get("fixed_sl_baseline_result", {}) if grid else {},
+        "exact_protection_result": grid.get("exact_protection_result", {}) if grid else {},
+        "exact_policy_result": grid.get("exact_policy_result", {}) if grid else {},
+        "stage3c_total_combinations_tested": grid.get("stage3c_total_combinations_tested", 0) if grid else 0,
+        "stage3c_value_ranges": grid.get("stage3c_value_ranges", {}) if grid else {},
+        "stage3c_shortlist": grid.get("stage3c_shortlist", []) if grid else [],
         "best": best or {},
         "top_5": (optimal.get("top_5") if optimal else (grid.get("optimal") or {}).get("top_5") if grid else []) or [],
     }
@@ -449,8 +553,10 @@ def _stage4_realized_expectancy_state(artifact_root: Path) -> dict[str, Any]:
     ledger_path = artifact_root / "promotion" / "stage4_trade_ledger.json"
     optimal_path = artifact_root / "promotion" / "stage4_optimal.json"
     summary_path = artifact_root / "promotion" / "stage4_summary.md"
+    run_index_path = artifact_root / "promotion" / "stage4_runs" / "index.json"
     realized = _read_json_if_exists(realized_path)
     optimal = _read_json_if_exists(optimal_path)
+    run_index = _read_json_if_exists(run_index_path) or {}
     best = None
     if optimal:
         best = optimal.get("best")
@@ -465,6 +571,10 @@ def _stage4_realized_expectancy_state(artifact_root: Path) -> dict[str, Any]:
         "best_candidate_id": realized.get("best_candidate_id") if realized else None,
         "best_candidate": best or {},
         "candidates": realized.get("candidates", []) if realized else [],
+        "latest_run_id": realized.get("run_id") if realized else run_index.get("latest_run_id"),
+        "latest_simulation_inputs": realized.get("simulation_inputs", {}) if realized else {},
+        "latest_account": (best or {}).get("account", {}) if best else {},
+        "stage4_runs": run_index.get("runs", []),
     }
 
 
@@ -532,6 +642,25 @@ def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
         return None
     payload = json.loads(path.read_text())
     return payload if isinstance(payload, dict) else None
+
+
+def _detail_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    matches = sum(1 for record in records if record.get("agreement") == "MATCH")
+    mismatches = sum(1 for record in records if record.get("agreement") == "MISMATCH")
+    neutral = sum(1 for record in records if record.get("agreement") == "NEUTRAL")
+    scoreable = matches + mismatches
+    directional_agreement = round(matches / scoreable, 6) if scoreable else 0
+    threshold = 55.0
+    return {
+        "total": len(records),
+        "matches": matches,
+        "mismatches": mismatches,
+        "neutral": neutral,
+        "scoreable": scoreable,
+        "directional_agreement": directional_agreement,
+        "promotion_threshold_pct": threshold,
+        "passes_threshold": directional_agreement * 100 >= threshold,
+    }
 
 
 def _all_window_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:

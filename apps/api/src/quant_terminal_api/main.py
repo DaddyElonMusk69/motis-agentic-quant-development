@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import re
-from datetime import date, datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,9 @@ from quant_terminal_worker.backtests.stage1 import run_stage1_backtest
 from quant_terminal_worker.ingestion.raw_candle_fill import fill_raw_candle_dataset
 from quant_terminal_worker.ingestion.legacy_signals import import_legacy_signal_sets
 from quant_terminal_worker.ingestion.signal_pool_extension import extend_signal_pool_from_local_candles
+from quant_terminal_worker.execution.lifecycle import run_route_lifecycle_cycle
+from quant_terminal_worker.execution.order_submission import submit_wake_order_intents
+from quant_terminal_worker.execution.scheduler import RouteLifecycleScheduler
 from quant_terminal_worker.stage0.workspace import build_stage0_commands
 from quant_terminal_worker.stage0.workspace import read_parquet_candles_for_stage0
 from quant_terminal_worker.stage0.execution import execute_stage0_candidate
@@ -36,12 +42,16 @@ from quant_terminal_worker.stage1.workspace import materialize_stage1_session_wo
 from quant_terminal_worker.stage1.workspace import create_stage1_iteration_workspace
 from quant_terminal_worker.stage1.workspace import build_stage1_gate_summary
 from quant_terminal_worker.stage1.workspace import list_stage1_iterations
+from quant_terminal_worker.stage1.workspace import read_stage1_iteration_detail
 from quant_terminal_worker.stage1.scoring import run_stage1a_training_score
 from quant_terminal_worker.stage1.scoring import run_stage1a_score
 from quant_terminal_worker.stage1.scoring import run_stage1a_canonical_full_cycle
 from quant_terminal_worker.stage1.scoring import generate_stage1a_failure_audit
 from quant_terminal_worker.stage2.capture_curve import run_stage2_capture_curve
+from quant_terminal_worker.stage3.grid_search import run_stage3_exact_protection
+from quant_terminal_worker.stage3.grid_search import run_stage3_fixed_sl_baseline
 from quant_terminal_worker.stage3.grid_search import run_stage3_grid_search
+from quant_terminal_worker.stage3.grid_search import run_stage3_local_variants
 from quant_terminal_worker.stage3.pyramid import run_stage3_pyramid
 from quant_terminal_worker.stage4.realized_expectancy import run_stage4_realized_expectancy
 
@@ -70,6 +80,7 @@ class SignalEngineRegistrationRequest(BaseModel):
     description: str = ""
     code_ref: dict[str, Any] = Field(default_factory=dict)
     supported_input_data_types: list[str] = Field(default_factory=lambda: ["candles"])
+    required_data: list[dict[str, Any]] = Field(default_factory=list)
     output_envelope_version: str = "signal_envelope.v1"
     live_scanner_entrypoint: str | None = None
     configuration_schema: dict[str, Any] = Field(default_factory=dict)
@@ -110,11 +121,28 @@ class Stage1SessionCreateRequest(BaseModel):
     train_end: str | None = None
     walk_forward_start: str | None = None
     walk_forward_end: str | None = None
+    seed_strategy_preference: str = "auto"
 
 
 class Stage1IterationCreateRequest(BaseModel):
     sample_method: str = "training"
     bundle_role: str = "strategy_builder"
+
+
+class Stage1CanonicalRequest(BaseModel):
+    force: bool = False
+
+
+class Stage2ExitPolicyRequest(BaseModel):
+    lock_profit_pct: float = Field(ge=0)
+    protect_trigger_pct: float = Field(gt=0)
+    trail_sl_pct: float = Field(ge=0)
+
+
+class Stage4RealizedExpectancyRequest(BaseModel):
+    initial_capital_usdt: float = Field(default=10_000.0, gt=0)
+    margin_allocation_pct: float = Field(default=30.0, gt=0, le=100)
+    leverage: float = Field(default=5.0, ge=1, le=125)
 
 
 class LegacySignalImportRequest(BaseModel):
@@ -137,6 +165,7 @@ class Stage0RunRequest(BaseModel):
 
 class Stage0UniverseRunRequest(BaseModel):
     universe_run_id: str
+    name: str | None = None
     train_start: str
     train_end: str
     walk_forward_start: str
@@ -153,6 +182,37 @@ class ExecuteStage0CandidateRequest(BaseModel):
 
 class ExecuteStage0CandidateBatchRequest(BaseModel):
     limit: int = Field(default=500, ge=1, le=1000)
+
+
+class ExecutionBundlePromotionRequest(BaseModel):
+    account_mode: str = "live"
+    execution_adapter: str = "okx"
+    risk_limits: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "max_notional_usd": 1000,
+            "max_daily_loss_usd": 250,
+        }
+    )
+
+
+class OrderSubmissionRequest(BaseModel):
+    confirm_live: bool = False
+    quantity: str | None = None
+    notional_usd: float | None = None
+
+
+class DeploymentRouteSettingsRequest(BaseModel):
+    cron_interval_minutes: int = Field(ge=1, le=1440)
+    execution_adapter: str = "okx"
+    exchange_account: str = "default"
+    margin_allocation_pct: float = Field(default=10.0, ge=0.1, le=100.0)
+    leverage: float = Field(default=1.0, ge=1.0, le=125.0)
+    auto_submit_enabled: bool = False
+
+
+class DeploymentRouteStartRequest(BaseModel):
+    confirm_live: bool = False
+    auto_submit_enabled: bool = False
 
 
 DEFAULT_WALK_FORWARD_TEMPLATES: list[dict[str, Any]] = [
@@ -173,6 +233,7 @@ def create_app(
     runtime_repository: Any | None = None,
     stage0_executor: Any | None = None,
     signal_pool_extension_service: Any | None = None,
+    live_signal_scan_service: Any | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Motis Deterministic Quant Terminal", version="0.1.0")
     app.add_middleware(
@@ -187,6 +248,7 @@ def create_app(
     runtime_repo = runtime_repository
     injected_stage0_executor = stage0_executor
     signal_pool_extender = signal_pool_extension_service
+    live_signal_scanner = live_signal_scan_service
 
     def get_market_data_repository() -> Any:
         nonlocal repository
@@ -205,6 +267,50 @@ def create_app(
                 raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
             runtime_repo = RuntimeRepository(database_url)
         return runtime_repo
+
+    def build_execution_adapter(route: dict[str, Any]) -> OKXAdapter:
+        if route.get("execution_adapter") != "okx":
+            raise HTTPException(status_code=400, detail=f"unsupported execution adapter: {route.get('execution_adapter')}")
+        return OKXAdapter(
+            {
+                "backend": "okx_cli",
+                "mode": route["account_mode"] if route.get("account_mode") in {"demo", "live"} else os.environ.get("OKX_MODE", "demo"),
+                "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+            }
+        )
+
+    def run_lifecycle_cycle_for_route(route_id: str) -> dict[str, Any]:
+        route = get_runtime_repository().get_deployment_route(route_id)
+        if route is None:
+            raise ValueError(f"deployment route not found: {route_id}")
+        non_data_blockers = [blocker for blocker in route.get("blockers", []) if blocker != "data_not_warmed"]
+        return run_route_lifecycle_cycle(
+            route_id=route_id,
+            runtime_repository=get_runtime_repository(),
+            market_data_repository=None if non_data_blockers else get_market_data_repository(),
+            fill_service=fill_service or fill_raw_candle_dataset,
+            signal_pool_extender=signal_pool_extender,
+            live_signal_scanner=live_signal_scanner,
+            adapter=build_execution_adapter(route),
+            workspace_root=Path.cwd(),
+        )
+
+    scheduler = RouteLifecycleScheduler(
+        load_route=lambda route_id: get_runtime_repository().get_deployment_route(route_id),
+        list_routes=lambda: get_runtime_repository().list_deployment_routes(),
+        update_route=lambda route_id, updates: get_runtime_repository().update_deployment_route_gate(route_id, **updates),
+        run_cycle=run_lifecycle_cycle_for_route,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            scheduler.resume_running()
+        except Exception:
+            pass
+        yield
+
+    app.router.lifespan_context = lifespan
 
     def run_stage0_candidate(universe_run: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
         if injected_stage0_executor is not None:
@@ -377,6 +483,8 @@ def create_app(
 
     @app.post("/api/v1/research/stage1-sessions")
     def create_stage1_research_session(request: Stage1SessionCreateRequest) -> dict[str, Any]:
+        if request.seed_strategy_preference not in {"auto", "engine_base", "latest_pair"}:
+            raise HTTPException(status_code=400, detail="seed_strategy_preference must be auto, engine_base, or latest_pair")
         candidate = get_runtime_repository().get_stage0_universe_candidate(request.source_candidate_id)
         if candidate is None:
             raise HTTPException(status_code=404, detail="Stage 0 candidate not found")
@@ -400,6 +508,7 @@ def create_app(
             repository=get_runtime_repository(),
             candidate=candidate,
             strategy_id=request.strategy_id,
+            preference=request.seed_strategy_preference,
         )
         manifest = {
             "schema_version": "0.1",
@@ -452,6 +561,27 @@ def create_app(
         materialize_stage1_session_workspace(workspace_root=Path.cwd(), session=session)
         get_runtime_repository().create_stage1_research_session(session)
         return {"session": session}
+
+    @app.delete("/api/v1/research/stage1-sessions/{session_id}")
+    def reset_stage1_research_session(session_id: str) -> dict[str, Any]:
+        session = get_runtime_repository().get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        _ensure_stage1_session_mutable(session)
+        artifact_root = Path(session["artifact_root"])
+        if not artifact_root.is_absolute():
+            artifact_root = Path.cwd() / artifact_root
+        if artifact_root.exists():
+            shutil.rmtree(artifact_root)
+        deleter = getattr(get_runtime_repository(), "delete_stage1_research_session", None)
+        if not callable(deleter):
+            raise HTTPException(status_code=501, detail="Stage 1 session deletion is not supported by this repository")
+        deleter(session_id)
+        return {
+            "status": "deleted",
+            "session_id": session_id,
+            "source_candidate_id": session["source_candidate_id"],
+        }
 
     @app.post("/api/v1/research/stage1-sessions/{session_id}/iterations")
     def create_stage1_research_iteration(
@@ -506,6 +636,23 @@ def create_app(
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
         iterations = list_stage1_iterations(workspace_root=Path.cwd(), session=session)
         return {"iterations": [_relative_nested_paths(Path.cwd(), iteration) for iteration in iterations]}
+
+    @app.get("/api/v1/research/stage1-sessions/{session_id}/iterations/{iteration_id}/details")
+    def get_stage1_research_iteration_detail(session_id: str, iteration_id: str) -> dict[str, Any]:
+        session = get_runtime_repository().get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        try:
+            detail = read_stage1_iteration_detail(
+                workspace_root=Path.cwd(),
+                session=session,
+                iteration_id=iteration_id,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"detail": _relative_nested_paths(Path.cwd(), detail)}
 
     @app.delete("/api/v1/research/stage1-sessions/{session_id}/iterations/{iteration_id}")
     def delete_stage1_research_iteration(session_id: str, iteration_id: str) -> dict[str, Any]:
@@ -576,12 +723,12 @@ def create_app(
         return signals_by_role
 
     @app.post("/api/v1/research/stage1-sessions/{session_id}/canonical-stage1a")
-    def run_stage1_canonical_readout(session_id: str) -> dict[str, Any]:
+    def run_stage1_canonical_readout(session_id: str, request: Stage1CanonicalRequest = Stage1CanonicalRequest()) -> dict[str, Any]:
         session = get_runtime_repository().get_stage1_research_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
-        if not gate["ready_to_freeze"]:
+        if not gate["ready_to_freeze"] and not request.force:
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -606,6 +753,7 @@ def create_app(
         if callable(updater):
             updater(session_id=session_id, status="stage1a_frozen", manifest=frozen_manifest)
         return {
+            "forced": bool(request.force and not gate["ready_to_freeze"]),
             "canonical_readout": _relative_nested_paths(Path.cwd(), result),
             "gate": _relative_nested_paths(
                 Path.cwd(),
@@ -639,8 +787,75 @@ def create_app(
             ),
         }
 
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage2/exit-policy")
+    def promote_stage2_exit_policy(session_id: str, request: Stage2ExitPolicyRequest) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
+        if not (gate.get("stage2_capture") or {}).get("exists"):
+            raise HTTPException(status_code=400, detail="Stage 2 exit policy requires completed Stage 2 travel capture")
+
+        artifact_root = Path(session["artifact_root"])
+        if not artifact_root.is_absolute():
+            artifact_root = Path.cwd() / artifact_root
+        promotion_root = artifact_root / "promotion"
+        capture_path = promotion_root / "stage2_capture_curve.json"
+        capture = json.loads(capture_path.read_text())
+        allowed = _stage2_policy_allowed_values(capture)
+        selected = {
+            "lock_profit_pct": float(request.lock_profit_pct),
+            "protect_trigger_pct": float(request.protect_trigger_pct),
+            "trail_sl_pct": float(request.trail_sl_pct),
+        }
+        invalid = [key for key, value in selected.items() if round(value, 10) not in allowed]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Stage 2 policy values must be selected from the capture curve TP band: {', '.join(invalid)}")
+        if request.trail_sl_pct > request.protect_trigger_pct:
+            raise HTTPException(status_code=400, detail="trail_sl_pct cannot be greater than protect_trigger_pct")
+        if request.protect_trigger_pct > request.lock_profit_pct:
+            raise HTTPException(status_code=400, detail="protect_trigger_pct cannot be greater than lock_profit_pct")
+
+        policy = {
+            "schema_version": "0.1",
+            "stage": "stage2_exit_policy_handoff",
+            "artifact_role": "stage2_exit_policy",
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "session_id": session_id,
+            "asset": session.get("asset"),
+            "strategy_id": session.get("strategy_id"),
+            "policy": selected,
+            "source": {
+                "capture_curve_path": str(capture_path),
+                "selection_source": "stage2_capture_curve_tp_band",
+            },
+        }
+        policy_path = promotion_root / "stage2_exit_policy.json"
+        policy_path.write_text(json.dumps(policy, indent=2) + "\n")
+        gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
+        return {
+            "stage2_exit_policy": _relative_nested_paths(Path.cwd(), gate["stage2_exit_policy"]),
+            "gate": _relative_nested_paths(Path.cwd(), gate),
+        }
+
     @app.post("/api/v1/research/stage1-sessions/{session_id}/stage3/grid-search")
     def run_stage3_grid_readout(session_id: str) -> dict[str, Any]:
+        return _run_stage3_grid_step(session_id, step="grid_search")
+
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage3/fixed-sl")
+    def run_stage3_fixed_sl_readout(session_id: str) -> dict[str, Any]:
+        return _run_stage3_grid_step(session_id, step="fixed_sl")
+
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage3/exact-protection")
+    def run_stage3_exact_protection_readout(session_id: str) -> dict[str, Any]:
+        return _run_stage3_grid_step(session_id, step="exact_protection")
+
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage3/local-variants")
+    def run_stage3_local_variants_readout(session_id: str) -> dict[str, Any]:
+        return _run_stage3_grid_step(session_id, step="local_variants")
+
+    def _run_stage3_grid_step(session_id: str, *, step: str) -> dict[str, Any]:
         repository = get_runtime_repository()
         session = repository.get_stage1_research_session(session_id)
         if session is None:
@@ -648,8 +863,16 @@ def create_app(
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
         if not (gate.get("stage2_capture") or {}).get("exists"):
             raise HTTPException(status_code=400, detail="Stage 3 requires completed Stage 2 travel capture")
+        if not (gate.get("stage2_exit_policy") or {}).get("exists"):
+            raise HTTPException(status_code=400, detail="Stage 3 requires promoted Stage 2 exit policy")
         try:
-            result = run_stage3_grid_search(
+            runner = {
+                "grid_search": run_stage3_grid_search,
+                "fixed_sl": run_stage3_fixed_sl_baseline,
+                "exact_protection": run_stage3_exact_protection,
+                "local_variants": run_stage3_local_variants,
+            }[step]
+            result = runner(
                 workspace_root=Path.cwd(),
                 session=session,
                 candles=_stage2_raw_candles(session, repository=repository),
@@ -672,7 +895,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
         if not (gate.get("stage3_grid") or {}).get("exists"):
-            raise HTTPException(status_code=400, detail="Stage 3 pyramid requires completed Stage 3 grid search")
+            raise HTTPException(status_code=400, detail="Stage 3 pyramid requires completed Stage 3 policy test")
         try:
             result = run_stage3_pyramid(
                 workspace_root=Path.cwd(),
@@ -690,7 +913,10 @@ def create_app(
         }
 
     @app.post("/api/v1/research/stage1-sessions/{session_id}/stage4/realized-expectancy")
-    def run_stage4_realized_expectancy_readout(session_id: str) -> dict[str, Any]:
+    def run_stage4_realized_expectancy_readout(
+        session_id: str,
+        request: Stage4RealizedExpectancyRequest = Stage4RealizedExpectancyRequest(),
+    ) -> dict[str, Any]:
         repository = get_runtime_repository()
         session = repository.get_stage1_research_session(session_id)
         if session is None:
@@ -704,6 +930,9 @@ def create_app(
                 session=session,
                 signal_rows=_flatten_signal_roles(_stage1_full_cycle_signals(session)),
                 candles=_stage2_raw_candles(session, repository=repository),
+                initial_capital_usdt=request.initial_capital_usdt,
+                margin_allocation_pct=request.margin_allocation_pct,
+                leverage=request.leverage,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -713,6 +942,281 @@ def create_app(
                 Path.cwd(),
                 build_stage1_gate_summary(workspace_root=Path.cwd(), session=session),
             ),
+        }
+
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/promote-execution-bundle")
+    def promote_execution_bundle(
+        session_id: str,
+        request: ExecutionBundlePromotionRequest = ExecutionBundlePromotionRequest(),
+    ) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
+        if not (gate.get("stage4_realized_expectancy") or {}).get("exists"):
+            raise HTTPException(status_code=400, detail="Execution bundle promotion requires completed Stage 4 evidence")
+        try:
+            bundle = _materialize_execution_bundle(
+                workspace_root=Path.cwd(),
+                repository=repository,
+                session=session,
+                gate=gate,
+                account_mode=request.account_mode,
+                execution_adapter=request.execution_adapter,
+                risk_limits=request.risk_limits,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        stored_bundle = repository.create_execution_bundle(bundle)
+        route = repository.upsert_deployment_route_for_bundle(
+            bundle=stored_bundle,
+            account_mode=request.account_mode,
+            execution_adapter=request.execution_adapter,
+        )
+        return {
+            "bundle": _relative_nested_paths(Path.cwd(), stored_bundle),
+            "route": _relative_nested_paths(Path.cwd(), route),
+        }
+
+    @app.get("/api/v1/trading/routes")
+    def list_trading_routes() -> dict[str, Any]:
+        return {"routes": _relative_nested_paths(Path.cwd(), get_runtime_repository().list_deployment_routes())}
+
+    @app.get("/api/v1/trading/routes/archived")
+    def list_archived_trading_routes() -> dict[str, Any]:
+        archived_routes = [
+            route
+            for route in get_runtime_repository().list_deployment_routes(include_archived=True)
+            if route.get("archived")
+        ]
+        return {"routes": _relative_nested_paths(Path.cwd(), archived_routes)}
+
+    @app.get("/api/v1/trading/routes/{route_id}")
+    def get_trading_route(route_id: str) -> dict[str, Any]:
+        route = get_runtime_repository().get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        return {"route": _relative_nested_paths(Path.cwd(), route)}
+
+    @app.get("/api/v1/trading/routes/{route_id}/wakes")
+    def list_trading_route_wakes(route_id: str, limit: int = 25, offset: int = 0) -> dict[str, Any]:
+        route = get_runtime_repository().get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        page = get_runtime_repository().list_wake_run_page(route_id, limit=limit, offset=offset)
+        return {
+            "wakes": _relative_nested_paths(Path.cwd(), page["wakes"]),
+            "total": page["total"],
+            "limit": page["limit"],
+            "offset": page["offset"],
+        }
+
+    @app.get("/api/v1/trading/routes/{route_id}/exchange-health")
+    def get_trading_route_exchange_health(route_id: str) -> dict[str, Any]:
+        route = get_runtime_repository().get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        try:
+            adapter = build_execution_adapter(route)
+        except HTTPException:
+            raise
+        cli_path_getter = getattr(adapter, "_cli_path", None)
+        cli_path = cli_path_getter() if callable(cli_path_getter) else None
+        base = {
+            "route_id": route_id,
+            "adapter": route.get("execution_adapter"),
+            "account_mode": route.get("account_mode"),
+            "exchange_account": route.get("exchange_account"),
+            "instrument": route.get("instrument"),
+            "cli_path": cli_path,
+            "checked_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        readiness_blockers = list(adapter.readiness_blockers()) if hasattr(adapter, "readiness_blockers") else []
+        if readiness_blockers:
+            return {
+                **base,
+                "status": "blocked",
+                "connected": False,
+                "readiness_blockers": readiness_blockers,
+                "snapshot": {},
+                "error": ", ".join(readiness_blockers),
+            }
+        try:
+            snapshot = adapter.snapshot(route["instrument"])
+        except OKXCLIError as exc:
+            return {
+                **base,
+                "status": "disconnected",
+                "connected": False,
+                "readiness_blockers": [],
+                "snapshot": {},
+                "error": _sanitize_exchange_error(str(exc)),
+            }
+        return {
+            **base,
+            "status": "connected",
+            "connected": True,
+            "readiness_blockers": [],
+            "snapshot": {
+                "position_count": len(snapshot.get("positions") or []),
+                "open_order_count": len(snapshot.get("open_orders") or []),
+                "protection_order_count": len(snapshot.get("protection_orders") or []),
+                "recent_fill_count": len(snapshot.get("recent_fills") or []),
+                "has_balance": bool(snapshot.get("balance")),
+            },
+            "error": None,
+        }
+
+    @app.post("/api/v1/trading/routes/{route_id}/enable")
+    def enable_trading_route(route_id: str) -> dict[str, Any]:
+        return _update_trading_route_gate(route_id, enabled=True)
+
+    @app.post("/api/v1/trading/routes/{route_id}/disable")
+    def disable_trading_route(route_id: str) -> dict[str, Any]:
+        return _update_trading_route_gate(route_id, enabled=False)
+
+    @app.post("/api/v1/trading/routes/{route_id}/archive")
+    def archive_trading_route(route_id: str) -> dict[str, Any]:
+        try:
+            scheduler.stop(route_id)
+        except ValueError:
+            pass
+        route = get_runtime_repository().archive_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        return {"route": _relative_nested_paths(Path.cwd(), route)}
+
+    @app.post("/api/v1/trading/routes/{route_id}/arm")
+    def arm_trading_route(route_id: str) -> dict[str, Any]:
+        return _update_trading_route_gate(route_id, manually_armed=True)
+
+    @app.post("/api/v1/trading/routes/{route_id}/disarm")
+    def disarm_trading_route(route_id: str) -> dict[str, Any]:
+        return _update_trading_route_gate(route_id, manually_armed=False)
+
+    @app.post("/api/v1/trading/routes/{route_id}/mark-data-warmed")
+    def mark_trading_route_data_warmed(route_id: str) -> dict[str, Any]:
+        return _update_trading_route_gate(route_id, data_warmed=True)
+
+    @app.patch("/api/v1/trading/routes/{route_id}/settings")
+    def update_trading_route_settings(route_id: str, request: DeploymentRouteSettingsRequest) -> dict[str, Any]:
+        route = get_runtime_repository().update_deployment_route_gate(
+            route_id,
+            cron_interval_minutes=request.cron_interval_minutes,
+            execution_adapter=request.execution_adapter,
+            exchange_account=request.exchange_account,
+            margin_allocation_pct=request.margin_allocation_pct,
+            leverage=request.leverage,
+            auto_submit_enabled=request.auto_submit_enabled,
+        )
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        return {"route": _relative_nested_paths(Path.cwd(), route)}
+
+    @app.post("/api/v1/trading/routes/{route_id}/start")
+    def start_trading_route(route_id: str, request: DeploymentRouteStartRequest) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        route = repository.get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        if route.get("account_mode") == "live" and not request.confirm_live:
+            raise HTTPException(status_code=400, detail="live route start requires confirm_live")
+        route = repository.update_deployment_route_gate(
+            route_id,
+            enabled=True,
+            manually_armed=True if route.get("account_mode") == "live" else route.get("manually_armed", False),
+            scheduler_status="running",
+            auto_submit_enabled=request.auto_submit_enabled,
+            next_wake_at=datetime.now(UTC),
+            last_lifecycle_error={},
+        )
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        try:
+            cycle = run_lifecycle_cycle_for_route(route_id)
+            scheduled_route = scheduler.start(route_id, run_immediately=False)
+        except OKXCLIError as exc:
+            repository.update_deployment_route_gate(
+                route_id,
+                scheduler_status="stopped",
+                last_lifecycle_error={"message": str(exc), "stage": "start"},
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "cycle": _relative_nested_paths(Path.cwd(), cycle),
+            "route": _relative_nested_paths(Path.cwd(), scheduled_route),
+        }
+
+    @app.post("/api/v1/trading/routes/{route_id}/stop")
+    def stop_trading_route(route_id: str) -> dict[str, Any]:
+        try:
+            route = scheduler.stop(route_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        route = get_runtime_repository().update_deployment_route_gate(route_id, enabled=False, next_wake_at=None) or route
+        return {"route": _relative_nested_paths(Path.cwd(), route)}
+
+    def _update_trading_route_gate(route_id: str, **updates: Any) -> dict[str, Any]:
+        route = get_runtime_repository().update_deployment_route_gate(route_id, **updates)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        return {"route": _relative_nested_paths(Path.cwd(), route)}
+
+    @app.post("/api/v1/trading/routes/{route_id}/wake")
+    def run_trading_route_wake(route_id: str) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        route = repository.get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        try:
+            cycle = run_lifecycle_cycle_for_route(route_id)
+        except OKXCLIError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "warmup": _relative_nested_paths(Path.cwd(), cycle["warmup"]),
+            "signal_update": _relative_nested_paths(Path.cwd(), cycle["signal_update"]),
+            "wake": _relative_nested_paths(Path.cwd(), cycle["wake"]),
+            "submission": _relative_nested_paths(Path.cwd(), cycle["submission"]),
+            "route": _relative_nested_paths(Path.cwd(), cycle["route"] or repository.get_deployment_route(route_id) or route),
+        }
+
+    @app.post("/api/v1/trading/routes/{route_id}/wakes/{wake_id}/submit-orders")
+    def submit_trading_route_wake_orders(
+        route_id: str,
+        wake_id: str,
+        request: OrderSubmissionRequest,
+    ) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        route = repository.get_deployment_route(route_id)
+        if route is None:
+            raise HTTPException(status_code=404, detail="deployment route not found")
+        if repository.get_wake_run(wake_id) is None:
+            raise HTTPException(status_code=404, detail="wake run not found")
+        adapter = OKXAdapter(
+            {
+                "backend": "okx_cli",
+                "mode": route["account_mode"] if route.get("account_mode") in {"demo", "live"} else os.environ.get("OKX_MODE", "demo"),
+                "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+            }
+        )
+        try:
+            result = submit_wake_order_intents(
+                route_id=route_id,
+                wake_id=wake_id,
+                repository=repository,
+                adapter=adapter,
+                confirm_live=request.confirm_live,
+                quantity_override=request.quantity,
+                notional_usd_override=request.notional_usd,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except OKXCLIError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            **_relative_nested_paths(Path.cwd(), result),
+            "route": _relative_nested_paths(Path.cwd(), repository.get_deployment_route(route_id) or route),
         }
 
     @app.post("/api/v1/research/stage1-sessions/{session_id}/iterations/{iteration_id}/score-training")
@@ -819,6 +1323,8 @@ def create_app(
             ),
             engine_ids=request.engine_ids,
         )
+        name = request.name.strip() if request.name else None
+        universe["run"]["name"] = name or None
         get_runtime_repository().create_stage0_universe(
             universe["run"],
             universe["candidates"],
@@ -1126,21 +1632,34 @@ def _resolve_stage1_seed_strategy(
     repository: Any,
     candidate: dict[str, Any],
     strategy_id: str,
+    preference: str = "auto",
 ) -> dict[str, Any]:
-    latest_seed = _latest_pair_seed(
+    latest_seed = lambda: _latest_pair_seed(
         repository=repository,
         asset=candidate["asset"],
         signal_engine_id=candidate["signal_engine_id"],
         strategy_id=strategy_id,
     )
-    if latest_seed:
-        return latest_seed
-    engine_seed = _engine_base_seed(
+    engine_seed = lambda: _engine_base_seed(
         repository=repository,
         signal_engine_id=candidate["signal_engine_id"],
     )
-    if engine_seed:
-        return engine_seed
+    if preference == "latest_pair":
+        chosen = latest_seed()
+        if chosen:
+            return chosen
+        raise HTTPException(status_code=400, detail="No latest developed strategy is available for this pair yet")
+    if preference == "engine_base":
+        chosen = engine_seed()
+        if chosen:
+            return chosen
+        raise HTTPException(status_code=400, detail="No engine base strategy template is configured for this signal engine")
+    chosen = latest_seed()
+    if chosen:
+        return chosen
+    chosen = engine_seed()
+    if chosen:
+        return chosen
     return {
         "source_type": "system_starter",
         "source_path": None,
@@ -1237,6 +1756,180 @@ def _stage2_raw_candles(session: dict[str, Any], *, repository: Any) -> list[Any
         start=start,
         end=end,
     )
+
+
+def _materialize_execution_bundle(
+    *,
+    workspace_root: Path,
+    repository: Any,
+    session: dict[str, Any],
+    gate: dict[str, Any],
+    account_mode: str,
+    execution_adapter: str,
+    risk_limits: dict[str, Any],
+) -> dict[str, Any]:
+    if account_mode not in {"demo", "live", "paper"}:
+        raise ValueError("account_mode must be demo, live, or paper")
+    artifact_root = Path(session["artifact_root"])
+    if not artifact_root.is_absolute():
+        artifact_root = workspace_root / artifact_root
+    promotion_root = artifact_root / "promotion"
+    optimal_path = promotion_root / "stage4_optimal.json"
+    realized_path = promotion_root / "stage4_realized_expectancy.json"
+    strategy_path = promotion_root / "frozen_stage1a_strategy_module" / "strategy.py"
+    if not optimal_path.is_file():
+        raise ValueError("Stage 4 optimal artifact is missing")
+    if not realized_path.is_file():
+        raise ValueError("Stage 4 realized expectancy artifact is missing")
+    if not strategy_path.is_file():
+        fallback_strategy_path = artifact_root / "strategy_module" / "strategy.py"
+        if fallback_strategy_path.is_file():
+            strategy_path = fallback_strategy_path
+        else:
+            raise ValueError("Frozen strategy module is missing")
+
+    optimal = _read_json_file(optimal_path)
+    realized = _read_json_file(realized_path)
+    best = optimal.get("best") or realized.get("best_candidate") or {}
+    if not best:
+        raise ValueError("Stage 4 optimal artifact does not include a best candidate")
+    source_universe_run = repository.get_stage0_universe_run(session["source_universe_run_id"])
+    if source_universe_run is None:
+        raise ValueError("Source Stage 0 universe run is missing")
+    forward_hours = int(source_universe_run["forward_hours"])
+    evidence_refs = {
+        "stage1_session_id": session["session_id"],
+        "stage1_canonical_scores": str(promotion_root / "stage1a_canonical_full_cycle_scores.json"),
+        "stage2_capture_curve": str(promotion_root / "stage2_capture_curve.json"),
+        "stage3_optimal": str(promotion_root / "stage3_optimal.json"),
+        "stage3_pyramid_optimal": str(promotion_root / "stage3_pyramid_optimal.json"),
+        "stage4_realized_expectancy": str(realized_path),
+        "stage4_optimal": str(optimal_path),
+        "stage4_summary": str(promotion_root / "stage4_summary.md"),
+    }
+    execution_setup = {
+        "schema_version": "0.1",
+        "source": "stage4_realized_expectancy",
+        "account_mode": account_mode,
+        "execution_adapter": execution_adapter,
+        "forward_hours": forward_hours,
+        "hard_exit_after_hours": forward_hours,
+        "stage4_candidate_id": best.get("candidate_id") or realized.get("best_candidate_id"),
+        "setup": best.get("setup") or best,
+        "cost_assumptions": realized.get("cost_assumptions", {}),
+        "slice_windows": realized.get("slice_windows", []),
+        "training_window": {
+            "start": _date_string(session["train_start"]),
+            "end": _date_string(session["train_end"]),
+        },
+        "walk_forward_window": {
+            "start": _date_string(session["walk_forward_start"]),
+            "end": _date_string(session["walk_forward_end"]),
+        },
+    }
+    bundle_seed = {
+        "asset": session["asset"],
+        "signal_engine_id": session["signal_engine_id"],
+        "strategy_id": session["strategy_id"],
+        "strategy_version": session["strategy_version"],
+        "session_id": session["session_id"],
+        "stage4_candidate_id": execution_setup["stage4_candidate_id"],
+        "content": {
+            "strategy": strategy_path.read_text(),
+            "execution_setup": execution_setup,
+            "risk_limits": risk_limits,
+            "evidence_refs": evidence_refs,
+        },
+    }
+    content_hash = _stable_hash(bundle_seed)
+    bundle_id = f"{session['asset'].lower()}-{session['signal_engine_id']}-{session['strategy_id']}-{content_hash[:12]}"
+    bundle_root = workspace_root / "artifacts" / "execution_bundles" / bundle_id
+    bundle_root.mkdir(parents=True, exist_ok=True)
+
+    strategy_copy = bundle_root / "strategy.py"
+    strategy_copy.write_text(strategy_path.read_text())
+    (bundle_root / "execution_setup.json").write_text(json.dumps(execution_setup, indent=2, sort_keys=True) + "\n")
+    (bundle_root / "evidence_refs.json").write_text(json.dumps(evidence_refs, indent=2, sort_keys=True) + "\n")
+    manifest = {
+        "schema_version": "0.1",
+        "bundle_id": bundle_id,
+        "asset": session["asset"],
+        "instrument": f"{session['asset']}-USDT-SWAP",
+        "signal_engine_id": session["signal_engine_id"],
+        "signal_engine_version": session["signal_engine_version"],
+        "strategy_id": session["strategy_id"],
+        "strategy_version": session["strategy_version"],
+        "source_stage1_session_id": session["session_id"],
+        "account_mode": account_mode,
+        "execution_adapter": execution_adapter,
+        "content_hash": content_hash,
+        "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "gate": _relative_nested_paths(workspace_root, gate),
+    }
+    (bundle_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    checksums = {
+        "strategy.py": _file_sha256(strategy_copy),
+        "execution_setup.json": _file_sha256(bundle_root / "execution_setup.json"),
+        "evidence_refs.json": _file_sha256(bundle_root / "evidence_refs.json"),
+        "manifest.json": _file_sha256(bundle_root / "manifest.json"),
+    }
+    (bundle_root / "checksums.json").write_text(json.dumps(checksums, indent=2, sort_keys=True) + "\n")
+    (bundle_root / "bundle.json").write_text(
+        json.dumps(
+            {
+                **manifest,
+                "execution_setup": execution_setup,
+                "risk_limits": risk_limits,
+                "evidence_refs": evidence_refs,
+                "checksums": checksums,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return {
+        "bundle_id": bundle_id,
+        "asset": session["asset"],
+        "instrument": f"{session['asset']}-USDT-SWAP",
+        "signal_engine_id": session["signal_engine_id"],
+        "signal_engine_version": session["signal_engine_version"],
+        "strategy_id": session["strategy_id"],
+        "strategy_version": session["strategy_version"],
+        "source_stage1_session_id": session["session_id"],
+        "source_stage4_result_path": str(realized_path),
+        "bundle_uri": str(bundle_root),
+        "strategy_module_ref": str(strategy_copy),
+        "execution_setup": execution_setup,
+        "risk_limits": risk_limits,
+        "evidence_refs": evidence_refs,
+        "content_hash": content_hash,
+        "status": "promoted",
+    }
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+
+def _sanitize_exchange_error(message: str) -> str:
+    lines = [line.strip() for line in str(message).splitlines() if line.strip()]
+    safe_lines: list[str] = []
+    blocked_terms = ("secret", "api_key", "apikey", "passphrase", "password", "token")
+    for line in lines:
+        lowered = line.lower()
+        if any(term in lowered for term in blocked_terms):
+            continue
+        safe_lines.append(line)
+    return safe_lines[0] if safe_lines else "Exchange adapter could not connect"
+
+
+def _stable_hash(payload: Any) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _add_hours(value: str, hours: int) -> str:
@@ -1364,11 +2057,29 @@ def _development_queue_state(
             "stage3_grid_complete",
             _next_action("run_stage3_pyramid", "Run Pyramid", target_stage="stage3"),
         )
-    if gate and (gate.get("stage2_capture") or {}).get("exists"):
+    if gate and (gate.get("stage3_grid") or {}).get("exact_protection_complete"):
+        return (
+            "stage3_local_variants_ready",
+            "stage3_exact_protection_complete",
+            _next_action("run_stage3_local_variants", "Run Local Variants", target_stage="stage3"),
+        )
+    if gate and (gate.get("stage3_grid") or {}).get("fixed_sl_complete"):
+        return (
+            "stage3_exact_protection_ready",
+            "stage3_fixed_sl_complete",
+            _next_action("run_stage3_exact_protection", "Run Exact Protection", target_stage="stage3"),
+        )
+    if gate and (gate.get("stage2_exit_policy") or {}).get("exists"):
         return (
             "stage3_ready",
+            "stage2_policy_promoted",
+            _next_action("run_stage3_fixed_sl", "Run Fixed SL", target_stage="stage3"),
+        )
+    if gate and (gate.get("stage2_capture") or {}).get("exists"):
+        return (
+            "stage2_policy_ready",
             "stage2_complete",
-            _next_action("run_stage3_grid_search", "Run Stage 3 Grid", target_stage="stage3"),
+            _next_action("promote_stage2_exit_policy", "Promote Exit Policy", target_stage="stage2"),
         )
     if gate and (gate.get("canonical_readout") or {}).get("exists"):
         return (
@@ -1411,6 +2122,19 @@ def _stage1_role_next_action(gate: dict[str, Any] | None) -> dict[str, Any]:
         if status == "fail":
             return _next_action("walk_forward_failed_new_cycle", "Walk-Forward Failed", disabled=True, target_stage="stage1")
     return _next_action("create_training_bundle", "Create Training Bundle", target_stage="stage1")
+
+
+def _stage2_policy_allowed_values(capture: dict[str, Any]) -> set[float]:
+    values = capture.get("tp_levels")
+    if not isinstance(values, list) or not values:
+        values = list((capture.get("results") or {}).keys())
+    allowed: set[float] = set()
+    for value in values:
+        try:
+            allowed.add(round(float(value), 10))
+        except (TypeError, ValueError):
+            continue
+    return allowed
 
 
 def _ensure_stage1_session_mutable(session: dict[str, Any]) -> None:

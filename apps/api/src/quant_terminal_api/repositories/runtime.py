@@ -10,7 +10,10 @@ from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from quant_terminal_api.db.models import (
     backtest_runs,
     decisions,
+    deployment_routes,
+    execution_bundles,
     market_data_refs,
+    owner_states,
     score_summaries,
     signal_engine_versions,
     signal_engines,
@@ -23,6 +26,7 @@ from quant_terminal_api.db.models import (
     strategy_development_runs,
     strategy_modules,
     strategy_versions,
+    wake_runs,
 )
 
 
@@ -52,11 +56,26 @@ class RuntimeRepository:
                         "version": registration["version"],
                         "code_ref": registration["code_ref"],
                         "supported_input_data_types": registration["supported_input_data_types"],
+                        "required_data": registration.get("required_data", []),
                         "output_envelope_version": registration["output_envelope_version"],
                         "runtime_entrypoint": registration["runtime_entrypoint"],
                         "live_scanner_entrypoint": registration.get("live_scanner_entrypoint"),
                         "configuration_schema": registration.get("configuration_schema", {}),
                     }
+                )
+            )
+            connection.execute(
+                signal_engine_versions.update()
+                .where(signal_engine_versions.c.signal_engine_id == registration["signal_engine_id"])
+                .where(signal_engine_versions.c.version == registration["version"])
+                .values(
+                    code_ref=registration["code_ref"],
+                    supported_input_data_types=registration["supported_input_data_types"],
+                    required_data=registration.get("required_data", []),
+                    output_envelope_version=registration["output_envelope_version"],
+                    runtime_entrypoint=registration["runtime_entrypoint"],
+                    live_scanner_entrypoint=registration.get("live_scanner_entrypoint"),
+                    configuration_schema=registration.get("configuration_schema", {}),
                 )
             )
 
@@ -508,6 +527,7 @@ class RuntimeRepository:
                 signal_engines.c.description,
                 signal_engine_versions.c.version,
                 signal_engine_versions.c.code_ref,
+                signal_engine_versions.c.required_data,
                 signal_engine_versions.c.runtime_entrypoint,
                 signal_engine_versions.c.live_scanner_entrypoint,
                 func.coalesce(signal_set_counts.c.signal_set_count, 0).label("signal_set_count"),
@@ -531,6 +551,7 @@ class RuntimeRepository:
                 signal_engines.c.description,
                 signal_engine_versions.c.version,
                 signal_engine_versions.c.code_ref,
+                signal_engine_versions.c.required_data,
                 signal_engine_versions.c.runtime_entrypoint,
                 signal_engine_versions.c.live_scanner_entrypoint,
                 signal_set_counts.c.signal_set_count,
@@ -586,8 +607,10 @@ class RuntimeRepository:
         signal_engine_id: str | None = None,
         asset: str | None = None,
         limit: int = 25,
+        descending: bool = False,
     ) -> list[dict[str, Any]]:
-        statement = select(signals).order_by(signals.c.timestamp).limit(limit)
+        order_by = signals.c.timestamp.desc() if descending else signals.c.timestamp
+        statement = select(signals).order_by(order_by).limit(limit)
         if signal_set_key:
             statement = statement.where(signals.c.signal_set_key == signal_set_key)
         if signal_engine_id:
@@ -629,6 +652,12 @@ class RuntimeRepository:
         with self.engine.connect() as connection:
             row = connection.execute(statement).mappings().first()
             return dict(row) if row else None
+
+    def delete_stage1_research_session(self, session_id: str) -> None:
+        with self.engine.begin() as connection:
+            connection.execute(
+                stage1_research_sessions.delete().where(stage1_research_sessions.c.session_id == session_id)
+            )
 
     def latest_stage1_strategy_seed(
         self,
@@ -680,6 +709,309 @@ class RuntimeRepository:
         )
         with self.engine.begin() as connection:
             connection.execute(statement)
+
+    def create_execution_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        with self.engine.begin() as connection:
+            connection.execute(self._insert_execution_bundle_ignore_conflict(bundle))
+        stored = self.get_execution_bundle(bundle["bundle_id"])
+        if stored is None:
+            raise RuntimeError("execution bundle was not persisted")
+        return stored
+
+    def get_execution_bundle(self, bundle_id: str) -> dict[str, Any] | None:
+        statement = select(execution_bundles).where(execution_bundles.c.bundle_id == bundle_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+            return dict(row) if row else None
+
+    def list_execution_bundles(self) -> list[dict[str, Any]]:
+        statement = select(execution_bundles).order_by(execution_bundles.c.created_at.desc())
+        with self.engine.connect() as connection:
+            return [dict(row._mapping) for row in connection.execute(statement)]
+
+    def upsert_deployment_route_for_bundle(
+        self,
+        *,
+        bundle: dict[str, Any],
+        account_mode: str,
+        execution_adapter: str,
+    ) -> dict[str, Any]:
+        route_id = _route_id(
+            asset=bundle["asset"],
+            account_mode=account_mode,
+        )
+        values = {
+            "route_id": route_id,
+            "active_bundle_id": bundle["bundle_id"],
+            "strategy_id": bundle["strategy_id"],
+            "strategy_version": bundle["strategy_version"],
+            "signal_engine_id": bundle["signal_engine_id"],
+            "signal_engine_version": bundle["signal_engine_version"],
+            "asset": bundle["asset"],
+            "instrument": bundle["instrument"],
+            "account_mode": account_mode,
+            "execution_adapter": execution_adapter,
+            "exchange_account": "default",
+            "cron_interval_minutes": _execution_setup_cron_minutes(bundle.get("execution_setup")),
+            "margin_allocation_pct": 10.0,
+            "leverage": _execution_setup_leverage(bundle.get("execution_setup")),
+            "scheduler_status": "stopped",
+            "auto_submit_enabled": False,
+            "last_wake_at": None,
+            "last_wake_id": None,
+            "next_wake_at": None,
+            "last_lifecycle_error": {},
+            "risk_limits": bundle["risk_limits"],
+            "promoted": True,
+            "data_warmed": False,
+            "manually_armed": False,
+            "enabled": False,
+            "archived": False,
+            "archived_at": None,
+        }
+        with self.engine.begin() as connection:
+            connection.execute(self._upsert_deployment_route(values))
+        route = self.get_deployment_route_for_asset_account(asset=bundle["asset"], account_mode=account_mode)
+        if route is None:
+            raise RuntimeError("deployment route was not persisted")
+        return route
+
+    def list_deployment_routes(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
+        statement = select(deployment_routes)
+        if not include_archived:
+            statement = statement.where(deployment_routes.c.archived.is_(False))
+        statement = statement.order_by(
+            deployment_routes.c.asset,
+            deployment_routes.c.account_mode,
+        )
+        with self.engine.connect() as connection:
+            routes = [dict(row._mapping) for row in connection.execute(statement)]
+        bundles = {bundle["bundle_id"]: bundle for bundle in self.list_execution_bundles()}
+        for route in routes:
+            _normalize_route_datetimes(route)
+            route["active_bundle"] = bundles.get(route.get("active_bundle_id"))
+            route["blockers"] = _route_blockers(route)
+        return routes
+
+    def get_deployment_route(self, route_id: str) -> dict[str, Any] | None:
+        statement = select(deployment_routes).where(deployment_routes.c.route_id == route_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+        if row is None:
+            return None
+        route = dict(row)
+        _normalize_route_datetimes(route)
+        if route.get("active_bundle_id"):
+            route["active_bundle"] = self.get_execution_bundle(route["active_bundle_id"])
+        else:
+            route["active_bundle"] = None
+        route["blockers"] = _route_blockers(route)
+        return route
+
+    def get_deployment_route_for_asset_account(self, *, asset: str, account_mode: str) -> dict[str, Any] | None:
+        statement = (
+            select(deployment_routes)
+            .where(deployment_routes.c.asset == asset)
+            .where(deployment_routes.c.account_mode == account_mode)
+            .limit(1)
+        )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+        if row is None:
+            return None
+        return self.get_deployment_route(row["route_id"])
+
+    def update_deployment_route_gate(self, route_id: str, **values: Any) -> dict[str, Any] | None:
+        allowed = {
+            "enabled",
+            "manually_armed",
+            "data_warmed",
+            "execution_adapter",
+            "exchange_account",
+            "cron_interval_minutes",
+            "margin_allocation_pct",
+            "leverage",
+            "scheduler_status",
+            "auto_submit_enabled",
+            "last_wake_at",
+            "last_wake_id",
+            "next_wake_at",
+            "last_lifecycle_error",
+            "archived",
+            "archived_at",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        for key in ("last_wake_at", "next_wake_at", "archived_at"):
+            if key in updates and updates[key] is not None:
+                updates[key] = _coerce_datetime(updates[key])
+        if updates:
+            statement = deployment_routes.update().where(deployment_routes.c.route_id == route_id).values(**updates)
+            with self.engine.begin() as connection:
+                connection.execute(statement)
+        return self.get_deployment_route(route_id)
+
+    def archive_deployment_route(self, route_id: str, *, archived_at: str | datetime | None = None) -> dict[str, Any] | None:
+        return self.update_deployment_route_gate(
+            route_id,
+            archived=True,
+            archived_at=archived_at or datetime.now(UTC),
+            enabled=False,
+            manually_armed=False,
+            scheduler_status="stopped",
+            auto_submit_enabled=False,
+            next_wake_at=None,
+            last_lifecycle_error={},
+        )
+
+    def record_wake_run(self, wake: dict[str, Any]) -> dict[str, Any]:
+        values = {
+            **wake,
+            "blockers": _json_safe(wake.get("blockers", [])),
+            "exchange_snapshot": _json_safe(wake.get("exchange_snapshot", {})),
+            "signal_scan_result": _json_safe(wake.get("signal_scan_result", {})),
+            "strategy_decision": _json_safe(wake.get("strategy_decision", {})),
+            "order_intents": _json_safe(wake.get("order_intents", [])),
+            "adapter_results": _json_safe(wake.get("adapter_results", [])),
+            "error": _json_safe(wake.get("error", {})),
+            "completed_at": _coerce_optional_datetime(wake.get("completed_at")),
+        }
+        with self.engine.begin() as connection:
+            connection.execute(insert(wake_runs).values(**values))
+        stored = self.get_wake_run(wake["wake_id"])
+        if stored is None:
+            raise RuntimeError("wake run was not persisted")
+        return stored
+
+    def get_wake_run(self, wake_id: str) -> dict[str, Any] | None:
+        statement = select(wake_runs).where(wake_runs.c.wake_id == wake_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+            return dict(row) if row else None
+
+    def list_wake_runs(self, route_id: str, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
+        statement = (
+            select(wake_runs)
+            .where(wake_runs.c.route_id == route_id)
+            .order_by(func.coalesce(wake_runs.c.completed_at, wake_runs.c.started_at).desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        with self.engine.connect() as connection:
+            return [dict(row._mapping) for row in connection.execute(statement)]
+
+    def count_wake_runs(self, route_id: str) -> int:
+        statement = select(func.count()).select_from(wake_runs).where(wake_runs.c.route_id == route_id)
+        with self.engine.connect() as connection:
+            return int(connection.execute(statement).scalar_one())
+
+    def list_wake_run_page(self, route_id: str, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
+        safe_limit = max(1, min(int(limit), 100))
+        safe_offset = max(0, int(offset))
+        return {
+            "wakes": self.list_wake_runs(route_id, limit=safe_limit, offset=safe_offset),
+            "total": self.count_wake_runs(route_id),
+            "limit": safe_limit,
+            "offset": safe_offset,
+        }
+
+    def update_wake_execution_results(
+        self,
+        *,
+        wake_id: str,
+        order_intents: list[dict[str, Any]],
+        adapter_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        statement = (
+            wake_runs.update()
+            .where(wake_runs.c.wake_id == wake_id)
+            .values(order_intents=_json_safe(order_intents), adapter_results=_json_safe(adapter_results))
+        )
+        with self.engine.begin() as connection:
+            connection.execute(statement)
+        stored = self.get_wake_run(wake_id)
+        if stored is None:
+            raise RuntimeError("wake run was not persisted")
+        return stored
+
+    def get_open_owner_state(self, route_id: str) -> dict[str, Any] | None:
+        statement = (
+            select(owner_states)
+            .where(owner_states.c.route_id == route_id)
+            .where(owner_states.c.status == "open")
+            .order_by(owner_states.c.created_at.desc())
+            .limit(1)
+        )
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+            return dict(row) if row else None
+
+    def create_owner_state(self, owner_state: dict[str, Any]) -> dict[str, Any]:
+        owner_state = {**owner_state, "position_state": _json_safe(owner_state.get("position_state", {}))}
+        with self.engine.begin() as connection:
+            connection.execute(insert(owner_states).values(**owner_state))
+        return owner_state
+
+    def update_owner_state(
+        self,
+        owner_state_id: str,
+        *,
+        status: str | None = None,
+        position_state: dict[str, Any] | None = None,
+        closed_at: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        if status is not None:
+            values["status"] = status
+        if position_state is not None:
+            values["position_state"] = _json_safe(position_state)
+        if closed_at is not None:
+            values["closed_at"] = _coerce_optional_datetime(closed_at)
+        if not values:
+            statement = select(owner_states).where(owner_states.c.owner_state_id == owner_state_id)
+            with self.engine.connect() as connection:
+                row = connection.execute(statement).mappings().first()
+                if row is None:
+                    raise ValueError(f"owner state not found: {owner_state_id}")
+                return dict(row)
+        with self.engine.begin() as connection:
+            connection.execute(
+                owner_states.update()
+                .where(owner_states.c.owner_state_id == owner_state_id)
+                .values(**values)
+            )
+        statement = select(owner_states).where(owner_states.c.owner_state_id == owner_state_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+            if row is None:
+                raise ValueError(f"owner state not found: {owner_state_id}")
+            return dict(row)
+
+    def append_owner_state_leg(self, owner_state_id: str, leg: dict[str, Any]) -> dict[str, Any]:
+        statement = select(owner_states).where(owner_states.c.owner_state_id == owner_state_id)
+        with self.engine.connect() as connection:
+            row = connection.execute(statement).mappings().first()
+        if row is None:
+            raise ValueError(f"owner state not found: {owner_state_id}")
+        owner_state = dict(row)
+        position_state = dict(owner_state.get("position_state") or {})
+        legs = list(position_state.get("legs") or [])
+        legs.append(leg)
+        position_state["legs"] = legs
+        position_state["protection_refresh_required"] = True
+        return self.update_owner_state(owner_state_id, position_state=position_state)
+
+    def close_open_owner_state(self, route_id: str, reason: str) -> dict[str, Any] | None:
+        owner_state = self.get_open_owner_state(route_id)
+        if owner_state is None:
+            return None
+        position_state = dict(owner_state.get("position_state") or {})
+        position_state["close_reason"] = reason
+        return self.update_owner_state(
+            owner_state["owner_state_id"],
+            status="closed",
+            position_state=position_state,
+            closed_at=datetime.now(UTC),
+        )
 
     def _repair_stage1_signal_pool_references(
         self,
@@ -1025,6 +1357,46 @@ class RuntimeRepository:
             )
         return insert(stage1_research_sessions).values(**values).prefix_with("OR IGNORE")
 
+    def _insert_execution_bundle_ignore_conflict(self, values: dict[str, Any]):
+        if self.engine.dialect.name == "postgresql":
+            return postgres_insert(execution_bundles).values(**values).on_conflict_do_nothing(
+                index_elements=["bundle_id"]
+            )
+        return insert(execution_bundles).values(**values).prefix_with("OR IGNORE")
+
+    def _upsert_deployment_route(self, values: dict[str, Any]):
+        if self.engine.dialect.name == "postgresql":
+            return postgres_insert(deployment_routes).values(**values).on_conflict_do_update(
+                index_elements=["asset", "account_mode"],
+                set_={
+                    "active_bundle_id": values["active_bundle_id"],
+                    "strategy_id": values["strategy_id"],
+                    "strategy_version": values["strategy_version"],
+                    "signal_engine_id": values["signal_engine_id"],
+                    "signal_engine_version": values["signal_engine_version"],
+                    "instrument": values["instrument"],
+                    "execution_adapter": values["execution_adapter"],
+                    "exchange_account": values["exchange_account"],
+                    "cron_interval_minutes": values["cron_interval_minutes"],
+                    "margin_allocation_pct": values["margin_allocation_pct"],
+                    "leverage": values["leverage"],
+                    "scheduler_status": values["scheduler_status"],
+                    "auto_submit_enabled": values["auto_submit_enabled"],
+                    "last_wake_at": values["last_wake_at"],
+                    "last_wake_id": values["last_wake_id"],
+                    "next_wake_at": values["next_wake_at"],
+                    "last_lifecycle_error": values["last_lifecycle_error"],
+                    "risk_limits": values["risk_limits"],
+                    "promoted": values["promoted"],
+                    "data_warmed": values["data_warmed"],
+                    "manually_armed": values["manually_armed"],
+                    "enabled": values["enabled"],
+                    "archived": values["archived"],
+                    "archived_at": values["archived_at"],
+                },
+            )
+        return insert(deployment_routes).values(**values).prefix_with("OR REPLACE")
+
 
 def _coerce_datetime(value: str | datetime) -> datetime:
     if isinstance(value, datetime):
@@ -1034,6 +1406,60 @@ def _coerce_datetime(value: str | datetime) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _normalize_route_datetimes(route: dict[str, Any]) -> None:
+    for key in ("last_wake_at", "next_wake_at", "archived_at", "created_at"):
+        value = route.get(key)
+        if isinstance(value, datetime) and value.tzinfo is None:
+            route[key] = value.replace(tzinfo=UTC)
+
+
+def _route_id(*, asset: str, account_mode: str) -> str:
+    return f"{asset.lower()}-{account_mode}"
+
+
+def _execution_setup_cron_minutes(execution_setup: Any) -> int:
+    value = None
+    if isinstance(execution_setup, dict):
+        value = execution_setup.get("cron_interval_minutes") or execution_setup.get("cron_interval")
+        nested = execution_setup.get("setup")
+        if value is None and isinstance(nested, dict):
+            value = nested.get("cron_interval_minutes") or nested.get("cron_interval")
+    try:
+        minutes = int(value) if value is not None else 15
+    except (TypeError, ValueError):
+        minutes = 15
+    return max(1, minutes)
+
+
+def _execution_setup_leverage(execution_setup: Any) -> float:
+    value = None
+    if isinstance(execution_setup, dict):
+        value = execution_setup.get("leverage")
+        nested = execution_setup.get("setup")
+        if value is None and isinstance(nested, dict):
+            value = nested.get("leverage")
+    try:
+        leverage = float(value) if value is not None else 1.0
+    except (TypeError, ValueError):
+        leverage = 1.0
+    return leverage if leverage > 0 else 1.0
+
+
+def _route_blockers(route: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    if not route.get("enabled"):
+        blockers.append("route_disabled")
+    if not route.get("active_bundle_id"):
+        blockers.append("missing_active_bundle")
+    if not route.get("promoted"):
+        blockers.append("route_not_promoted")
+    if not route.get("data_warmed"):
+        blockers.append("data_not_warmed")
+    if route.get("account_mode") == "live" and not route.get("manually_armed"):
+        blockers.append("route_not_manually_armed")
+    return blockers
 
 
 def _repair_stage1_manifest_references(
@@ -1090,6 +1516,20 @@ def _coerce_optional_datetime(value: str | datetime | None) -> datetime | None:
     if value is None:
         return None
     return _coerce_datetime(value)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _normalize_signal_set_row(row: dict[str, Any]) -> dict[str, Any]:

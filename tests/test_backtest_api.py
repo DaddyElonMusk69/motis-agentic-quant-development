@@ -41,6 +41,14 @@ def test_backtest_api_registers_modules_and_launches_stage1_run():
             "name": "Threshold Reversal",
             "version": "0.1.0",
             "runtime_entrypoint": "quant_terminal_engines.threshold_reversal:generate_signals",
+            "required_data": [
+                {
+                    "data_type": "candles",
+                    "origin": "raw",
+                    "timeframe": "5m",
+                    "lookback_bars": 500,
+                }
+            ],
         },
     )
     strategy_response = client.post(
@@ -81,6 +89,9 @@ def test_backtest_api_registers_modules_and_launches_stage1_run():
     summary_response = client.get("/api/v1/backtests/bt-api-1")
 
     assert engine_response.status_code == 200
+    assert repository.engines[0]["required_data"] == [
+        {"data_type": "candles", "origin": "raw", "timeframe": "5m", "lookback_bars": 500}
+    ]
     assert strategy_response.status_code == 200
     assert run_response.status_code == 200
     assert run_response.json()["score_summary"]["metrics"]["agreement_rate"] == 1.0

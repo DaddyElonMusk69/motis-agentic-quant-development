@@ -96,9 +96,358 @@ def test_run_stage4_realized_expectancy_scores_full_decision_set(tmp_path: Path)
     assert best["executed_trades"] == 1
     assert best["skipped_decisions"] == 1
     assert best["tp_hits"] == 1
-    assert best["net_expectancy_pct"] == 2.5
+    assert best["net_expectancy_pct"] == 0.75
     assert result["ledger"]["candidates"][0]["trades"][1]["entry_status"] == "SKIPPED"
     assert (promotion_root / "stage4_realized_expectancy.json").exists()
     assert (promotion_root / "stage4_trade_ledger.json").exists()
     assert (promotion_root / "stage4_optimal.json").exists()
     assert "Stage 4 Realized Expectancy" in (promotion_root / "stage4_summary.md").read_text()
+
+
+def test_stage4_backtest_skips_signals_while_position_is_open(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[
+            _record("sig-1", "LONG"),
+            _record("sig-2", "LONG"),
+            _record("sig-3", "LONG"),
+        ],
+        setup={"tp_pct": 10.0, "sl_pct": 10.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    signals = [
+        _signal("sig-1", "2026-05-01T00:00:00Z", 100),
+        _signal("sig-2", "2026-05-01T00:10:00Z", 101),
+        _signal("sig-3", "2026-05-01T01:10:00Z", 110),
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101, "low": 99, "close": 100.5},
+        {"timestamp": "2026-05-01T00:55:00Z", "open": 100.5, "high": 101, "low": 100, "close": 100.5},
+        {"timestamp": "2026-05-01T01:00:00Z", "open": 100.5, "high": 110.5, "low": 100, "close": 110},
+        {"timestamp": "2026-05-01T01:15:00Z", "open": 110, "high": 121.5, "low": 109, "close": 121},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    best = result["best_candidate"]
+    assert best["total_decisions"] == 3
+    assert best["executed_trades"] == 2
+    assert best["skipped_decisions"] == 1
+    assert best["skipped_position_open"] == 1
+    first_skipped = result["ledger"]["candidates"][0]["trades"][1]
+    assert first_skipped["signal_id"] == "sig-2"
+    assert first_skipped["skip_reason"] == "position_open"
+
+
+def test_stage4_backtest_accounts_for_okx_taker_fees_and_equity(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101}]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=5,
+        slippage_bps_per_side=0,
+    )
+
+    account = result["best_candidate"]["account"]
+    assert account["initial_capital_usdt"] == 1000
+    assert account["total_entry_fees_usdt"] == 0.75
+    assert account["total_exit_fees_usdt"] == 0.7575
+    assert account["total_fees_usdt"] == 1.5075
+    assert account["gross_pnl_usdt"] == 15.0
+    assert account["net_pnl_usdt"] == 13.4925
+    assert account["ending_equity_usdt"] == 1013.4925
+
+
+def test_stage4_backtest_sizes_pyramid_legs_from_full_position_margin(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={
+            "tp_pct": 5.0,
+            "sl_pct": 10.0,
+            "max_hold_hours": 1,
+            "pyramid_step_pct": 1.0,
+            "max_legs": 3,
+            "sl_breakeven": False,
+        },
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 99.8, "close": 101},
+        {"timestamp": "2026-05-01T00:10:00Z", "open": 101, "high": 102.3, "low": 100.8, "close": 102},
+        {"timestamp": "2026-05-01T00:15:00Z", "open": 102, "high": 108, "low": 101.5, "close": 107},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    trade = result["ledger"]["candidates"][0]["trades"][0]
+    assert trade["filled_legs"] == 3
+    assert [leg["margin_usdt"] for leg in trade["leg_details"]] == [100.0, 100.0, 100.0]
+    assert [leg["entry_notional_usdt"] for leg in trade["leg_details"]] == [500.0, 500.0, 500.0]
+    assert trade["gross_pnl_usdt"] == 75.0
+
+
+def test_stage4_backtest_hard_exits_at_max_hold_gate(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 10.0, "sl_pct": 10.0, "max_hold_hours": 0.25},
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101, "low": 99, "close": 100.5},
+        {"timestamp": "2026-05-01T00:15:00Z", "open": 100.5, "high": 101, "low": 100, "close": 100.8},
+        {"timestamp": "2026-05-01T00:20:00Z", "open": 100.8, "high": 110.5, "low": 100.5, "close": 110},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    trade = result["ledger"]["candidates"][0]["trades"][0]
+    assert trade["exit_status"] == "HARD_EXIT"
+    assert trade["exit_ts"] == "2026-05-01T00:15:00Z"
+    assert trade["exit_price"] == 100.8
+
+
+def test_stage4_backtest_fixed_sl_candidate_does_not_move_stop(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={
+            "tp_pct": 3.0,
+            "sl_pct": 1.0,
+            "initial_sl_pct": 1.0,
+            "protection_enabled": False,
+            "protect_trigger_pct": 1.0,
+            "trail_sl_pct": 0.5,
+            "max_hold_hours": 1,
+        },
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 100.8, "close": 101.0},
+        {"timestamp": "2026-05-01T00:10:00Z", "open": 101.0, "high": 101.1, "low": 99.0, "close": 99.5},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    best = result["best_candidate"]
+    trade = result["ledger"]["candidates"][0]["trades"][0]
+    assert best["sl_hits"] == 1
+    assert best["protected_sl_hits"] == 0
+    assert trade["protection_enabled"] is False
+    assert trade["protection_activated"] is False
+    assert trade["exit_status"] == "INITIAL_SL"
+    assert trade["exit_price"] == 99.0
+
+
+def test_stage4_backtest_protected_candidate_moves_stop_after_trigger(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={
+            "tp_pct": 3.0,
+            "sl_pct": 1.0,
+            "initial_sl_pct": 1.0,
+            "protection_enabled": True,
+            "protect_trigger_pct": 1.0,
+            "trail_sl_pct": 0.5,
+            "max_hold_hours": 1,
+        },
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 100.8, "close": 101.0},
+        {"timestamp": "2026-05-01T00:10:00Z", "open": 101.0, "high": 101.1, "low": 100.4, "close": 100.6},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    best = result["best_candidate"]
+    trade = result["ledger"]["candidates"][0]["trades"][0]
+    assert best["protected_sl_hits"] == 1
+    assert best["initial_sl_hits"] == 0
+    assert trade["protection_enabled"] is True
+    assert trade["protection_activated"] is True
+    assert trade["exit_status"] == "PROTECTED_SL"
+    assert trade["exit_price"] == 100.5
+    assert trade["leg_details"][0]["exit_status"] == "PROTECTED_SL"
+
+
+def test_stage4_backtest_keeps_run_history_and_updates_latest_compatibility_files(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101}]
+
+    first = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+    second = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=2000,
+        margin_allocation_pct=20,
+        leverage=3,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    assert first["run_id"] != second["run_id"]
+    first_run_path = promotion_root = artifact_root / "promotion" / "stage4_runs" / first["run_id"]
+    second_run_path = artifact_root / "promotion" / "stage4_runs" / second["run_id"]
+    assert (first_run_path / "stage4_realized_expectancy.json").exists()
+    assert (second_run_path / "stage4_realized_expectancy.json").exists()
+
+    index = json.loads((artifact_root / "promotion" / "stage4_runs" / "index.json").read_text())
+    assert [run["run_id"] for run in index["runs"]] == [first["run_id"], second["run_id"]]
+    assert index["latest_run_id"] == second["run_id"]
+    assert index["runs"][-1]["simulation_inputs"] == {
+        "initial_capital_usdt": 2000,
+        "margin_allocation_pct": 20,
+        "leverage": 3,
+    }
+
+    latest = json.loads((artifact_root / "promotion" / "stage4_realized_expectancy.json").read_text())
+    optimal = json.loads((artifact_root / "promotion" / "stage4_optimal.json").read_text())
+    assert latest["run_id"] == second["run_id"]
+    assert latest["source_run_path"].endswith(f"stage4_runs/{second['run_id']}/stage4_realized_expectancy.json")
+    assert optimal["run_id"] == second["run_id"]
+
+
+def _write_stage4_fixture(tmp_path: Path, *, records: list[dict], setup: dict) -> Path:
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(json.dumps({"records": records}))
+    (promotion_root / "stage4_candidates.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "market_tp_sl",
+                        "setup": {
+                            "entry_model": "market",
+                            "timeout_policy": "close_at_cutoff",
+                            **setup,
+                        },
+                    }
+                ]
+            }
+        )
+    )
+    return artifact_root
+
+
+def _session(artifact_root: Path) -> dict:
+    return {
+        "session_id": "stage1-aave",
+        "artifact_root": str(artifact_root),
+        "asset": "AAVE",
+        "strategy_id": "aave-vegas",
+        "strategy_version": "v0.1",
+        "signal_engine_id": "vegas_ema",
+        "signal_set_id": "AAVE-vegas_ema-canonical",
+    }
+
+
+def _record(signal_id: str, direction: str) -> dict:
+    return {
+        "signal_id": signal_id,
+        "agent_direction": direction,
+        "decision_direction": direction,
+        "agreement": "MATCH" if direction in {"LONG", "SHORT"} else "NEUTRAL",
+        "sample_role": "training",
+    }
+
+
+def _signal(signal_id: str, timestamp: str, price: float) -> dict:
+    return {
+        "signal_id": signal_id,
+        "timestamp": timestamp,
+        "payload": {
+            "timestamp": timestamp,
+            "interactions": [{"timeframe": "2h", "market_price": price}],
+            "active_timeframes": ["2h"],
+        },
+    }

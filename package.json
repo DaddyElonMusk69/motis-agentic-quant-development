@@ -2,11 +2,14 @@
   "name": "motis-quant-terminal",
   "private": true,
   "workspaces": [
-    "apps/web"
+    "apps/web",
+    "apps/web-v2"
   ],
   "scripts": {
     "dev:web": "npm --workspace apps/web run dev",
     "build:web": "npm --workspace apps/web run build",
+    "dev:web-v2": "npm --workspace apps/web-v2 run dev",
+    "build:web-v2": "npm --workspace apps/web-v2 run build",
     "test:python": "python3 -m pytest tests -q"
   }
 }

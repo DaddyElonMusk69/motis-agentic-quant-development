@@ -540,6 +540,7 @@ def test_build_stage1_gate_summary_reports_stage2_capture_complete(tmp_path: Pat
         json.dumps({"metrics": {"total_match_signals": 1}, "results": {"1.0": {"full_cycle": {"rate": 100.0}}}})
     )
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     session = {"session_id": "stage1-aave", "artifact_root": str(artifact_root), "status": "stage1a_frozen"}
 
@@ -563,6 +564,7 @@ def test_build_stage1_gate_summary_reports_stage3_grid_complete(tmp_path: Path):
     (frozen_root / "strategy.py").write_text("def decide(context): return {}")
     (promotion_root / "stage2_capture_curve.json").write_text(json.dumps({"metrics": {"total_match_signals": 1}}))
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     (promotion_root / "stage3_grid_results.json").write_text(
         json.dumps({"total_signals": 1, "optimal": {"best": {"tp": 2.5, "sl": 1.0}}})
@@ -592,6 +594,7 @@ def test_build_stage1_gate_summary_reports_stage3_pyramid_complete(tmp_path: Pat
     (frozen_root / "strategy.py").write_text("def decide(context): return {}")
     (promotion_root / "stage2_capture_curve.json").write_text(json.dumps({"metrics": {"total_match_signals": 1}}))
     (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
     (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
     (promotion_root / "stage3_grid_results.json").write_text(
         json.dumps({"total_signals": 1, "optimal": {"best": {"tp": 2.5, "sl": 1.0}}})

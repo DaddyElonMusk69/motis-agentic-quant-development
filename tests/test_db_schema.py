@@ -23,14 +23,17 @@ def test_schema_declares_core_product_tables():
         "score_summaries",
         "agent_tasks",
         "agent_runs",
+        "execution_bundles",
         "deployment_routes",
+        "wake_runs",
+        "owner_states",
         "audit_log",
     }
 
     assert expected.issubset(set(metadata.tables))
 
 
-def test_deployment_routes_enforce_one_live_route_per_strategy_asset_pair():
+def test_deployment_routes_enforce_one_route_per_asset_account():
     route_table = metadata.tables["deployment_routes"]
 
     unique_constraints = {
@@ -39,8 +42,45 @@ def test_deployment_routes_enforce_one_live_route_per_strategy_asset_pair():
         if constraint.__class__.__name__ == "UniqueConstraint"
     }
 
-    assert ("strategy_id", "asset") in unique_constraints
+    assert ("asset", "account_mode") in unique_constraints
+    assert "active_bundle_id" in route_table.columns
+    assert "cron_interval_minutes" in route_table.columns
+    assert "exchange_account" in route_table.columns
+    assert "margin_allocation_pct" in route_table.columns
+    assert "leverage" in route_table.columns
+    assert "archived" in route_table.columns
+    assert "archived_at" in route_table.columns
 
+
+def test_signal_engine_versions_declare_required_data_contract():
+    table = metadata.tables["signal_engine_versions"]
+
+    assert "required_data" in table.columns
+
+
+def test_execution_runtime_tables_have_audit_keys():
+    bundle_table = metadata.tables["execution_bundles"]
+    wake_table = metadata.tables["wake_runs"]
+    owner_table = metadata.tables["owner_states"]
+
+    assert {"bundle_id", "bundle_uri", "execution_setup", "risk_limits", "evidence_refs", "content_hash", "status"}.issubset(
+        set(bundle_table.columns.keys())
+    )
+    assert {"wake_id", "route_id", "bundle_id", "status", "branch", "blockers", "order_intents", "adapter_results"}.issubset(
+        set(wake_table.columns.keys())
+    )
+    assert {
+        "owner_state_id",
+        "route_id",
+        "bundle_id",
+        "position_instance_id",
+        "position_state",
+        "owner_strategy_id",
+        "opened_from_signal_id",
+        "status",
+    }.issubset(
+        set(owner_table.columns.keys())
+    )
 
 def test_market_data_refs_unique_key_includes_data_origin():
     table = metadata.tables["market_data_refs"]
@@ -97,6 +137,7 @@ def test_stage0_universe_runs_allow_repeat_configs():
     }
 
     assert ("config_hash",) not in unique_constraints
+    assert "name" in table.columns
 
 
 def test_stage1_research_sessions_link_to_stage0_candidate():
