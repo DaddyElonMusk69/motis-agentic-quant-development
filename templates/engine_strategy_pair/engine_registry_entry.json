@@ -1,0 +1,24 @@
+{
+  "signal_engine_id": "example_breakout",
+  "version": "0.1.0",
+  "name": "Example Breakout",
+  "description": "Minimal scaffold for a contract-compliant neutral signal engine.",
+  "required_data": [
+    {
+      "data_type": "candles",
+      "origin": "raw",
+      "timeframe": "5m",
+      "lookback_bars": 500,
+      "freshness_tolerance_seconds": 300
+    }
+  ],
+  "output_envelope_version": "signal_packet.v2",
+  "runtime_entrypoint": "templates/engine_strategy_pair/generate_training_signals.py",
+  "live_scanner_entrypoint": "templates/engine_strategy_pair/scan_live_signal.py",
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "range_threshold_pct": {"type": "number", "default": 1.0}
+    }
+  }
+}

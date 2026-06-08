@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import sys
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from quant_terminal_sdk.market_data_reader import MarketDataCandle, MarketDataReader
+from quant_terminal_sdk.market_data_reader import MarketDataReader
 from quant_terminal_worker.ingestion.legacy_signals import build_signal_set_key
+from quant_terminal_worker.signal_engines.runtime import EngineTrainingContext, resolve_signal_engine
 
 
-DEFAULT_TIMEFRAMES = ("2h", "4h", "8h", "12h", "1d")
 SIGNAL_ENGINE_VERSION = "0.1"
 
 
@@ -28,8 +26,6 @@ def extend_signal_pool_from_local_candles(
     signal_set = repository.get_signal_set(signal_set_key)
     if signal_set is None:
         raise ValueError(f"Canonical signal pool not found for {signal_engine_id}/{asset}")
-    if signal_engine_id != "vegas_ema":
-        raise ValueError(f"Parquet signal extension is not implemented for {signal_engine_id}")
 
     reader = MarketDataReader(repository=repository, workspace_root=root)
     raw_5m = reader.get_candles(asset=asset, timeframe="5m", origin="raw")
@@ -73,23 +69,30 @@ def extend_signal_pool_from_local_candles(
             import_result={"status": "skipped", "reason": "already_scanned_to_target"},
         )
 
-    derived = {
-        timeframe: reader.get_candles(asset=asset, timeframe=timeframe, origin="derived")
-        for timeframe in DEFAULT_TIMEFRAMES
-    }
-    parameters = _engine_parameters(signal_set)
-    generated_packets = _generate_vegas_packets(
+    resolved = resolve_signal_engine(
+        signal_engine_id,
+        version=signal_set.get("signal_engine_version"),
+        repository=repository,
         workspace_root=root,
-        asset=asset,
-        raw_5m=raw_5m,
-        derived=derived,
-        start=scan_start,
-        end=requested_target,
-        context_bars=int(parameters.get("context_bars", 80)),
-        proximity_threshold=Decimal(str(parameters.get("proximity_threshold", "0.002"))),
-        vote_threshold=int(parameters.get("vote_threshold", 2)),
-        window_minutes=int(parameters.get("dedupe_window_minutes", 120)),
     )
+    parameters = _engine_parameters(signal_set, defaults=_spec_default_parameters(resolved.spec))
+    training_output = resolved.generate_training_signals(
+        EngineTrainingContext(
+            asset=asset,
+            instrument=signal_set.get("instrument") or f"{asset}-USDT-SWAP",
+            signal_set=signal_set,
+            signal_set_key=signal_set_key,
+            parameters=parameters,
+            market_data_reader=reader,
+            spec=resolved.spec,
+            workspace_root=root,
+            repository=repository,
+            start=scan_start,
+            end=requested_target,
+            raw_candle_end=raw_candle_end,
+        )
+    )
+    generated_packets = list(training_output.packets)
 
     new_packets = [
         packet
@@ -150,62 +153,6 @@ def extend_signal_pool_from_local_candles(
     )
 
 
-def _generate_vegas_packets(
-    *,
-    workspace_root: Path,
-    asset: str,
-    raw_5m: list[MarketDataCandle],
-    derived: dict[str, list[MarketDataCandle]],
-    start: datetime,
-    end: datetime,
-    context_bars: int,
-    proximity_threshold: Decimal,
-    vote_threshold: int,
-    window_minutes: int,
-) -> list[dict[str, Any]]:
-    _ensure_vegas_path(workspace_root)
-    from vegas.replay_provider import ReplayMarketStateProvider
-    from vegas.signal_engine import UniversalVegasSignalEngine
-
-    provider = ReplayMarketStateProvider(
-        asset=asset,
-        raw_5m=[_to_vegas_candle(candle) for candle in raw_5m],
-        derived_candles={
-            timeframe: [_to_vegas_candle(candle) for candle in candles]
-            for timeframe, candles in derived.items()
-        },
-        context_bars=context_bars,
-    )
-    engine = UniversalVegasSignalEngine(
-        proximity_threshold=proximity_threshold,
-        vote_threshold=vote_threshold,
-    )
-    window = timedelta(minutes=window_minutes)
-    packets: list[dict[str, Any]] = []
-    last_emitted_at: datetime | None = None
-
-    for candle in provider.raw_5m:
-        if candle.ts < start:
-            continue
-        if candle.ts > end:
-            break
-        try:
-            snapshot = provider.snapshot_at(candle.ts)
-        except ValueError as error:
-            if "Not enough completed" not in str(error):
-                raise
-            continue
-        packet = engine.scan(snapshot)
-        if packet is None:
-            continue
-        if last_emitted_at is not None and (candle.ts - last_emitted_at) < window:
-            continue
-        last_emitted_at = candle.ts
-        packets.append(packet.to_dict())
-
-    return packets
-
-
 def _append_packets_to_signal_set(
     *,
     repository: Any,
@@ -249,46 +196,27 @@ def _append_packets_to_signal_set(
         "source": "parquet_market_data",
     }
 
-
-def _to_vegas_candle(candle: MarketDataCandle) -> Any:
-    from vegas.schemas import Candle
-
-    return Candle(
-        ts=candle.timestamp,
-        open=candle.open,
-        high=candle.high,
-        low=candle.low,
-        close=candle.close,
-        volume=candle.volume,
-        vol_ccy=candle.vol_ccy,
-        vol_ccy_quote=candle.vol_ccy_quote,
-        confirm=candle.confirm,
-    )
-
-
-def _ensure_vegas_path(root: Path) -> None:
-    src = root / "artifacts" / "signal_engine" / "src"
-    if not src.exists():
-        raise ValueError(f"Vegas signal engine source is missing: {src}")
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
-
-
 def _canonical_signal_set_key(signal_engine_id: str, asset: str) -> str:
     return build_signal_set_key(signal_engine_id, asset, f"{asset}-{signal_engine_id}-canonical")
 
 
-def _engine_parameters(signal_set: dict[str, Any]) -> dict[str, Any]:
+def _engine_parameters(signal_set: dict[str, Any], *, defaults: dict[str, Any] | None = None) -> dict[str, Any]:
     manifest = signal_set.get("manifest") if isinstance(signal_set.get("manifest"), dict) else {}
     parameters = manifest.get("parameters") if isinstance(manifest.get("parameters"), dict) else {}
-    defaults = {
-        "timeframes": list(DEFAULT_TIMEFRAMES),
+    base_defaults = {
+        "timeframes": ["2h", "4h", "8h", "12h", "1d"],
         "context_bars": 80,
         "vote_threshold": 2,
         "proximity_threshold": "0.002",
         "dedupe_window_minutes": 120,
     }
-    return {**defaults, **parameters}
+    return {**base_defaults, **(defaults or {}), **parameters}
+
+
+def _spec_default_parameters(spec: Any) -> dict[str, Any]:
+    configuration_schema = spec.configuration_schema if isinstance(spec.configuration_schema, dict) else {}
+    defaults = configuration_schema.get("default_parameters")
+    return dict(defaults) if isinstance(defaults, dict) else {}
 
 
 def _packet_data_refs(signal_set: dict[str, Any]) -> list[str]:

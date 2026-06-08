@@ -10,7 +10,9 @@ STRATEGY_VERSION = "0.1.0"
 def decide(context: dict[str, Any]) -> dict[str, Any]:
     signal = context["signal"]
     parameters = context.get("parameters", {})
-    move_pct = float(signal.get("payload", {}).get("move_pct", 0.0))
+    payload = signal.get("payload", {})
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    move_pct = float(evidence.get("move_pct", payload.get("move_pct", 0.0)))
     long_threshold = float(parameters.get("long_threshold_pct", 1.0))
     short_threshold = float(parameters.get("short_threshold_pct", -1.0))
 

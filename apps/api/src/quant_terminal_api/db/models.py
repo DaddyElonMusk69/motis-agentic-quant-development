@@ -396,7 +396,7 @@ deployment_routes = Table(
     Column("archived", Boolean, nullable=False, default=False),
     Column("archived_at", DateTime(timezone=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
-    UniqueConstraint("asset", "account_mode"),
+    UniqueConstraint("asset", "account_mode", "execution_adapter", "exchange_account"),
 )
 
 wake_runs = Table(

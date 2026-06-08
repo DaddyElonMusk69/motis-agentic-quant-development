@@ -22,8 +22,15 @@ from quant_terminal_api.services.market_data_catalog import (
     read_parquet_candles,
 )
 from quant_terminal_sdk.agent_tasks import AgentTaskBundle
+from quant_terminal_sdk.engine_contracts import (
+    ContractValidationError,
+    SignalEngineSpec,
+    validate_execution_bundle_contract,
+    validate_strategy_module,
+)
 from quant_terminal_sdk.market_data_reader import MarketDataReader
-from quant_terminal_worker.adapters.okx import OKXAdapter, OKXCLIError
+from quant_terminal_worker.adapters.exchange import ExchangeAdapterError, build_exchange_adapter
+from quant_terminal_worker.adapters.okx import OKXAdapter
 from quant_terminal_worker.backtests.stage1 import run_stage1_backtest
 from quant_terminal_worker.ingestion.raw_candle_fill import fill_raw_candle_dataset
 from quant_terminal_worker.ingestion.legacy_signals import import_legacy_signal_sets
@@ -81,7 +88,7 @@ class SignalEngineRegistrationRequest(BaseModel):
     code_ref: dict[str, Any] = Field(default_factory=dict)
     supported_input_data_types: list[str] = Field(default_factory=lambda: ["candles"])
     required_data: list[dict[str, Any]] = Field(default_factory=list)
-    output_envelope_version: str = "signal_envelope.v1"
+    output_envelope_version: str = "signal_packet.v2"
     live_scanner_entrypoint: str | None = None
     configuration_schema: dict[str, Any] = Field(default_factory=dict)
 
@@ -268,16 +275,11 @@ def create_app(
             runtime_repo = RuntimeRepository(database_url)
         return runtime_repo
 
-    def build_execution_adapter(route: dict[str, Any]) -> OKXAdapter:
-        if route.get("execution_adapter") != "okx":
-            raise HTTPException(status_code=400, detail=f"unsupported execution adapter: {route.get('execution_adapter')}")
-        return OKXAdapter(
-            {
-                "backend": "okx_cli",
-                "mode": route["account_mode"] if route.get("account_mode") in {"demo", "live"} else os.environ.get("OKX_MODE", "demo"),
-                "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
-            }
-        )
+    def build_execution_adapter(route: dict[str, Any]) -> Any:
+        try:
+            return build_exchange_adapter(route)
+        except ExchangeAdapterError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def run_lifecycle_cycle_for_route(route_id: str) -> dict[str, Any]:
         route = get_runtime_repository().get_deployment_route(route_id)
@@ -564,10 +566,11 @@ def create_app(
 
     @app.delete("/api/v1/research/stage1-sessions/{session_id}")
     def reset_stage1_research_session(session_id: str) -> dict[str, Any]:
-        session = get_runtime_repository().get_stage1_research_session(session_id)
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
-        _ensure_stage1_session_mutable(session)
+        _ensure_stage1_session_resettable(repository=repository, session=session)
         artifact_root = Path(session["artifact_root"])
         if not artifact_root.is_absolute():
             artifact_root = Path.cwd() / artifact_root
@@ -1044,7 +1047,7 @@ def create_app(
             }
         try:
             snapshot = adapter.snapshot(route["instrument"])
-        except OKXCLIError as exc:
+        except ExchangeAdapterError as exc:
             return {
                 **base,
                 "status": "disconnected",
@@ -1136,7 +1139,7 @@ def create_app(
         try:
             cycle = run_lifecycle_cycle_for_route(route_id)
             scheduled_route = scheduler.start(route_id, run_immediately=False)
-        except OKXCLIError as exc:
+        except ExchangeAdapterError as exc:
             repository.update_deployment_route_gate(
                 route_id,
                 scheduler_status="stopped",
@@ -1171,7 +1174,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="deployment route not found")
         try:
             cycle = run_lifecycle_cycle_for_route(route_id)
-        except OKXCLIError as exc:
+        except ExchangeAdapterError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {
             "warmup": _relative_nested_paths(Path.cwd(), cycle["warmup"]),
@@ -1193,13 +1196,7 @@ def create_app(
             raise HTTPException(status_code=404, detail="deployment route not found")
         if repository.get_wake_run(wake_id) is None:
             raise HTTPException(status_code=404, detail="wake run not found")
-        adapter = OKXAdapter(
-            {
-                "backend": "okx_cli",
-                "mode": route["account_mode"] if route.get("account_mode") in {"demo", "live"} else os.environ.get("OKX_MODE", "demo"),
-                "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
-            }
-        )
+        adapter = build_execution_adapter(route)
         try:
             result = submit_wake_order_intents(
                 route_id=route_id,
@@ -1212,7 +1209,7 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except OKXCLIError as exc:
+        except ExchangeAdapterError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {
             **_relative_nested_paths(Path.cwd(), result),
@@ -1540,7 +1537,7 @@ def create_app(
                 repository=get_market_data_repository(),
                 adapter=OKXAdapter({"backend": "okx_cli", "mode": os.environ.get("OKX_MODE", "demo")}),
             )
-        except OKXCLIError as exc:
+        except ExchangeAdapterError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return app
@@ -1827,6 +1824,16 @@ def _materialize_execution_bundle(
             "end": _date_string(session["walk_forward_end"]),
         },
     }
+    engine_spec = _resolve_engine_spec_for_promotion(
+        repository=repository,
+        signal_engine_id=session["signal_engine_id"],
+        version=session.get("signal_engine_version"),
+    )
+    try:
+        validate_strategy_module(strategy_path)
+        validate_execution_bundle_contract({"execution_setup": execution_setup})
+    except ContractValidationError as exc:
+        raise ValueError(str(exc)) from exc
     bundle_seed = {
         "asset": session["asset"],
         "signal_engine_id": session["signal_engine_id"],
@@ -1863,6 +1870,9 @@ def _materialize_execution_bundle(
         "account_mode": account_mode,
         "execution_adapter": execution_adapter,
         "content_hash": content_hash,
+        "contract_version": "engine_strategy_contract.v1",
+        "validated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "signal_engine_spec": engine_spec.to_mapping(),
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "gate": _relative_nested_paths(workspace_root, gate),
     }
@@ -1906,6 +1916,27 @@ def _materialize_execution_bundle(
         "content_hash": content_hash,
         "status": "promoted",
     }
+
+
+def _resolve_engine_spec_for_promotion(
+    *,
+    repository: Any,
+    signal_engine_id: str,
+    version: str | None,
+) -> SignalEngineSpec:
+    for engine in repository.list_signal_engines():
+        if engine.get("signal_engine_id") != signal_engine_id:
+            continue
+        if version is not None and engine.get("version") != version:
+            continue
+        return SignalEngineSpec.from_mapping({**engine, "output_envelope_version": engine.get("output_envelope_version") or "signal_packet.v2"})
+    registry_path = Path.cwd() / "artifacts" / "signal_engine" / "engine_registry.json"
+    if registry_path.is_file():
+        registry = json.loads(registry_path.read_text())
+        entry = registry.get(signal_engine_id) if isinstance(registry, dict) else None
+        if isinstance(entry, dict):
+            return SignalEngineSpec.from_mapping({**entry, "output_envelope_version": entry.get("output_envelope_version") or "signal_packet.v2"})
+    raise ValueError(f"Signal engine spec not found for {signal_engine_id}")
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -2143,6 +2174,20 @@ def _ensure_stage1_session_mutable(session: dict[str, Any]) -> None:
     gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
     if (gate.get("canonical_readout") or {}).get("exists"):
         raise HTTPException(status_code=409, detail="Stage 1 session is frozen")
+
+
+def _ensure_stage1_session_resettable(*, repository: Any, session: dict[str, Any]) -> None:
+    finder = getattr(repository, "list_execution_bundles_for_stage1_session", None)
+    if callable(finder):
+        bundles = finder(session["session_id"])
+    else:
+        bundles = [
+            bundle
+            for bundle in repository.list_execution_bundles()
+            if bundle.get("source_stage1_session_id") == session["session_id"]
+        ]
+    if bundles:
+        raise HTTPException(status_code=409, detail="Stage 1 session has a promoted execution bundle")
 
 
 def _next_action(

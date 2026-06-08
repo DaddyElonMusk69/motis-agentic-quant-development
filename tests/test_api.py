@@ -22,6 +22,7 @@ class StubRuntimeRepository:
         self.updated_candidate = None
         self.summary_refreshed = False
         self.stage1_sessions = []
+        self.execution_bundles = []
         self.updated_stage1_session = None
         self.window_requests = []
         self.window_signals = None
@@ -236,6 +237,13 @@ class StubRuntimeRepository:
 
     def delete_stage1_research_session(self, session_id):
         self.stage1_sessions = [session for session in self.stage1_sessions if session["session_id"] != session_id]
+
+    def list_execution_bundles_for_stage1_session(self, session_id):
+        return [
+            bundle
+            for bundle in self.execution_bundles
+            if bundle.get("source_stage1_session_id") == session_id
+        ]
 
     def list_signals_for_signal_set_window(self, **kwargs):
         self.window_requests.append(kwargs)
@@ -1098,6 +1106,86 @@ def test_stage1_session_reset_endpoint_returns_candidate_to_clean_slate(tmp_path
     }
     assert repository.stage1_sessions == []
     assert not artifact_root.exists()
+
+
+def test_stage1_session_reset_allows_frozen_unpromoted_session(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "canonical_stage1a_decisions.json").write_text("{}\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "source_universe_run_id": "universe-a",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.delete("/api/v1/research/stage1-sessions/stage1-aave")
+
+    assert response.status_code == 200
+    assert repository.stage1_sessions == []
+    assert not artifact_root.exists()
+
+
+def test_stage1_session_reset_blocks_promoted_execution_bundle(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    artifact_root.mkdir(parents=True)
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "source_universe_run_id": "universe-a",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    repository.execution_bundles = [
+        {
+            "bundle_id": "bundle-aave",
+            "source_stage1_session_id": "stage1-aave",
+            "status": "promoted",
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.delete("/api/v1/research/stage1-sessions/stage1-aave")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Stage 1 session has a promoted execution bundle"
+    assert repository.stage1_sessions[0]["session_id"] == "stage1-aave"
+    assert artifact_root.exists()
 
 
 def test_stage1_session_endpoint_inherits_windows_from_stage0_batch():
@@ -3168,6 +3256,7 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution.db'}")
     metadata.create_all(engine)
     repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
     session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
     promotion_root = tmp_path / session["artifact_root"] / "promotion"
     frozen_root = promotion_root / "frozen_stage1a_strategy_module"
@@ -3212,6 +3301,9 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     assert promoted["bundle"]["status"] == "promoted"
     assert promoted["bundle"]["execution_setup"]["forward_hours"] == 36
     assert promoted["bundle"]["execution_setup"]["hard_exit_after_hours"] == 36
+    manifest = json.loads((tmp_path / promoted["bundle"]["bundle_uri"] / "manifest.json").read_text())
+    assert manifest["contract_version"] == "engine_strategy_contract.v1"
+    assert manifest["signal_engine_spec"]["signal_engine_id"] == "vegas_ema"
     assert promoted["route"]["route_id"] == "aave-live"
     assert promoted["route"]["enabled"] is False
     assert promoted["route"]["blockers"] == ["route_disabled", "data_not_warmed", "route_not_manually_armed"]
@@ -3226,6 +3318,64 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     assert wake_response.status_code == 200
     assert wake_response.json()["wake"]["status"] == "blocked"
     assert wake_response.json()["wake"]["branch"] == "route_gate"
+
+
+def test_promote_execution_bundle_rejects_missing_strategy_decide(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-invalid-strategy.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True, exist_ok=True)
+    (frozen_root / "strategy.py").write_text("def helper(context):\n    return None\n")
+    (promotion_root / "stage4_realized_expectancy.json").write_text(
+        json.dumps({"best_candidate_id": "fixed", "best_candidate": {"candidate_id": "fixed"}, "candidates": []})
+    )
+    (promotion_root / "stage4_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (promotion_root / "stage4_optimal.json").write_text(
+        json.dumps({"best": {"candidate_id": "fixed", "setup": {"tp_pct": 2.0, "sl_pct": 1.0}}})
+    )
+    (promotion_root / "stage4_summary.md").write_text("# Stage 4 Realized Expectancy\n")
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "strategy module must expose callable decide(context)"
+
+
+def test_promote_execution_bundle_rejects_invalid_execution_setup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-invalid-setup.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True, exist_ok=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {'trade_action': 'SKIP'}\n")
+    (promotion_root / "stage4_realized_expectancy.json").write_text(
+        json.dumps({"best_candidate_id": "fixed", "best_candidate": {"candidate_id": "fixed"}, "candidates": []})
+    )
+    (promotion_root / "stage4_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (promotion_root / "stage4_optimal.json").write_text(
+        json.dumps({"best": {"candidate_id": "fixed", "setup": {"tp_pct": 2.0}}})
+    )
+    (promotion_root / "stage4_summary.md").write_text("# Stage 4 Realized Expectancy\n")
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "execution setup missing initial_sl_pct"
 
 
 def test_trading_route_archive_hides_route_and_lists_archived_strategy(tmp_path, monkeypatch):
@@ -3387,7 +3537,11 @@ def test_trading_wake_auto_warms_required_market_data(tmp_path, monkeypatch):
         def snapshot(self, instrument):
             return {"instrument": instrument, "positions": [], "open_orders": []}
 
-    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    monkeypatch.setattr(api_main, "build_exchange_adapter", lambda route: FakeOKXAdapter({
+        "backend": "okx_cli",
+        "mode": route["account_mode"],
+        "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+    }))
     client = TestClient(
         create_app(
             runtime_repository=repository,
@@ -3464,7 +3618,11 @@ def test_submit_wake_orders_places_order_and_persists_owner_state(tmp_path, monk
         def place_swap_order(self, request):
             return {"ordId": "okx-order-1", "clOrdId": request.client_order_id}
 
-    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    monkeypatch.setattr(api_main, "build_exchange_adapter", lambda route: FakeOKXAdapter({
+        "backend": "okx_cli",
+        "mode": route["account_mode"],
+        "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+    }))
     client = TestClient(create_app(runtime_repository=repository))
 
     response = client.post(
@@ -3479,6 +3637,83 @@ def test_submit_wake_orders_places_order_and_persists_owner_state(tmp_path, monk
     assert payload["wake"]["order_intents"][0]["status"] == "submitted"
     assert payload["wake"]["adapter_results"][0]["ordId"] == "okx-order-1"
     assert repository.get_open_owner_state(route["route_id"])["opened_from_signal_id"] == "signal-1"
+
+
+def test_submit_wake_orders_uses_route_exchange_adapter_factory(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'submit-factory.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    bundle = _execution_bundle(tmp_path)
+    stored_bundle = repository.create_execution_bundle(bundle)
+    route = repository.upsert_deployment_route_for_bundle(
+        bundle=stored_bundle,
+        account_mode="demo",
+        execution_adapter="okx",
+    )
+    route = repository.update_deployment_route_gate(route["route_id"], exchange_account="paper-profile")
+    repository.update_deployment_route_gate(route["route_id"], enabled=True, data_warmed=True, manually_armed=True)
+    wake = repository.record_wake_run(
+        {
+            "wake_id": "wake-submit-factory",
+            "route_id": route["route_id"],
+            "bundle_id": stored_bundle["bundle_id"],
+            "status": "completed",
+            "branch": "entry_scan",
+            "blockers": [],
+            "exchange_snapshot": {},
+            "signal_scan_result": {"status": "evaluated", "signal_id": "signal-factory"},
+            "strategy_decision": {"action": "ENTER"},
+            "order_intents": [
+                {
+                    "intent_id": "wake-submit-factory:0",
+                    "route_id": route["route_id"],
+                    "asset": "AAVE",
+                    "instrument": "AAVE-USDT-SWAP",
+                    "signal_id": "signal-factory",
+                    "side": "buy",
+                    "direction": "LONG",
+                    "order_type": "market",
+                    "quantity": "1",
+                    "notional_usd": 10,
+                    "trade_mode": "isolated",
+                    "reduce_only": False,
+                    "client_order_id": "motis-submit-factory",
+                    "status": "intent_only",
+                }
+            ],
+            "adapter_results": [],
+            "error": {},
+            "completed_at": "2026-06-05T00:00:00Z",
+        }
+    )
+
+    built_routes = []
+
+    class FakeAdapter:
+        def place_swap_order(self, request):
+            return {"ordId": "factory-order-1", "clOrdId": request.client_order_id}
+
+    def fake_build_exchange_adapter(route):
+        built_routes.append(dict(route))
+        return FakeAdapter()
+
+    class ExplodingOKXAdapter:
+        def __init__(self, config):
+            raise AssertionError("submit-orders must use build_exchange_adapter")
+
+    monkeypatch.setattr(api_main, "build_exchange_adapter", fake_build_exchange_adapter, raising=False)
+    monkeypatch.setattr(api_main, "OKXAdapter", ExplodingOKXAdapter, raising=False)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        f"/api/v1/trading/routes/{route['route_id']}/wakes/{wake['wake_id']}/submit-orders",
+        json={"confirm_live": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["wake"]["adapter_results"][0]["ordId"] == "factory-order-1"
+    assert built_routes[0]["execution_adapter"] == "okx"
+    assert built_routes[0]["exchange_account"] == "paper-profile"
 
 
 def test_trading_route_exchange_health_reports_connected_backend_adapter(tmp_path, monkeypatch):
@@ -3513,7 +3748,11 @@ def test_trading_route_exchange_health_reports_connected_backend_adapter(tmp_pat
         def _cli_path(self):
             return "/opt/homebrew/bin/okx"
 
-    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    monkeypatch.setattr(api_main, "build_exchange_adapter", lambda route: FakeOKXAdapter({
+        "backend": "okx_cli",
+        "mode": route["account_mode"],
+        "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+    }))
     client = TestClient(create_app(runtime_repository=repository))
 
     response = client.get(f"/api/v1/trading/routes/{route['route_id']}/exchange-health")
@@ -3551,12 +3790,16 @@ def test_trading_route_exchange_health_reports_sanitized_adapter_failure(tmp_pat
             return []
 
         def snapshot(self, instrument):
-            raise api_main.OKXCLIError("Error: Not logged in\nsecret_key=should-not-leak")
+            raise api_main.ExchangeAdapterError("Error: Not logged in\nsecret_key=should-not-leak")
 
         def _cli_path(self):
             return "/opt/homebrew/bin/okx"
 
-    monkeypatch.setattr(api_main, "OKXAdapter", FakeOKXAdapter)
+    monkeypatch.setattr(api_main, "build_exchange_adapter", lambda route: FakeOKXAdapter({
+        "backend": "okx_cli",
+        "mode": route["account_mode"],
+        "profile": route.get("exchange_account") if route.get("exchange_account") not in {None, "", "default"} else None,
+    }))
     client = TestClient(create_app(runtime_repository=repository))
 
     response = client.get(f"/api/v1/trading/routes/{route['route_id']}/exchange-health")
@@ -3607,6 +3850,27 @@ def _queue_universe_run():
         "status": "completed",
         "summary": {"accepted": 1, "pending_stage0": 0, "watchlist": 0},
     }
+
+
+def _register_vegas_engine(repository):
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema",
+            "name": "Vegas EMA Tunnel",
+            "description": "Legacy engine",
+            "version": "0.1",
+            "code_ref": {
+                "path": "artifacts/signal_engine",
+                "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py",
+            },
+            "supported_input_data_types": ["candles"],
+            "required_data": [{"data_type": "candles", "origin": "raw", "timeframe": "5m"}],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:generate_training_signals",
+            "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:scan_live_signal",
+            "configuration_schema": {},
+        }
+    )
 
 
 def _queue_candidate(candidate_id, asset, acceptance_status, trigger_rate_pct, *, total_records=None, packet_count=100):

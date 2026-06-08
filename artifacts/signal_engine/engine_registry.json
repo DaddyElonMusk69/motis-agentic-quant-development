@@ -1,11 +1,13 @@
 {
   "vegas_ema": {
     "signal_engine_id": "vegas_ema",
-    "replay_generator_path": "artifacts/signal_engine/scripts/signals/generate_training_session.py",
-    "live_scanner_path": "artifacts/signal_engine/scripts/signals/scan_okx_live_signals.py",
-    "dev_signals_root": "dev/signals/vegas_ema",
-    "live_signals_root": "live/signals/vegas_ema",
-    "signal_family": "vegas_ema",
+    "version": "0.1",
+    "name": "Vegas EMA Tunnel",
+    "description": "Multi-timeframe Vegas EMA tunnel signal engine.",
+    "code_ref": {
+      "path": "artifacts/signal_engine",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py"
+    },
     "required_data": [
       {
         "data_type": "candles",
@@ -69,14 +71,170 @@
           "timeframe": "5m"
         }
       }
-    ]
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:scan_live_signal",
+    "configuration_schema": {}
+  },
+  "vegas_ema_vote1": {
+    "signal_engine_id": "vegas_ema_vote1",
+    "version": "0.1",
+    "name": "Vegas 1 Vote",
+    "description": "Vegas EMA tunnel signal engine variant that emits on one timeframe vote.",
+    "code_ref": {
+      "path": "artifacts/signal_engine",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py"
+    },
+    "required_data": [
+      {
+        "data_type": "candles",
+        "origin": "raw",
+        "timeframe": "5m",
+        "lookback_bars": 20000,
+        "freshness_tolerance_seconds": 300
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "2h",
+        "lookback_bars": 676,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "4h",
+        "lookback_bars": 676,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "8h",
+        "lookback_bars": 676,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "12h",
+        "lookback_bars": 676,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "1d",
+        "lookback_bars": 676,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      }
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:scan_live_signal",
+    "configuration_schema": {
+      "default_parameters": {
+        "vote_threshold": 1
+      }
+    }
   },
   "bollinger": {
     "signal_engine_id": "bollinger",
-    "replay_generator_path": "artifacts/signal_engine/scripts/signals/generate_bollinger_training_session.py",
-    "live_scanner_path": "artifacts/signal_engine/scripts/signals/scan_okx_live_bollinger_signals.py",
-    "dev_signals_root": "dev/signals/bollinger",
-    "live_signals_root": "live/signals/bollinger",
-    "signal_family": "bollinger"
+    "version": "0.1",
+    "name": "Bollinger Bands",
+    "description": "Multi-timeframe Bollinger band proximity signal engine.",
+    "code_ref": {
+      "path": "apps/worker/src/quant_terminal_worker/signal_engines/bollinger.py",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/bollinger_base.py"
+    },
+    "required_data": [
+      {
+        "data_type": "candles",
+        "origin": "raw",
+        "timeframe": "5m",
+        "lookback_bars": 20000,
+        "freshness_tolerance_seconds": 300
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "4h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "8h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "12h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "1d",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        }
+      }
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.bollinger:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.bollinger:scan_live_signal",
+    "configuration_schema": {
+      "default_parameters": {
+        "timeframes": ["4h", "8h", "12h", "1d"],
+        "context_bars": 80,
+        "bb_period": 20,
+        "bb_stddev": "2",
+        "watched_bands": ["upper", "lower"],
+        "proximity_threshold": "0.002",
+        "vote_threshold": 2,
+        "dedupe_window_minutes": 120
+      }
+    }
   }
 }

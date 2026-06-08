@@ -26,12 +26,19 @@ def test_sample_signal_engine_emits_neutral_signal_envelopes():
             "instrument": "BTC-USDT-SWAP",
             "timestamp": "2026-06-01T00:10:00Z",
             "data_refs": ["btc-raw-5m"],
-            "payload_schema": "threshold_reversal.v1",
+            "payload_schema": "signal_packet.v2",
             "payload": {
-                "move_pct": 3.0,
-                "lookback_open": 100.0,
-                "current_close": 103.0,
-                "neutral_trigger": "lookback_move_exceeded",
+                "schema_version": "signal_packet.v2",
+                "asset": "BTC",
+                "instrument": "BTC-USDT-SWAP",
+                "timestamp": "2026-06-01T00:10:00Z",
+                "active_timeframes": ["5m"],
+                "evidence": {
+                    "move_pct": 3.0,
+                    "lookback_open": 100.0,
+                    "current_close": 103.0,
+                    "neutral_trigger": "lookback_move_exceeded",
+                },
             },
         }
     ]

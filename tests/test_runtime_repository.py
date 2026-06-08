@@ -73,6 +73,48 @@ def test_runtime_repository_serializes_datetime_values_inside_wake_json_payloads
     assert stored["exchange_snapshot"]["positions"][0]["opened_at"] == "2026-06-06T04:12:21Z"
 
 
+def test_runtime_repository_closes_all_open_owner_states_for_route_instrument():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    base = {
+        "route_id": "aave-live",
+        "bundle_id": "bundle-1",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "account_mode": "live",
+        "owner_strategy_id": "aave-strategy",
+        "owner_strategy_version": "v0.1",
+        "opened_from_signal_id": None,
+        "status": "open",
+        "position_state": {"direction": "LONG"},
+    }
+    repository.create_owner_state({**base, "owner_state_id": "owner-1", "position_instance_id": "pos-1"})
+    repository.create_owner_state({**base, "owner_state_id": "owner-2", "position_instance_id": "pos-2"})
+    repository.create_owner_state(
+        {
+            **base,
+            "owner_state_id": "owner-other",
+            "route_id": "eth-live",
+            "asset": "ETH",
+            "instrument": "ETH-USDT-SWAP",
+            "position_instance_id": "pos-other",
+        }
+    )
+
+    closed = repository.close_open_owner_states(
+        "aave-live",
+        instrument="AAVE-USDT-SWAP",
+        reason="exchange_position_flat",
+    )
+
+    assert {row["owner_state_id"] for row in closed} == {"owner-1", "owner-2"}
+    assert all(row["status"] == "closed" for row in closed)
+    assert all(row["position_state"]["close_reason"] == "exchange_position_flat" for row in closed)
+    assert repository.get_open_owner_state("aave-live") is None
+    assert repository.get_open_owner_state("eth-live")["owner_state_id"] == "owner-other"
+
+
 def test_runtime_repository_refreshes_signal_engine_required_data_on_reregistration():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     metadata.create_all(engine)
@@ -1097,7 +1139,7 @@ def test_runtime_repository_persists_execution_bundle_route_wake_and_signal_cons
     assert repository.get_open_owner_state(route["route_id"]) is None
 
 
-def test_runtime_repository_reuses_one_deployment_route_per_asset_account():
+def test_runtime_repository_reuses_one_deployment_route_per_asset_account_exchange():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     metadata.create_all(engine)
     repository = RuntimeRepository(engine)
@@ -1141,15 +1183,34 @@ def test_runtime_repository_reuses_one_deployment_route_per_asset_account():
         account_mode="live",
         execution_adapter="okx",
     )
+    repository.update_deployment_route_gate(second_route["route_id"], exchange_account="main-live-01")
+    third_bundle = {
+        **first_bundle,
+        "bundle_id": "aave-okx-alt-account-bundle",
+        "source_stage1_session_id": "stage1-aave-alt",
+        "bundle_uri": "artifacts/execution_bundles/aave-alt",
+        "strategy_module_ref": "artifacts/execution_bundles/aave-alt/strategy.py",
+        "content_hash": "alt",
+    }
+    third_route = repository.upsert_deployment_route_for_bundle(
+        bundle=repository.create_execution_bundle(third_bundle),
+        account_mode="live",
+        execution_adapter="okx",
+        exchange_account="default",
+    )
 
     routes = repository.list_deployment_routes()
     assert first_route["route_id"] == "aave-live"
     assert second_route["route_id"] == "aave-live"
-    assert len(routes) == 1
-    assert routes[0]["active_bundle_id"] == "aave-bollinger-bundle"
-    assert routes[0]["signal_engine_id"] == "bollinger"
-    assert routes[0]["strategy_id"] == "aave-bollinger"
-    assert routes[0]["cron_interval_minutes"] == 15
+    assert third_route["route_id"] == "aave-live-okx-default"
+    assert len(routes) == 2
+    default_route = next(route for route in routes if route["exchange_account"] == "default")
+    live_profile_route = next(route for route in routes if route["exchange_account"] == "main-live-01")
+    assert default_route["active_bundle_id"] == "aave-okx-alt-account-bundle"
+    assert live_profile_route["active_bundle_id"] == "aave-bollinger-bundle"
+    assert live_profile_route["signal_engine_id"] == "bollinger"
+    assert live_profile_route["strategy_id"] == "aave-bollinger"
+    assert live_profile_route["cron_interval_minutes"] == 15
 
 
 def test_runtime_repository_archives_deployment_routes_out_of_active_list():

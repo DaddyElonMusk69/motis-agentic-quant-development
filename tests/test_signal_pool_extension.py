@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, insert
 
 from quant_terminal_api.db.models import data_sources, market_data_refs, metadata
 from quant_terminal_api.repositories.runtime import RuntimeRepository
-from quant_terminal_worker.ingestion import signal_pool_extension
+from quant_terminal_worker.signal_engines import vegas_ema
 from quant_terminal_worker.ingestion.signal_pool_extension import extend_signal_pool_from_local_candles
 
 
@@ -84,7 +84,7 @@ def test_extend_signal_pool_uses_parquet_candles_and_ignores_persistent_packet_f
             }
         ]
 
-    monkeypatch.setattr(signal_pool_extension, "_generate_vegas_packets", fake_generator)
+    monkeypatch.setattr(vegas_ema, "generate_vegas_packets", fake_generator)
 
     result = extend_signal_pool_from_local_candles(
         workspace_root=root,
@@ -124,7 +124,7 @@ def test_extend_signal_pool_reports_no_new_signals_and_advances_scan_coverage(
         timestamps=["2026-05-10T00:00:00Z", "2026-05-20T00:00:00Z"],
     )
 
-    monkeypatch.setattr(signal_pool_extension, "_generate_vegas_packets", lambda **kwargs: [])
+    monkeypatch.setattr(vegas_ema, "generate_vegas_packets", lambda **kwargs: [])
 
     result = extend_signal_pool_from_local_candles(
         workspace_root=root,
@@ -176,7 +176,7 @@ def test_extend_signal_pool_resumes_after_existing_parquet_scan_coverage(
         calls.append(kwargs)
         return []
 
-    monkeypatch.setattr(signal_pool_extension, "_generate_vegas_packets", fake_generator)
+    monkeypatch.setattr(vegas_ema, "generate_vegas_packets", fake_generator)
 
     result = extend_signal_pool_from_local_candles(
         workspace_root=root,
@@ -203,6 +203,29 @@ def _repository_with_signal_pool(
         connection.execute(
             insert(data_sources).values(source_id="okx", name="OKX", source_type="exchange", config={})
         )
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema",
+            "name": "Vegas EMA",
+            "description": "",
+            "version": "0.1",
+            "code_ref": {},
+            "supported_input_data_types": ["candles"],
+            "required_data": [
+                {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                {
+                    "data_type": "candles",
+                    "origin": "derived",
+                    "timeframe": "2h",
+                    "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                },
+            ],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:generate_training_signals",
+            "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema:scan_live_signal",
+            "configuration_schema": {},
+        }
+    )
     repository.upsert_signal_set(
         {
             "signal_set_key": "vegas_ema:AAVE:AAVE-vegas_ema-canonical",

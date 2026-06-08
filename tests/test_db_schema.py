@@ -33,7 +33,7 @@ def test_schema_declares_core_product_tables():
     assert expected.issubset(set(metadata.tables))
 
 
-def test_deployment_routes_enforce_one_route_per_asset_account():
+def test_deployment_routes_enforce_one_route_per_asset_account_exchange():
     route_table = metadata.tables["deployment_routes"]
 
     unique_constraints = {
@@ -42,7 +42,7 @@ def test_deployment_routes_enforce_one_route_per_asset_account():
         if constraint.__class__.__name__ == "UniqueConstraint"
     }
 
-    assert ("asset", "account_mode") in unique_constraints
+    assert ("asset", "account_mode", "execution_adapter", "exchange_account") in unique_constraints
     assert "active_bundle_id" in route_table.columns
     assert "cron_interval_minutes" in route_table.columns
     assert "exchange_account" in route_table.columns

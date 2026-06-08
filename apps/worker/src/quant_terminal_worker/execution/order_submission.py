@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from quant_terminal_worker.adapters.okx import SwapOrderRequest, SwapProtectionRequest
+from quant_terminal_worker.adapters.exchange import SwapOrderRequest, SwapProtectionRequest
 
 
 def submit_wake_order_intents(

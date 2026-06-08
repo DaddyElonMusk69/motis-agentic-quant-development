@@ -1,0 +1,3 @@
+display_name: Signal Engine Builder
+short_description: Build Motis contract-compliant signal engines and paired base strategies.
+default_prompt: Build or review a Motis signal engine against the canonical engine/strategy contract.

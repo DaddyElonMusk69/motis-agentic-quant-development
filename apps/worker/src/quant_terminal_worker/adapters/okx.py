@@ -10,50 +10,11 @@ import shutil
 import subprocess
 from typing import Any
 
+from quant_terminal_worker.adapters.exchange import ExchangeAdapterError, SwapOrderRequest, SwapProtectionRequest
 
-class OKXCLIError(RuntimeError):
+
+class OKXCLIError(ExchangeAdapterError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class SwapOrderRequest:
-    inst_id: str
-    side: str
-    order_type: str
-    size: str
-    trade_mode: str
-    client_order_id: str
-    position_side: str | None = None
-    price: str | None = None
-    target_currency: str | None = None
-    tp_trigger_price: str | None = None
-    sl_trigger_price: str | None = None
-    reduce_only: bool = False
-
-    def __post_init__(self) -> None:
-        if self.side not in {"buy", "sell"}:
-            raise ValueError("side must be buy or sell")
-        if not self.client_order_id:
-            raise ValueError("client_order_id is required for idempotent live orders")
-        if self.target_currency not in {None, "base_ccy", "quote_ccy", "margin"}:
-            raise ValueError("target_currency must be base_ccy, quote_ccy, or margin")
-
-
-@dataclass(frozen=True, slots=True)
-class SwapProtectionRequest:
-    inst_id: str
-    side: str
-    size: str
-    trade_mode: str
-    tp_trigger_price: str
-    sl_trigger_price: str
-    position_side: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.side not in {"buy", "sell"}:
-            raise ValueError("side must be buy or sell")
-        if not self.tp_trigger_price or not self.sl_trigger_price:
-            raise ValueError("tp_trigger_price and sl_trigger_price are required")
 
 
 @dataclass(frozen=True, slots=True)

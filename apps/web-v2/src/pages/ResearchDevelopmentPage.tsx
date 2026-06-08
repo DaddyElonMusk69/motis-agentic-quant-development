@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Clipboard, Play, RefreshCw, Trash2, UploadCloud, X } from "lucide-react";
+import { Clipboard, Play, RefreshCw, RotateCcw, Trash2, UploadCloud, X } from "lucide-react";
 import {
   createStage1Iteration,
   createStage1ResearchSession,
@@ -745,9 +745,25 @@ export function ResearchDevelopmentPage() {
             <div className="workbench-header development-header">
               <div>
                 <span className="eyebrow">Candidate workbench</span>
-                <h1>{row ? `${row.asset} / ${row.signal_engine_id}` : "Select a candidate"}</h1>
+                <h1>{session ? `${session.asset} / ${session.strategy_id}` : row ? `${row.asset} / ${row.signal_engine_id}` : "Select a candidate"}</h1>
               </div>
               <div className="header-actions">
+                {session ? (
+                  <button
+                    className="button button--secondary button--compact"
+                    disabled={deleteSessionMutation.isPending}
+                    onClick={() => {
+                      if (window.confirm("Reset this development session back to clean slate? This deletes the current Stage 1-4 workspace and iteration history for this candidate. Promoted execution bundles cannot be reset here.")) {
+                        deleteSessionMutation.mutate(session.session_id);
+                      }
+                    }}
+                    title="Reset this development session to the clean slate before Stage 1 started"
+                    type="button"
+                  >
+                    <RotateCcw aria-hidden="true" />
+                    {deleteSessionMutation.isPending ? "Resetting" : "Reset Session"}
+                  </button>
+                ) : null}
                 {row ? <StatusBadge tone={stageTone(row)}>{developmentLabel(row)}</StatusBadge> : null}
                 <button
                   className="button button--primary"
@@ -803,7 +819,6 @@ export function ResearchDevelopmentPage() {
                 onOpenIteration={setSelectedIteration}
                 onOpenPrompt={(iteration) => promptMutation.mutate({ session_id: session!.session_id, iteration_id: iteration.iteration_id })}
                 onRunCanonical={() => requestCanonicalFreeze()}
-                onResetSession={() => session && deleteSessionMutation.mutate(session.session_id)}
                 onScore={(iteration) => scoreMutation.mutate({ session_id: session!.session_id, iteration_id: iteration.iteration_id, sample_role: stage1RoleForIteration(iteration) })}
                 onStartStage1={requestStartStage1}
                 row={row}
@@ -1112,7 +1127,6 @@ function Stage1Panel({
   onOpenIteration,
   onOpenPrompt,
   onRunCanonical,
-  onResetSession,
   onScore,
   onStartStage1,
   row,
@@ -1132,7 +1146,6 @@ function Stage1Panel({
   onOpenIteration: (iteration: Stage1IterationSummary) => void;
   onOpenPrompt: (iteration: Stage1IterationSummary) => void;
   onRunCanonical: () => void;
-  onResetSession: () => void;
   onScore: (iteration: Stage1IterationSummary) => void;
   onStartStage1: () => void;
   row: DevelopmentQueueRow | undefined;
@@ -1177,23 +1190,6 @@ function Stage1Panel({
         </TerminalPanel>
       ) : (
         <>
-          <TerminalPanel title="Session Controls">
-            <div className="action-card action-card--inline">
-              <span>Reset this candidate to the clean slate before Stage 1 started. This deletes the current session workspace and iteration history for this pool only.</span>
-              <button
-                className="button button--secondary"
-                disabled={frozen}
-                onClick={() => {
-                  if (window.confirm("Reset this Stage 1 session back to clean slate?")) {
-                    onResetSession();
-                  }
-                }}
-                type="button"
-              >
-                Reset Session
-              </button>
-            </div>
-          </TerminalPanel>
           <div className="stage1-lanes">
             {stage1Roles.map((role, index) => {
               const latest = groupedIterations[role][groupedIterations[role].length - 1];

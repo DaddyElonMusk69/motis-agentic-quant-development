@@ -9,6 +9,7 @@ from quant_terminal_worker.execution.live_signal_scan import scan_latest_live_si
 
 
 DEFAULT_ENTRY_ORDER_TTL_MINUTES = 30
+PYRAMID_LEG_BUCKET_TOLERANCE = 0.35
 
 
 def run_route_wake(
@@ -169,10 +170,6 @@ def run_route_wake(
             },
         )
 
-    open_owner_state = repository.get_open_owner_state(route_id)
-    if open_owner_state is not None and not working_entry_orders and hasattr(repository, "close_open_owner_state"):
-        repository.close_open_owner_state(route_id, reason="exchange_position_flat")
-
     fresh_orders = [
         order
         for order in working_entry_orders
@@ -212,6 +209,33 @@ def run_route_wake(
                     client_order_id=client_order_id or None,
                 )
             )
+    if hasattr(repository, "close_open_owner_states"):
+        repository.close_open_owner_states(route_id, instrument=route["instrument"], reason="exchange_position_flat")
+    elif hasattr(repository, "close_open_owner_state"):
+        repository.close_open_owner_state(route_id, reason="exchange_position_flat")
+
+    if working_entry_orders:
+        return _record_wake(
+            repository,
+            {
+                "wake_id": wake_id,
+                "route_id": route_id,
+                "bundle_id": bundle["bundle_id"],
+                "status": "completed",
+                "branch": "idle",
+                "blockers": [],
+                "exchange_snapshot": snapshot,
+                "signal_scan_result": {
+                    "status": "no_position_after_cleanup",
+                    "cancelled_order_count": len(adapter_results),
+                },
+                "strategy_decision": {},
+                "order_intents": [],
+                "adapter_results": adapter_results,
+                "error": {},
+                "completed_at": datetime.now(UTC),
+            },
+        )
 
     if not allow_entry_scan:
         return _record_wake(
@@ -481,14 +505,19 @@ def _run_position_management(
         execution_setup=runtime["execution_setup"],
         now=now,
         owner_state=owner_state,
+        route=route,
+        snapshot=snapshot,
+        working_entry_orders=working_entry_orders,
     )
+    hard_exit = _hard_time_gate_decision(route=route, position_context=position_context)
+    if hard_exit is not None:
+        return hard_exit
     if not hasattr(module, "manage_position"):
         decision = _default_protection_decision(
             route=route,
             position_context=position_context,
             snapshot=snapshot,
             execution_setup=runtime["execution_setup"],
-            owner_state=owner_state,
         ) or {
             "decision_id": f"{route['route_id']}:position-management",
             "action": "HOLD",
@@ -496,10 +525,9 @@ def _run_position_management(
             "order_intents": [],
             "diagnostics": {"position_context": position_context},
         }
-        gated = _apply_hard_time_gate(route=route, decision=decision, position_context=position_context)
         return _apply_pyramid_management(
             route=route,
-            decision=gated,
+            decision=decision,
             position_context=position_context,
             owner_state=owner_state,
             execution_setup=runtime["execution_setup"],
@@ -534,18 +562,17 @@ def _run_position_management(
         "reduce_only": raw.get("reduce_only"),
         "diagnostics": raw.get("diagnostics", {}),
     }
-    if _canonical_action(decision.get("action")) == "HOLD":
-        decision = _default_protection_decision(
-            route=route,
-            position_context=position_context,
-            snapshot=snapshot,
-            execution_setup=runtime["execution_setup"],
-            owner_state=owner_state,
-        ) or decision
-    gated = _apply_hard_time_gate(route=route, decision=decision, position_context=position_context)
+    if action in {"EXIT", "REDUCE"}:
+        return decision
+    decision = _default_protection_decision(
+        route=route,
+        position_context=position_context,
+        snapshot=snapshot,
+        execution_setup=runtime["execution_setup"],
+    ) or {**decision, "action": "HOLD"}
     return _apply_pyramid_management(
         route=route,
-        decision=gated,
+        decision=decision,
         position_context=position_context,
         owner_state=owner_state,
         execution_setup=runtime["execution_setup"],
@@ -559,78 +586,140 @@ def _default_protection_decision(
     position_context: dict[str, Any],
     snapshot: dict[str, Any],
     execution_setup: dict[str, Any],
-    owner_state: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
-    tp_pct = _numeric(setup.get("tp_pct"))
-    sl_pct = _numeric(setup.get("sl_pct"))
-    entry_price = _numeric(position_context.get("entry_price"))
-    size = _numeric(position_context.get("size"))
-    if tp_pct <= 0 or sl_pct <= 0 or entry_price <= 0 or size <= 0:
+    resolved = _resolve_bundle_protection(
+        route=route,
+        position_context=position_context,
+        snapshot=snapshot,
+        execution_setup=execution_setup,
+    )
+    if resolved is None:
         return None
-
-    direction = str(position_context.get("direction") or "LONG").upper()
-    tp, sl = _protection_prices(entry_price=entry_price, direction=direction, tp_pct=tp_pct, sl_pct=sl_pct)
-    expected_side = "sell" if direction == "LONG" else "buy"
-    protection_state = _protection_state(snapshot=snapshot, instrument=route["instrument"])
-    position_state = dict(owner_state.get("position_state") or {}) if owner_state else {}
-    refresh_required = _truthy(position_state.get("protection_refresh_required"))
-    if not refresh_required and protection_state["has_single_live"] and _protection_matches(
-        protection_state["orders"][0],
-        side=expected_side,
-        size=_format_decimal(size),
-        tp=tp,
-        sl=sl,
-    ):
-        return None
-
+    diagnostics = {"protection": resolved["diagnostics"]}
+    if resolved["synced"]:
+        return {
+            "decision_id": f"{route['route_id']}:bundle-protection",
+            "action": "HOLD",
+            "reason_code": "bundle_protection_synced",
+            "order_intents": [],
+            "diagnostics": diagnostics,
+        }
     return {
         "decision_id": f"{route['route_id']}:bundle-protection",
         "action": "UPDATE_PROTECTION",
         "reason_code": "bundle_protection_refresh",
         "order_intents": [],
-        "quantity": _format_decimal(size),
+        "quantity": resolved["quantity"],
         "notional_usd": None,
-        "side": expected_side,
-        "direction": direction,
+        "side": resolved["side"],
+        "direction": resolved["direction"],
         "order_type": "market",
         "price": None,
+        "tp": resolved["tp"],
+        "sl": resolved["sl"],
+        "tp_pct": resolved["tp_pct"],
+        "sl_pct": resolved["sl_pct"],
+        "reduce_only": True,
+        "diagnostics": diagnostics,
+    }
+
+
+def _resolve_bundle_protection(
+    *,
+    route: dict[str, Any],
+    position_context: dict[str, Any],
+    snapshot: dict[str, Any],
+    execution_setup: dict[str, Any],
+) -> dict[str, Any] | None:
+    setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
+    tp_pct = _numeric(_first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct"))
+    initial_sl_pct = _numeric(_first_present(setup, "initial_sl_pct", "sl_pct"))
+    entry_price = _numeric(position_context.get("entry_price"))
+    size = _numeric(position_context.get("size"))
+    if tp_pct <= 0 or initial_sl_pct <= 0 or entry_price <= 0 or size <= 0:
+        return None
+
+    direction = str(position_context.get("direction") or "LONG").upper()
+    mark_price = _numeric(position_context.get("mark_price")) or _numeric(position_context.get("last_price"))
+    protection_state = _protection_state(snapshot=snapshot, instrument=route["instrument"])
+    live_order = protection_state["orders"][0] if protection_state["has_single_live"] else None
+    live_sl = _numeric(_first_present(live_order or {}, "slTriggerPx", "sl", "sl_trigger_price"))
+    live_tp = _numeric(_first_present(live_order or {}, "tpTriggerPx", "tp", "tp_trigger_price"))
+    protection_enabled = _truthy(setup.get("protection_enabled"))
+    protect_trigger_pct = _numeric(setup.get("protect_trigger_pct"))
+    trail_sl_pct = _numeric(setup.get("trail_sl_pct"))
+    favorable_move_pct = _favorable_move_pct(entry_price=entry_price, mark_price=mark_price, direction=direction)
+    phase = "initial"
+    if protection_enabled and protect_trigger_pct > 0 and trail_sl_pct > 0:
+        if _live_sl_is_protected(entry_price=entry_price, live_sl=live_sl, direction=direction):
+            phase = "protected"
+        elif favorable_move_pct is not None and favorable_move_pct >= protect_trigger_pct:
+            phase = "protected"
+    selected_sl_pct = trail_sl_pct if phase == "protected" else initial_sl_pct
+    tp = _take_profit_price(entry_price=entry_price, direction=direction, tp_pct=tp_pct)
+    sl = (
+        _protected_stop_price(entry_price=entry_price, direction=direction, trail_sl_pct=selected_sl_pct)
+        if phase == "protected"
+        else _initial_stop_price(entry_price=entry_price, direction=direction, sl_pct=selected_sl_pct)
+    )
+    expected_side = "sell" if direction == "LONG" else "buy"
+    synced = protection_state["has_single_live"] and _protection_matches(
+        protection_state["orders"][0],
+        side=expected_side,
+        size=_format_decimal(size),
+        tp=tp,
+        sl=sl,
+    )
+    sync_reason = "protection_already_synced"
+    if not synced:
+        if protection_state["live_count"] == 0:
+            sync_reason = "missing_live_protection"
+        elif protection_state["live_count"] != 1:
+            sync_reason = "live_protection_count_mismatch"
+        else:
+            sync_reason = "live_protection_mismatch"
+
+    return {
+        "quantity": _format_decimal(size),
+        "side": expected_side,
+        "direction": direction,
         "tp": tp,
         "sl": sl,
         "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
-        "reduce_only": True,
+        "sl_pct": selected_sl_pct,
+        "synced": synced,
         "diagnostics": {
             "entry_price": _format_decimal(entry_price),
-            "protection_refresh_required": refresh_required,
+            "mark_price": _format_decimal(mark_price) if mark_price > 0 else None,
+            "phase": phase,
+            "protection_enabled": protection_enabled,
+            "favorable_move_pct": _rounded_number(favorable_move_pct) if favorable_move_pct is not None else None,
+            "protect_trigger_pct": _rounded_number(protect_trigger_pct) if protect_trigger_pct > 0 else None,
+            "trail_sl_pct": _rounded_number(trail_sl_pct) if trail_sl_pct > 0 else None,
+            "initial_sl_pct": _rounded_number(initial_sl_pct),
+            "final_tp_pct": _rounded_number(tp_pct),
+            "derived_tp": tp,
+            "derived_sl": sl,
+            "live_tp": _format_decimal(live_tp) if live_tp > 0 else None,
+            "live_sl": _format_decimal(live_sl) if live_sl > 0 else None,
             "live_protection_count": protection_state["live_count"],
+            "sync_reason": sync_reason,
         },
     }
 
 
-def _apply_hard_time_gate(
+def _hard_time_gate_decision(
     *,
     route: dict[str, Any],
-    decision: dict[str, Any],
     position_context: dict[str, Any],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     hard_exit_after_hours = _numeric(position_context.get("hard_exit_after_hours"))
     age_hours = _numeric(position_context.get("age_hours"))
-    action = _canonical_action(decision.get("action"))
-    if hard_exit_after_hours <= 0 or age_hours < hard_exit_after_hours or action in {"EXIT", "REDUCE"}:
-        return decision
+    if hard_exit_after_hours <= 0 or age_hours < hard_exit_after_hours:
+        return None
     direction = str(position_context.get("direction") or "LONG").upper()
-    diagnostics = dict(decision.get("diagnostics") or {})
-    diagnostics.update(
-        {
-            "position_age_hours": age_hours,
-            "hard_exit_after_hours": hard_exit_after_hours,
-            "strategy_decision_before_gate": decision,
-        }
-    )
     return {
-        **decision,
-        "decision_id": decision.get("decision_id") or f"{route['route_id']}:position-management",
+        "decision_id": f"{route['route_id']}:position-management",
         "action": "EXIT",
         "reason_code": "hard_time_gate_expired",
         "order_intents": [],
@@ -641,7 +730,10 @@ def _apply_hard_time_gate(
         "order_type": "market",
         "price": None,
         "reduce_only": True,
-        "diagnostics": diagnostics,
+        "diagnostics": {
+            "position_age_hours": age_hours,
+            "hard_exit_after_hours": hard_exit_after_hours,
+        },
     }
 
 
@@ -651,6 +743,9 @@ def _position_context(
     execution_setup: dict[str, Any],
     now: datetime,
     owner_state: dict[str, Any] | None,
+    route: dict[str, Any],
+    snapshot: dict[str, Any],
+    working_entry_orders: list[dict[str, Any]],
 ) -> dict[str, Any]:
     raw_size = _numeric(position.get("pos") or position.get("size") or position.get("sz"))
     direction = _position_direction(position, raw_size=raw_size)
@@ -658,6 +753,11 @@ def _position_context(
     age_hours = None
     if opened_at is not None:
         age_hours = max(0.0, (now - opened_at).total_seconds() / 3600)
+    mark_price = _numeric(_first_present(position, "markPx", "mark_price"))
+    if mark_price <= 0:
+        mark_price = _numeric(_first_present(position, "last", "lastPx", "last_price"))
+    position_notional = _position_notional_usd(position=position, mark_price=mark_price)
+    account_equity = _account_equity_usd(snapshot)
     return {
         "instrument": position.get("instId") or position.get("instrument"),
         "direction": direction,
@@ -667,6 +767,8 @@ def _position_context(
         "entry_price": _first_present(position, "avgPx", "avg_price", "entry_price", "openAvgPx"),
         "mark_price": _first_present(position, "markPx", "mark_price"),
         "last_price": _first_present(position, "last", "lastPx", "last_price"),
+        "position_notional_usd": _rounded_number(position_notional) if position_notional > 0 else None,
+        "account_equity_usd": _rounded_number(account_equity) if account_equity > 0 else None,
         "opened_at": opened_at.isoformat().replace("+00:00", "Z") if opened_at else None,
         "age_hours": age_hours,
         "hard_exit_after_hours": _hard_exit_after_hours(execution_setup),
@@ -674,12 +776,15 @@ def _position_context(
             execution_setup=execution_setup,
             owner_state=owner_state,
             position=position,
+            snapshot=snapshot,
             position_context_base={
                 "direction": direction,
                 "entry_price": _first_present(position, "avgPx", "avg_price", "entry_price", "openAvgPx"),
+                "mark_price": _first_present(position, "markPx", "mark_price"),
+                "last_price": _first_present(position, "last", "lastPx", "last_price"),
             },
-            route=None,
-            working_entry_orders=[],
+            route=route,
+            working_entry_orders=working_entry_orders,
         ),
     }
 
@@ -818,6 +923,7 @@ def _apply_pyramid_management(
         execution_setup=execution_setup,
         owner_state=owner_state,
         position={},
+        snapshot={},
         position_context_base=position_context,
         route=route,
         working_entry_orders=working_entry_orders,
@@ -855,6 +961,7 @@ def _pyramid_context(
     execution_setup: dict[str, Any],
     owner_state: dict[str, Any] | None,
     position: dict[str, Any],
+    snapshot: dict[str, Any],
     position_context_base: dict[str, Any],
     route: dict[str, Any] | None,
     working_entry_orders: list[dict[str, Any]],
@@ -864,54 +971,48 @@ def _pyramid_context(
     step_pct = _numeric(pyramid_setup.get("step_pct") or setup.get("pyramid_step_pct"))
     max_legs = _pyramid_max_legs(execution_setup)
     sl_breakeven = _truthy(pyramid_setup.get("sl_breakeven") or setup.get("sl_breakeven"))
-    position_state = dict(owner_state.get("position_state") or {}) if owner_state else {}
-    direction = str(position_state.get("direction") or position_context_base.get("direction") or "LONG").upper()
-    all_legs = [dict(leg) for leg in position_state.get("legs") or []]
-    filled_leg_rows = [
-        dict(leg)
-        for leg in all_legs
-        if str(leg.get("status") or "submitted").lower() == "filled"
-    ]
-    pending_leg_rows = [
-        dict(leg)
-        for leg in all_legs
-        if str(leg.get("status") or "submitted").lower() in {"submitted", "working", "open", "partially_filled", "partially-filled"}
-    ]
-    filled_legs = len(filled_leg_rows)
-    pending_legs = len(pending_leg_rows)
-    active_leg_count = filled_legs + pending_legs
-    last_leg = filled_leg_rows[-1] if filled_leg_rows else {}
-    last_leg_entry = _numeric(
-        last_leg.get("entry_price")
-        or last_leg.get("entry")
-        or last_leg.get("last_leg_entry")
-        or position_context_base.get("entry_price")
-    )
+    direction = str(position_context_base.get("direction") or "LONG").upper()
+    entry_price = _numeric(position_context_base.get("entry_price"))
     trigger_source = "mark"
     trigger_price = _numeric(position_context_base.get("mark_price") or _first_present(position, "markPx", "mark_price"))
     if trigger_price <= 0:
         trigger_source = "last"
         trigger_price = _numeric(position_context_base.get("last_price") or _first_present(position, "last", "lastPx", "last_price"))
+    route_leverage = _numeric(route.get("leverage")) if route else 0.0
+    margin_allocation_pct = _numeric(route.get("margin_allocation_pct")) if route else 0.0
+    account_equity = _account_equity_usd(snapshot) or _numeric(position_context_base.get("account_equity_usd"))
+    position_notional = _numeric(position_context_base.get("position_notional_usd")) or _position_notional_usd(position=position, mark_price=trigger_price)
+    current_margin = abs(position_notional) / route_leverage if route_leverage > 0 else 0.0
+    per_leg_margin = account_equity * margin_allocation_pct / 100 / max_legs if account_equity > 0 and margin_allocation_pct > 0 and max_legs > 0 else 0.0
+    raw_legs = current_margin / per_leg_margin if per_leg_margin > 0 else 0.0
+    inferred_legs = _infer_pyramid_legs(raw_legs=raw_legs, max_legs=max_legs)
+    active_leg_count = inferred_legs or 0
     next_trigger_price = None
-    if last_leg_entry > 0 and step_pct > 0:
+    if entry_price > 0 and step_pct > 0 and inferred_legs is not None:
         if direction == "SHORT":
-            next_trigger_price = last_leg_entry * (1 - step_pct / 100)
+            next_trigger_price = entry_price * (1 - inferred_legs * step_pct / 100)
         else:
-            next_trigger_price = last_leg_entry * (1 + step_pct / 100)
+            next_trigger_price = entry_price * (1 + inferred_legs * step_pct / 100)
         next_trigger_price = _rounded_number(next_trigger_price)
     blockers: list[str] = []
-    if owner_state is None:
-        blockers.append("missing_owner_state")
-    elif route is not None and owner_state.get("bundle_id") != route.get("active_bundle_id"):
-        blockers.append("bundle_mismatch")
     if step_pct <= 0:
         blockers.append("missing_pyramid_step_pct")
-    if active_leg_count >= max_legs:
+    if route_leverage <= 0:
+        blockers.append("missing_route_leverage")
+    if margin_allocation_pct <= 0:
+        blockers.append("missing_margin_allocation_pct")
+    if account_equity <= 0:
+        blockers.append("missing_account_equity")
+    if position_notional <= 0:
+        blockers.append("missing_position_notional")
+    if per_leg_margin <= 0:
+        blockers.append("missing_per_leg_margin")
+    if raw_legs > 0 and inferred_legs is None:
+        blockers.append("pyramid_exposure_ambiguous")
+    if inferred_legs is not None and inferred_legs >= max_legs:
         blockers.append("max_legs_reached")
-    if pending_legs > 0:
-        blockers.append("pending_pyramid_leg_exists")
-    if last_leg_entry <= 0:
-        blockers.append("missing_last_leg_entry")
+    if entry_price <= 0:
+        blockers.append("missing_entry_price")
     if trigger_price <= 0:
         blockers.append("missing_trigger_price")
     if working_entry_orders:
@@ -923,11 +1024,18 @@ def _pyramid_context(
         "step_pct": _rounded_number(step_pct) if step_pct > 0 else None,
         "max_legs": max_legs,
         "sl_breakeven": sl_breakeven,
-        "filled_legs": filled_legs,
-        "pending_legs": pending_legs,
+        "bucket_tolerance": PYRAMID_LEG_BUCKET_TOLERANCE,
+        "raw_legs": _rounded_number(raw_legs) if raw_legs > 0 else None,
+        "inferred_legs": inferred_legs,
+        "current_margin": _rounded_number(current_margin) if current_margin > 0 else None,
+        "per_leg_margin": _rounded_number(per_leg_margin) if per_leg_margin > 0 else None,
+        "position_notional_usd": _rounded_number(position_notional) if position_notional > 0 else None,
+        "account_equity_usd": _rounded_number(account_equity) if account_equity > 0 else None,
+        "filled_legs": inferred_legs or 0,
+        "pending_legs": 0,
         "active_legs": active_leg_count,
-        "next_leg": filled_legs + 1,
-        "last_leg_entry": _rounded_number(last_leg_entry) if last_leg_entry > 0 else None,
+        "next_leg": (inferred_legs + 1) if inferred_legs is not None else None,
+        "last_leg_entry": _rounded_number(entry_price) if entry_price > 0 else None,
         "next_trigger_price": next_trigger_price,
         "trigger_price": _rounded_number(trigger_price) if trigger_price > 0 else None,
         "trigger_source": trigger_source if trigger_price > 0 else None,
@@ -1096,8 +1204,8 @@ def _coerce_order_intent(
         "price": intent.get("price") or decision.get("price"),
         "tp": intent.get("tp") or decision.get("tp"),
         "sl": intent.get("sl") or decision.get("sl"),
-        "tp_pct": intent.get("tp_pct") or decision.get("tp_pct") or setup.get("tp_pct"),
-        "sl_pct": intent.get("sl_pct") or decision.get("sl_pct") or setup.get("sl_pct"),
+        "tp_pct": intent.get("tp_pct") or decision.get("tp_pct") or _first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct"),
+        "sl_pct": intent.get("sl_pct") or decision.get("sl_pct") or _first_present(setup, "initial_sl_pct", "sl_pct"),
         "reduce_only": _truthy(intent.get("reduce_only") if "reduce_only" in intent else _default_reduce_only(action)),
         "client_order_id": str(intent.get("client_order_id") or client_order_id)[:64],
         "status": intent.get("status") or "intent_only",
@@ -1182,14 +1290,69 @@ def _account_equity_usd(snapshot: dict[str, Any]) -> float:
     return 0.0
 
 
-def _protection_prices(*, entry_price: float, direction: str, tp_pct: float, sl_pct: float) -> tuple[str, str]:
+def _position_notional_usd(*, position: dict[str, Any], mark_price: float) -> float:
+    explicit = _numeric(
+        _first_present(
+            position,
+            "notionalUsd",
+            "notional_usd",
+            "notional",
+            "posNotional",
+            "position_notional_usd",
+        )
+    )
+    if explicit > 0:
+        return abs(explicit)
+    size = abs(_numeric(position.get("pos") or position.get("size") or position.get("sz")))
+    return size * mark_price if size > 0 and mark_price > 0 else 0.0
+
+
+def _infer_pyramid_legs(*, raw_legs: float, max_legs: int) -> int | None:
+    if raw_legs <= 0:
+        return None
+    for leg in range(1, max_legs + 1):
+        if abs(raw_legs - leg) <= PYRAMID_LEG_BUCKET_TOLERANCE:
+            return leg
+    return None
+
+
+def _favorable_move_pct(*, entry_price: float, mark_price: float, direction: str) -> float | None:
+    if entry_price <= 0 or mark_price <= 0:
+        return None
     if direction == "SHORT":
-        tp = entry_price * (1 - tp_pct / 100)
-        sl = entry_price * (1 + sl_pct / 100)
-    else:
-        tp = entry_price * (1 + tp_pct / 100)
-        sl = entry_price * (1 - sl_pct / 100)
-    return _format_decimal(tp), _format_decimal(sl)
+        return (entry_price - mark_price) / entry_price * 100
+    return (mark_price - entry_price) / entry_price * 100
+
+
+def _live_sl_is_protected(*, entry_price: float, live_sl: float, direction: str) -> bool:
+    if entry_price <= 0 or live_sl <= 0:
+        return False
+    return live_sl < entry_price if direction == "SHORT" else live_sl > entry_price
+
+
+def _protection_prices(*, entry_price: float, direction: str, tp_pct: float, sl_pct: float) -> tuple[str, str]:
+    return (
+        _take_profit_price(entry_price=entry_price, direction=direction, tp_pct=tp_pct),
+        _initial_stop_price(entry_price=entry_price, direction=direction, sl_pct=sl_pct),
+    )
+
+
+def _take_profit_price(*, entry_price: float, direction: str, tp_pct: float) -> str:
+    if direction == "SHORT":
+        return _format_decimal(entry_price * (1 - tp_pct / 100))
+    return _format_decimal(entry_price * (1 + tp_pct / 100))
+
+
+def _initial_stop_price(*, entry_price: float, direction: str, sl_pct: float) -> str:
+    if direction == "SHORT":
+        return _format_decimal(entry_price * (1 + sl_pct / 100))
+    return _format_decimal(entry_price * (1 - sl_pct / 100))
+
+
+def _protected_stop_price(*, entry_price: float, direction: str, trail_sl_pct: float) -> str:
+    if direction == "SHORT":
+        return _format_decimal(entry_price * (1 - trail_sl_pct / 100))
+    return _format_decimal(entry_price * (1 + trail_sl_pct / 100))
 
 
 def _protection_state(*, snapshot: dict[str, Any], instrument: str) -> dict[str, Any]:

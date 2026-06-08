@@ -528,8 +528,10 @@ class RuntimeRepository:
                 signal_engine_versions.c.version,
                 signal_engine_versions.c.code_ref,
                 signal_engine_versions.c.required_data,
+                signal_engine_versions.c.output_envelope_version,
                 signal_engine_versions.c.runtime_entrypoint,
                 signal_engine_versions.c.live_scanner_entrypoint,
+                signal_engine_versions.c.configuration_schema,
                 func.coalesce(signal_set_counts.c.signal_set_count, 0).label("signal_set_count"),
                 func.coalesce(signal_counts.c.packet_count, 0).label("packet_count"),
             )
@@ -552,8 +554,10 @@ class RuntimeRepository:
                 signal_engine_versions.c.version,
                 signal_engine_versions.c.code_ref,
                 signal_engine_versions.c.required_data,
+                signal_engine_versions.c.output_envelope_version,
                 signal_engine_versions.c.runtime_entrypoint,
                 signal_engine_versions.c.live_scanner_entrypoint,
+                signal_engine_versions.c.configuration_schema,
                 signal_set_counts.c.signal_set_count,
                 signal_counts.c.packet_count,
             )
@@ -729,16 +733,28 @@ class RuntimeRepository:
         with self.engine.connect() as connection:
             return [dict(row._mapping) for row in connection.execute(statement)]
 
+    def list_execution_bundles_for_stage1_session(self, session_id: str) -> list[dict[str, Any]]:
+        statement = (
+            select(execution_bundles)
+            .where(execution_bundles.c.source_stage1_session_id == session_id)
+            .order_by(execution_bundles.c.created_at.desc())
+        )
+        with self.engine.connect() as connection:
+            return [dict(row._mapping) for row in connection.execute(statement)]
+
     def upsert_deployment_route_for_bundle(
         self,
         *,
         bundle: dict[str, Any],
         account_mode: str,
         execution_adapter: str,
+        exchange_account: str = "default",
     ) -> dict[str, Any]:
-        route_id = _route_id(
+        route_id = self._deployment_route_id(
             asset=bundle["asset"],
             account_mode=account_mode,
+            execution_adapter=execution_adapter,
+            exchange_account=exchange_account,
         )
         values = {
             "route_id": route_id,
@@ -751,7 +767,7 @@ class RuntimeRepository:
             "instrument": bundle["instrument"],
             "account_mode": account_mode,
             "execution_adapter": execution_adapter,
-            "exchange_account": "default",
+            "exchange_account": exchange_account,
             "cron_interval_minutes": _execution_setup_cron_minutes(bundle.get("execution_setup")),
             "margin_allocation_pct": 10.0,
             "leverage": _execution_setup_leverage(bundle.get("execution_setup")),
@@ -771,7 +787,12 @@ class RuntimeRepository:
         }
         with self.engine.begin() as connection:
             connection.execute(self._upsert_deployment_route(values))
-        route = self.get_deployment_route_for_asset_account(asset=bundle["asset"], account_mode=account_mode)
+        route = self.get_deployment_route_for_asset_account(
+            asset=bundle["asset"],
+            account_mode=account_mode,
+            execution_adapter=execution_adapter,
+            exchange_account=exchange_account,
+        )
         if route is None:
             raise RuntimeError("deployment route was not persisted")
         return route
@@ -808,18 +829,63 @@ class RuntimeRepository:
         route["blockers"] = _route_blockers(route)
         return route
 
-    def get_deployment_route_for_asset_account(self, *, asset: str, account_mode: str) -> dict[str, Any] | None:
+    def get_deployment_route_for_asset_account(
+        self,
+        *,
+        asset: str,
+        account_mode: str,
+        execution_adapter: str | None = None,
+        exchange_account: str | None = None,
+    ) -> dict[str, Any] | None:
         statement = (
             select(deployment_routes)
             .where(deployment_routes.c.asset == asset)
             .where(deployment_routes.c.account_mode == account_mode)
-            .limit(1)
         )
+        if execution_adapter is not None:
+            statement = statement.where(deployment_routes.c.execution_adapter == execution_adapter)
+        if exchange_account is not None:
+            statement = statement.where(deployment_routes.c.exchange_account == exchange_account)
+        statement = statement.order_by(deployment_routes.c.created_at.desc()).limit(1)
         with self.engine.connect() as connection:
             row = connection.execute(statement).mappings().first()
         if row is None:
             return None
         return self.get_deployment_route(row["route_id"])
+
+    def _deployment_route_id(
+        self,
+        *,
+        asset: str,
+        account_mode: str,
+        execution_adapter: str,
+        exchange_account: str,
+    ) -> str:
+        existing = self.get_deployment_route_for_asset_account(
+            asset=asset,
+            account_mode=account_mode,
+            execution_adapter=execution_adapter,
+            exchange_account=exchange_account,
+        )
+        if existing is not None:
+            return str(existing["route_id"])
+        base_route_id = _route_id(asset=asset, account_mode=account_mode)
+        existing_base = self.get_deployment_route(base_route_id)
+        if existing_base is None:
+            return base_route_id
+        if (
+            existing_base.get("asset") == asset
+            and existing_base.get("account_mode") == account_mode
+            and existing_base.get("execution_adapter") == execution_adapter
+            and existing_base.get("exchange_account") == exchange_account
+        ):
+            return base_route_id
+        return _route_id(
+            asset=asset,
+            account_mode=account_mode,
+            execution_adapter=execution_adapter,
+            exchange_account=exchange_account,
+        )
 
     def update_deployment_route_gate(self, route_id: str, **values: Any) -> dict[str, Any] | None:
         allowed = {
@@ -1012,6 +1078,30 @@ class RuntimeRepository:
             position_state=position_state,
             closed_at=datetime.now(UTC),
         )
+
+    def close_open_owner_states(self, route_id: str, *, instrument: str | None = None, reason: str) -> list[dict[str, Any]]:
+        statement = (
+            select(owner_states)
+            .where(owner_states.c.route_id == route_id)
+            .where(owner_states.c.status == "open")
+        )
+        if instrument:
+            statement = statement.where(owner_states.c.instrument == instrument)
+        with self.engine.connect() as connection:
+            rows = [dict(row) for row in connection.execute(statement).mappings()]
+        closed = []
+        for owner_state in rows:
+            position_state = dict(owner_state.get("position_state") or {})
+            position_state["close_reason"] = reason
+            closed.append(
+                self.update_owner_state(
+                    owner_state["owner_state_id"],
+                    status="closed",
+                    position_state=position_state,
+                    closed_at=datetime.now(UTC),
+                )
+            )
+        return closed
 
     def _repair_stage1_signal_pool_references(
         self,
@@ -1367,7 +1457,7 @@ class RuntimeRepository:
     def _upsert_deployment_route(self, values: dict[str, Any]):
         if self.engine.dialect.name == "postgresql":
             return postgres_insert(deployment_routes).values(**values).on_conflict_do_update(
-                index_elements=["asset", "account_mode"],
+                index_elements=["asset", "account_mode", "execution_adapter", "exchange_account"],
                 set_={
                     "active_bundle_id": values["active_bundle_id"],
                     "strategy_id": values["strategy_id"],
@@ -1415,8 +1505,17 @@ def _normalize_route_datetimes(route: dict[str, Any]) -> None:
             route[key] = value.replace(tzinfo=UTC)
 
 
-def _route_id(*, asset: str, account_mode: str) -> str:
-    return f"{asset.lower()}-{account_mode}"
+def _route_id(
+    *,
+    asset: str,
+    account_mode: str,
+    execution_adapter: str | None = None,
+    exchange_account: str | None = None,
+) -> str:
+    base = f"{asset.lower()}-{account_mode}"
+    if execution_adapter is None and exchange_account is None:
+        return base
+    return f"{base}-{str(execution_adapter or 'exchange').lower()}-{str(exchange_account or 'default').lower()}"
 
 
 def _execution_setup_cron_minutes(execution_setup: Any) -> int:

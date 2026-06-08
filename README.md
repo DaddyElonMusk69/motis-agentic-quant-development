@@ -5,11 +5,49 @@ and execution.
 
 ## Architecture
 
-- `apps/web`: React/Vite operator terminal.
+- `apps/web`: original React/Vite operator terminal.
+- `apps/web-v2`: current terminal-style React/Vite research, data, engine, and trading UI.
 - `apps/api`: FastAPI API and SQLAlchemy schema metadata.
-- `apps/worker`: Python worker subprocess runner and execution adapter boundaries.
-- `packages/strategy_sdk`: shared signal, strategy, walk-forward, market-data, and deployment contracts.
+- `apps/worker`: Python worker runtime for ingestion, research stages, signal-engine dispatch, lifecycle wakes, and exchange adapter boundaries.
+- `packages/strategy_sdk`: shared signal, strategy, engine, market-data, and deployment contracts.
+- `packages/strategy_modules`: paired base strategy modules used to seed Stage 1 development.
+- `artifacts/signal_engine`: canonical engine registry plus legacy signal-engine source retained as implementation evidence.
+- `docs/engine-strategy-contract.md`: source of truth for new signal engine / strategy pair contracts.
+- `skills`: repo-local Codex skills for future agents, including signal-engine building and Stage 1A optimization.
 - `ops`: Docker Compose and container packaging.
+
+## Signal Engines And Strategy Contracts
+
+Signal engines are contract-driven. New engines must register a canonical
+`SignalEngineSpec` in `artifacts/signal_engine/engine_registry.json`, emit neutral
+`signal_packet.v2` packets, read canonical Parquet market data, and provide both:
+
+- `runtime_entrypoint` for training/research signal-pool generation.
+- `live_scanner_entrypoint` for latest-candle live scans.
+
+Signal packets must not contain direction, sizing, leverage, TP/SL, or order intent.
+The paired base strategy owns `decide(context)` and optional `manage_position(context)`.
+Live execution owns sizing, TP/SL price derivation, protection, pyramiding, exchange
+routing, and idempotent order submission.
+
+Current contract-ready engines:
+
+- `vegas_ema`: multi-timeframe Vegas EMA tunnel, default 2 votes.
+- `vegas_ema_vote1`: Vegas EMA variant, default 1 vote.
+- `bollinger`: multi-timeframe Bollinger band proximity engine with paired
+  `bollinger_base` strategy.
+
+When building a new engine, use the repo-local skill:
+
+```text
+skills/signal-engine-builder/SKILL.md
+```
+
+The Stage 1A optimizer skill is also vendored for future agents:
+
+```text
+skills/stage1a-training-optimizer/SKILL.md
+```
 
 ## Local Development
 
@@ -20,6 +58,19 @@ make dev-api
 make dev-worker
 npm install
 make dev-web
+```
+
+Current v2 frontend:
+
+```bash
+VITE_API_BASE_URL=http://127.0.0.1:8000 npm --workspace apps/web-v2 run dev -- --host 127.0.0.1 --port 5174 --strictPort
+```
+
+Useful verification commands:
+
+```bash
+pytest -q
+npm --workspace apps/web-v2 run build
 ```
 
 Docker Compose packaging:

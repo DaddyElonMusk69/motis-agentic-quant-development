@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stage 1A Training Optimizer"
+  short_description: "Disciplined training-only Stage 1A directional strategy updates."
+  default_prompt: "Use this skill to update a Stage 1A direction-only strategy from a training failure audit without overfitting or touching validation/walk-forward/OOS evidence."
