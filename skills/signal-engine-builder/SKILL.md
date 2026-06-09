@@ -22,7 +22,9 @@ For current runtime examples, read:
 
 - `apps/worker/src/quant_terminal_worker/signal_engines/runtime.py`
 - `apps/worker/src/quant_terminal_worker/signal_engines/vegas_ema.py`
+- `apps/worker/src/quant_terminal_worker/signal_engines/bollinger.py`
 - `tests/test_signal_engine_runtime.py`
+- `tests/test_api.py` signal-engine catalog tests
 
 ## Non-Negotiable Contract Rules
 
@@ -35,6 +37,7 @@ For current runtime examples, read:
 - Strategy direction belongs in the paired base strategy `decide(context)`.
 - Execution setup and live router own sizing, TP/SL price derivation, protection, pyramiding, and order submission.
 - The engine registry entry should include `code_ref.base_strategy_path`, and that file must expose a valid strategy `decide()`.
+- The engine must be visible through `GET /api/v1/signal-engines`, even before any DB signal pool exists. Repo registry entries must merge into the API catalog with zero counts when the DB has no row yet.
 
 ## Build Workflow
 
@@ -53,16 +56,21 @@ For current runtime examples, read:
 4. Implement or point to the paired base strategy under `packages/strategy_modules/src/quant_terminal_strategies/`.
 5. Add tests before implementation:
    - registry/spec validation
+   - API engine catalog includes registry-only entries with `signal_set_count: 0` and `packet_count: 0`
    - training dispatch from Parquet
    - live scan from Parquet
    - packet neutrality
    - paired base strategy validates
    - Stage 0 signal-pool preparation still works where relevant
-6. Run focused tests, then `pytest -q`. Run `npm --workspace apps/web-v2 run build` if frontend/API types were touched.
+6. If catalog behavior changes, update `apps/api/src/quant_terminal_api/main.py` and tests so DB rows win but repo registry entries fill missing engines.
+7. Run focused tests, then `pytest -q`. Run `npm --workspace apps/web-v2 run build` if frontend/API types were touched.
+8. Restart the backend and verify the live endpoint includes the new engine:
+   - `curl -sS http://127.0.0.1:8000/api/v1/signal-engines`
 
 ## Common Mistakes
 
 - Adding a legacy script path without a contract runtime adapter.
+- Assuming `engine_registry.json` alone makes the engine visible in the UI. The Engines page reads the API catalog, so registry-only engines must be merged into `GET /api/v1/signal-engines`.
 - Letting a packet imply `LONG` or `SHORT`.
 - Forgetting `code_ref.base_strategy_path`, which leaves Stage 1 to fall back to the generic starter.
 - Using live exchange fetches inside the engine instead of canonical Parquet.
@@ -73,5 +81,7 @@ For current runtime examples, read:
 - `validate_signal_engine_spec(...)` passes.
 - `validate_signal_packet(...)` passes for emitted packets.
 - `validate_strategy_module(base_strategy_path)` passes.
+- `GET /api/v1/signal-engines` returns the new engine after backend restart, even with zero signal sets.
+- The v2 Engines tab can list/select the new engine.
 - Existing engines keep their old behavior unless the user explicitly asked for a behavior change.
 - New engine can be selected independently in research/trading flows by its engine id.

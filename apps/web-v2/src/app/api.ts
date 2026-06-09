@@ -58,6 +58,9 @@ export type SignalEngine = {
   description: string;
   version: string | null;
   code_ref: Record<string, unknown> | null;
+  required_data?: Array<Record<string, unknown>>;
+  output_envelope_version?: string | null;
+  configuration_schema?: Record<string, unknown>;
   runtime_entrypoint: string | null;
   live_scanner_entrypoint: string | null;
   signal_set_count: number;
@@ -644,6 +647,7 @@ export type DeploymentRoute = {
   cron_interval_minutes?: number;
   margin_allocation_pct?: number;
   leverage?: number;
+  manual_sizing_enabled?: boolean;
   scheduler_status?: string;
   auto_submit_enabled?: boolean;
   last_wake_at?: string | null;
@@ -799,6 +803,22 @@ export function fetchSignalEngines(): Promise<{ engines: SignalEngine[] }> {
 
 export function fetchSignalSets(signalEngineId: string): Promise<{ signal_sets: SignalSet[] }> {
   return requestJson<{ signal_sets: SignalSet[] }>(`/api/v1/signal-engines/${signalEngineId}/signal-sets`);
+}
+
+export function updateSignalEngine(signalEngineId: string, request: { name: string }): Promise<{ engine: SignalEngine }> {
+  return requestJson<{ engine: SignalEngine }>(`/api/v1/signal-engines/${signalEngineId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  });
+}
+
+export function createSignalSet(request: { signal_engine_id: string; asset: string }): Promise<{ signal_set: SignalSet }> {
+  return requestJson<{ signal_set: SignalSet }>(`/api/v1/signal-engines/${request.signal_engine_id}/signal-sets`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ asset: request.asset })
+  });
 }
 
 export function fetchSignals(signalSetKey: string, limit = 5): Promise<{ signals: SignalRecord[] }> {
@@ -1099,6 +1119,7 @@ export function updateRouteSettings(request: {
   exchange_account: string;
   margin_allocation_pct: number;
   leverage: number;
+  manual_sizing_enabled: boolean;
   auto_submit_enabled: boolean;
 }): Promise<{ route: DeploymentRoute }> {
   return requestJson<{ route: DeploymentRoute }>(`/api/v1/trading/routes/${request.route_id}/settings`, {
@@ -1110,6 +1131,7 @@ export function updateRouteSettings(request: {
       exchange_account: request.exchange_account,
       margin_allocation_pct: request.margin_allocation_pct,
       leverage: request.leverage,
+      manual_sizing_enabled: request.manual_sizing_enabled,
       auto_submit_enabled: request.auto_submit_enabled
     })
   });

@@ -382,6 +382,7 @@ deployment_routes = Table(
     Column("cron_interval_minutes", Integer, nullable=False, default=15),
     Column("margin_allocation_pct", Float, nullable=False, default=10.0),
     Column("leverage", Float, nullable=False, default=1.0),
+    Column("manual_sizing_enabled", Boolean, nullable=False, default=False),
     Column("scheduler_status", String, nullable=False, default="stopped"),
     Column("auto_submit_enabled", Boolean, nullable=False, default=False),
     Column("last_wake_at", DateTime(timezone=True), nullable=True),

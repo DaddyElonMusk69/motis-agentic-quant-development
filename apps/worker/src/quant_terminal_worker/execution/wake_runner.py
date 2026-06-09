@@ -978,8 +978,9 @@ def _pyramid_context(
     if trigger_price <= 0:
         trigger_source = "last"
         trigger_price = _numeric(position_context_base.get("last_price") or _first_present(position, "last", "lastPx", "last_price"))
-    route_leverage = _numeric(route.get("leverage")) if route else 0.0
-    margin_allocation_pct = _numeric(route.get("margin_allocation_pct")) if route else 0.0
+    sizing_policy = _route_sizing_policy(route=route, execution_setup=execution_setup)
+    route_leverage = sizing_policy["leverage"]
+    margin_allocation_pct = sizing_policy["margin_allocation_pct"]
     account_equity = _account_equity_usd(snapshot) or _numeric(position_context_base.get("account_equity_usd"))
     position_notional = _numeric(position_context_base.get("position_notional_usd")) or _position_notional_usd(position=position, mark_price=trigger_price)
     current_margin = abs(position_notional) / route_leverage if route_leverage > 0 else 0.0
@@ -1217,7 +1218,7 @@ def _coerce_order_intent(
     if route_sizing is not None:
         order_intent.update(
             {
-                "sizing_source": "route_margin_allocation",
+                "sizing_source": route_sizing["sizing_source"],
                 "account_equity_usd": route_sizing["account_equity_usd"],
                 "margin_allocation_pct": route_sizing["margin_allocation_pct"],
                 "pyramid_max_legs": route_sizing["pyramid_max_legs"],
@@ -1236,8 +1237,9 @@ def _route_margin_sizing(
 ) -> dict[str, Any] | None:
     if action not in {"ENTER", "ENTER_LONG", "ENTER_SHORT", "PYRAMID"}:
         return None
-    margin_allocation_pct = _numeric(route.get("margin_allocation_pct"))
-    leverage = _numeric(route.get("leverage"))
+    sizing_policy = _route_sizing_policy(route=route, execution_setup=execution_setup)
+    margin_allocation_pct = sizing_policy["margin_allocation_pct"]
+    leverage = sizing_policy["leverage"]
     account_equity = _account_equity_usd(snapshot)
     if margin_allocation_pct <= 0 or leverage <= 0 or account_equity <= 0:
         return None
@@ -1245,11 +1247,38 @@ def _route_margin_sizing(
     margin_usd = account_equity * margin_allocation_pct / 100 / max_legs
     return {
         "account_equity_usd": _rounded_number(account_equity),
+        "sizing_source": sizing_policy["source"],
         "margin_allocation_pct": _rounded_number(margin_allocation_pct),
         "leverage": _rounded_number(leverage),
         "pyramid_max_legs": max_legs,
         "margin_usd": _rounded_number(margin_usd),
         "notional_usd": _rounded_number(margin_usd * leverage),
+    }
+
+
+def _route_sizing_policy(*, route: dict[str, Any] | None, execution_setup: dict[str, Any]) -> dict[str, Any]:
+    if route and _truthy(route.get("manual_sizing_enabled")):
+        return {
+            "source": "manual_route_override",
+            "margin_allocation_pct": _numeric(route.get("margin_allocation_pct")),
+            "leverage": _numeric(route.get("leverage")),
+        }
+    sizing = execution_setup.get("sizing") if isinstance(execution_setup.get("sizing"), dict) else {}
+    setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
+    margin_allocation_pct = _numeric(
+        sizing.get("margin_allocation_pct")
+        or execution_setup.get("margin_allocation_pct")
+        or setup.get("margin_allocation_pct")
+    )
+    leverage = _numeric(
+        sizing.get("leverage")
+        or execution_setup.get("leverage")
+        or setup.get("leverage")
+    )
+    return {
+        "source": "bundle_stage4_sizing",
+        "margin_allocation_pct": margin_allocation_pct,
+        "leverage": leverage,
     }
 
 

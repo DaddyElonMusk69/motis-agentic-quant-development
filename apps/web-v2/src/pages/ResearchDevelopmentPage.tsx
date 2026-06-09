@@ -510,6 +510,32 @@ export function ResearchDevelopmentPage() {
     setSelectedIteration(null);
   }, [session?.session_id]);
 
+  useEffect(() => {
+    const latestInputs = gate?.stage4_realized_expectancy.latest_simulation_inputs;
+    if (!session?.session_id || !gate?.stage4_realized_expectancy.exists || !latestInputs) {
+      return;
+    }
+    const nextInputs = {
+      initial_capital_usdt: Number(latestInputs.initial_capital_usdt ?? 10000),
+      margin_allocation_pct: Number(latestInputs.margin_allocation_pct ?? 30),
+      leverage: Number(latestInputs.leverage ?? 5)
+    };
+    setStage4Inputs((current) => (
+      current.initial_capital_usdt === nextInputs.initial_capital_usdt
+      && current.margin_allocation_pct === nextInputs.margin_allocation_pct
+      && current.leverage === nextInputs.leverage
+        ? current
+        : nextInputs
+    ));
+  }, [
+    gate?.stage4_realized_expectancy.exists,
+    gate?.stage4_realized_expectancy.latest_run_id,
+    gate?.stage4_realized_expectancy.latest_simulation_inputs?.initial_capital_usdt,
+    gate?.stage4_realized_expectancy.latest_simulation_inputs?.margin_allocation_pct,
+    gate?.stage4_realized_expectancy.latest_simulation_inputs?.leverage,
+    session?.session_id
+  ]);
+
   const startStage1 = (seedPreference: Stage1SeedStrategyPreference) => {
     if (!row || !pool) {
       return;

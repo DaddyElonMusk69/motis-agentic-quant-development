@@ -161,6 +161,14 @@ class SignalPoolExtendRequest(BaseModel):
     target_end: str | None = None
 
 
+class SignalEngineUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1)
+
+
+class SignalPoolCreateRequest(BaseModel):
+    asset: str
+
+
 class Stage0RunRequest(BaseModel):
     run_id: str
     strategy_id: str
@@ -214,6 +222,7 @@ class DeploymentRouteSettingsRequest(BaseModel):
     exchange_account: str = "default"
     margin_allocation_pct: float = Field(default=10.0, ge=0.1, le=100.0)
     leverage: float = Field(default=1.0, ge=1.0, le=125.0)
+    manual_sizing_enabled: bool = False
     auto_submit_enabled: bool = False
 
 
@@ -386,11 +395,40 @@ def create_app(
 
     @app.get("/api/v1/signal-engines")
     def list_signal_engines() -> dict[str, Any]:
-        return {"engines": get_runtime_repository().list_signal_engines()}
+        return {"engines": _signal_engine_catalog(get_runtime_repository(), workspace_root=Path.cwd())}
+
+    @app.patch("/api/v1/signal-engines/{signal_engine_id}")
+    def update_signal_engine(signal_engine_id: str, request: SignalEngineUpdateRequest) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        engine = _materialize_signal_engine(repository, workspace_root=Path.cwd(), signal_engine_id=signal_engine_id)
+        if engine is None:
+            raise HTTPException(status_code=404, detail="Signal engine not found")
+        if request.name is not None:
+            updater = getattr(repository, "update_signal_engine", None)
+            if not callable(updater):
+                raise HTTPException(status_code=501, detail="Signal engine update is not supported by this repository")
+            engine = updater(signal_engine_id, name=request.name)
+        catalog_engine = next(
+            (item for item in _signal_engine_catalog(repository, workspace_root=Path.cwd()) if item["signal_engine_id"] == signal_engine_id),
+            engine,
+        )
+        return {"engine": catalog_engine}
 
     @app.get("/api/v1/signal-engines/{signal_engine_id}/signal-sets")
     def list_signal_sets(signal_engine_id: str) -> dict[str, Any]:
         return {"signal_sets": get_runtime_repository().list_signal_sets(signal_engine_id)}
+
+    @app.post("/api/v1/signal-engines/{signal_engine_id}/signal-sets")
+    def create_signal_set(signal_engine_id: str, request: SignalPoolCreateRequest) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        engine = _materialize_signal_engine(repository, workspace_root=Path.cwd(), signal_engine_id=signal_engine_id)
+        if engine is None:
+            raise HTTPException(status_code=404, detail="Signal engine not found")
+        try:
+            signal_set = _create_canonical_signal_set(repository=repository, engine=engine, asset=request.asset)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"signal_set": signal_set}
 
     @app.get("/api/v1/signals")
     def list_signals(
@@ -1111,6 +1149,7 @@ def create_app(
             exchange_account=request.exchange_account,
             margin_allocation_pct=request.margin_allocation_pct,
             leverage=request.leverage,
+            manual_sizing_enabled=request.manual_sizing_enabled,
             auto_submit_enabled=request.auto_submit_enabled,
         )
         if route is None:
@@ -1790,6 +1829,7 @@ def _materialize_execution_bundle(
     best = optimal.get("best") or realized.get("best_candidate") or {}
     if not best:
         raise ValueError("Stage 4 optimal artifact does not include a best candidate")
+    simulation_inputs = realized.get("simulation_inputs") if isinstance(realized.get("simulation_inputs"), dict) else {}
     source_universe_run = repository.get_stage0_universe_run(session["source_universe_run_id"])
     if source_universe_run is None:
         raise ValueError("Source Stage 0 universe run is missing")
@@ -1813,6 +1853,12 @@ def _materialize_execution_bundle(
         "hard_exit_after_hours": forward_hours,
         "stage4_candidate_id": best.get("candidate_id") or realized.get("best_candidate_id"),
         "setup": best.get("setup") or best,
+        "sizing": {
+            "source": "stage4_realized_expectancy",
+            "initial_capital_usdt": simulation_inputs.get("initial_capital_usdt"),
+            "margin_allocation_pct": simulation_inputs.get("margin_allocation_pct"),
+            "leverage": simulation_inputs.get("leverage"),
+        },
         "cost_assumptions": realized.get("cost_assumptions", {}),
         "slice_windows": realized.get("slice_windows", []),
         "training_window": {
@@ -1937,6 +1983,121 @@ def _resolve_engine_spec_for_promotion(
         if isinstance(entry, dict):
             return SignalEngineSpec.from_mapping({**entry, "output_envelope_version": entry.get("output_envelope_version") or "signal_packet.v2"})
     raise ValueError(f"Signal engine spec not found for {signal_engine_id}")
+
+
+def _signal_engine_catalog(repository: Any, *, workspace_root: Path) -> list[dict[str, Any]]:
+    engines_by_id = {engine["signal_engine_id"]: dict(engine) for engine in repository.list_signal_engines()}
+    registry_path = workspace_root / "artifacts" / "signal_engine" / "engine_registry.json"
+    if registry_path.is_file():
+        registry = json.loads(registry_path.read_text())
+        if isinstance(registry, dict):
+            for signal_engine_id, entry in registry.items():
+                if not isinstance(entry, dict) or signal_engine_id in engines_by_id:
+                    continue
+                engines_by_id[signal_engine_id] = {
+                    **entry,
+                    "signal_set_count": 0,
+                    "packet_count": 0,
+                }
+    return sorted(engines_by_id.values(), key=lambda engine: str(engine.get("signal_engine_id") or ""))
+
+
+def _materialize_signal_engine(repository: Any, *, workspace_root: Path, signal_engine_id: str) -> dict[str, Any] | None:
+    existing = next((engine for engine in repository.list_signal_engines() if engine["signal_engine_id"] == signal_engine_id), None)
+    if existing is not None:
+        return existing
+    entry = _registry_signal_engine(workspace_root=workspace_root, signal_engine_id=signal_engine_id)
+    if entry is None:
+        return None
+    registration = {
+        "signal_engine_id": entry["signal_engine_id"],
+        "name": entry.get("name") or entry["signal_engine_id"],
+        "description": entry.get("description", ""),
+        "version": entry.get("version") or "0.1",
+        "code_ref": entry.get("code_ref") if isinstance(entry.get("code_ref"), dict) else {},
+        "supported_input_data_types": entry.get("supported_input_data_types") or ["candles"],
+        "required_data": entry.get("required_data") or [],
+        "output_envelope_version": entry.get("output_envelope_version") or "signal_packet.v2",
+        "runtime_entrypoint": entry.get("runtime_entrypoint") or "",
+        "live_scanner_entrypoint": entry.get("live_scanner_entrypoint"),
+        "configuration_schema": entry.get("configuration_schema") if isinstance(entry.get("configuration_schema"), dict) else {},
+    }
+    repository.register_signal_engine(registration)
+    return next((engine for engine in repository.list_signal_engines() if engine["signal_engine_id"] == signal_engine_id), registration)
+
+
+def _registry_signal_engine(*, workspace_root: Path, signal_engine_id: str) -> dict[str, Any] | None:
+    registry_path = workspace_root / "artifacts" / "signal_engine" / "engine_registry.json"
+    if not registry_path.is_file():
+        return None
+    registry = json.loads(registry_path.read_text())
+    entry = registry.get(signal_engine_id) if isinstance(registry, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _create_canonical_signal_set(*, repository: Any, engine: dict[str, Any], asset: str) -> dict[str, Any]:
+    asset = asset.upper()
+    required_refs, missing = _required_data_refs(repository=repository, engine=engine, asset=asset)
+    if missing:
+        raise ValueError(f"Missing required local data for {asset}: {', '.join(missing)}")
+    signal_engine_id = engine["signal_engine_id"]
+    signal_set_id = f"{asset}-{signal_engine_id}-canonical"
+    signal_set_key = f"{signal_engine_id}:{asset}:{signal_set_id}"
+    existing = repository.get_signal_set(signal_set_key)
+    if existing is not None:
+        return _relative_nested_paths(Path.cwd(), existing)
+    instrument = _instrument_for_refs(asset=asset, refs=required_refs)
+    configuration_schema = engine.get("configuration_schema") if isinstance(engine.get("configuration_schema"), dict) else {}
+    parameters = configuration_schema.get("default_parameters") if isinstance(configuration_schema.get("default_parameters"), dict) else {}
+    signal_set = {
+        "signal_set_key": signal_set_key,
+        "signal_set_id": signal_set_id,
+        "signal_engine_id": signal_engine_id,
+        "signal_engine_version": engine.get("version") or "0.1",
+        "asset": asset,
+        "instrument": instrument,
+        "start_ts": None,
+        "end_ts": None,
+        "packet_count": 0,
+        "payload_schema": engine.get("output_envelope_version") or "signal_packet.v2",
+        "source_path": "canonicalized:signals",
+        "manifest": {
+            "schema_version": "0.1",
+            "signal_set_id": signal_set_id,
+            "signal_engine_id": signal_engine_id,
+            "asset": asset,
+            "instrument": instrument,
+            "parameters": dict(parameters),
+            "data_refs": [ref["dataset_id"] for ref in required_refs if ref.get("dataset_id")],
+            "scan_coverage": {"source": "parquet_market_data", "start_ts": None, "end_ts": None},
+        },
+    }
+    repository.upsert_signal_set(signal_set)
+    return _relative_nested_paths(Path.cwd(), repository.get_signal_set(signal_set_key) or signal_set)
+
+
+def _required_data_refs(*, repository: Any, engine: dict[str, Any], asset: str) -> tuple[list[dict[str, Any]], list[str]]:
+    refs: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for requirement in engine.get("required_data") or []:
+        if requirement.get("data_type") != "candles":
+            missing.append(str(requirement.get("data_type") or "unsupported data"))
+            continue
+        origin = requirement.get("origin") or requirement.get("data_origin") or "raw"
+        timeframe = requirement.get("timeframe") or "5m"
+        ref = repository.get_candle_ref(asset=asset, data_type="candles", origin=origin, timeframe=timeframe)
+        if ref is None:
+            missing.append(f"{origin} candles {timeframe}")
+            continue
+        refs.append(ref)
+    return refs, missing
+
+
+def _instrument_for_refs(*, asset: str, refs: list[dict[str, Any]]) -> str:
+    for ref in refs:
+        if ref.get("instrument"):
+            return str(ref["instrument"])
+    return f"{asset}-USDT-SWAP"
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:

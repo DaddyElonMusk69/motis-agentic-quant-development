@@ -12,6 +12,7 @@ build/
 .data/
 agent_tasks/
 *.egg-info/
+artifacts/execution_bundles/
 dev/
 live/*
 !live/.gitkeep

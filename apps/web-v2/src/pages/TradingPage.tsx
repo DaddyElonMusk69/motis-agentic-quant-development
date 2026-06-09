@@ -29,6 +29,8 @@ import { TerminalPanel } from "../components/TerminalPanel";
 
 const STARTABLE_ROUTE_BLOCKERS = new Set(["route_disabled", "data_not_warmed", "route_not_manually_armed"]);
 const WAKE_PAGE_SIZE = 25;
+const LIVE_WAKE_POLL_MS = 5000;
+const ROUTE_STATUS_POLL_MS = 10000;
 
 function updateTradingUrl(routeId: string) {
   const params = new URLSearchParams(window.location.search);
@@ -125,6 +127,49 @@ function routeSetup(route: DeploymentRoute): Record<string, unknown> {
   const setup = route.active_bundle?.execution_setup;
   const nested = readRecordValue(setup, "setup");
   return nested && typeof nested === "object" ? nested as Record<string, unknown> : {};
+}
+
+function routeExecutionSetup(route: DeploymentRoute): Record<string, unknown> {
+  const setup = route.active_bundle?.execution_setup;
+  return setup && typeof setup === "object" ? setup as Record<string, unknown> : {};
+}
+
+function routeBundleSizing(route: DeploymentRoute): { margin_allocation_pct: number; leverage: number; source: string } {
+  const executionSetup = routeExecutionSetup(route);
+  const setup = routeSetup(route);
+  const sizing = readRecordValue(executionSetup, "sizing");
+  const sizingRecord = sizing && typeof sizing === "object" ? sizing as Record<string, unknown> : {};
+  const margin = Number(
+    readRecordValue(sizingRecord, "margin_allocation_pct")
+    ?? readRecordValue(executionSetup, "margin_allocation_pct")
+    ?? readRecordValue(setup, "margin_allocation_pct")
+    ?? route.margin_allocation_pct
+    ?? 0
+  );
+  const leverage = Number(
+    readRecordValue(sizingRecord, "leverage")
+    ?? readRecordValue(executionSetup, "leverage")
+    ?? readRecordValue(setup, "leverage")
+    ?? route.leverage
+    ?? 0
+  );
+  return {
+    margin_allocation_pct: Number.isFinite(margin) ? margin : 0,
+    leverage: Number.isFinite(leverage) ? leverage : 0,
+    source: String(readRecordValue(sizingRecord, "source") ?? "stage4 bundle")
+  };
+}
+
+function effectiveRouteSizing(route: DeploymentRoute): { margin_allocation_pct: number; leverage: number; source: string; manual: boolean } {
+  if (route.manual_sizing_enabled) {
+    return {
+      margin_allocation_pct: Number(route.margin_allocation_pct ?? 0),
+      leverage: Number(route.leverage ?? 0),
+      source: "manual override",
+      manual: true
+    };
+  }
+  return { ...routeBundleSizing(route), manual: false };
 }
 
 function pyramidMaxLegs(route: DeploymentRoute): number {
@@ -307,7 +352,12 @@ export function TradingPage() {
   const [submitSizing, setSubmitSizing] = useState<Record<string, { quantity: string; notionalUsd: string }>>({});
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [wakePage, setWakePage] = useState(0);
-  const routesQuery = useQuery({ queryKey: ["trading-routes"], queryFn: fetchTradingRoutes });
+  const routesQuery = useQuery({
+    queryKey: ["trading-routes"],
+    queryFn: fetchTradingRoutes,
+    refetchInterval: (query) => (query.state.data?.routes ?? []).some((item) => item.scheduler_status === "running") ? LIVE_WAKE_POLL_MS : ROUTE_STATUS_POLL_MS,
+    refetchIntervalInBackground: true
+  });
   const archivedRoutesQuery = useQuery({
     enabled: archivedOpen,
     queryKey: ["trading-routes", "archived"],
@@ -316,6 +366,8 @@ export function TradingPage() {
   const routes = routesQuery.data?.routes ?? [];
   const archivedRoutes = archivedRoutesQuery.data?.routes ?? [];
   const route = selectedRoute(routes, searchParams.get("route"));
+  const routeRunning = route?.scheduler_status === "running";
+  const wakePollingEnabled = Boolean(route?.route_id && routeRunning);
 
   const wakesQuery = useQuery({
     enabled: Boolean(route?.route_id),
@@ -323,12 +375,16 @@ export function TradingPage() {
     queryFn: () => fetchRouteWakes(route!.route_id, {
       limit: WAKE_PAGE_SIZE,
       offset: wakePage * WAKE_PAGE_SIZE
-    })
+    }),
+    refetchInterval: wakePollingEnabled ? LIVE_WAKE_POLL_MS : false,
+    refetchIntervalInBackground: true
   });
   const latestWakesQuery = useQuery({
     enabled: Boolean(route?.route_id) && wakePage !== 0,
     queryKey: ["route-wakes-latest", route?.route_id],
-    queryFn: () => fetchRouteWakes(route!.route_id, { limit: 1, offset: 0 })
+    queryFn: () => fetchRouteWakes(route!.route_id, { limit: 1, offset: 0 }),
+    refetchInterval: wakePollingEnabled ? LIVE_WAKE_POLL_MS : false,
+    refetchIntervalInBackground: true
   });
   const healthQuery = useQuery({
     enabled: Boolean(route?.route_id),
@@ -624,7 +680,12 @@ export function TradingPage() {
 
                 <TerminalPanel
                   className="scroll-panel trading-wake-history-panel"
-                  title="Wake History"
+                  title={
+                    <span className="panel-title-with-dot">
+                      Wake History
+                      {wakePollingEnabled ? <span className="live-poll-dot" aria-label="Live polling" /> : null}
+                    </span>
+                  }
                   actions={
                     <div className="header-actions">
                       <div className="wake-pagination-v2" aria-label="Wake history pagination">
@@ -653,7 +714,7 @@ export function TradingPage() {
                         {wakeMutation.isPending ? "Running wake" : "Run One Wake"}
                       </button>
                       <button className="icon-button" disabled={!route || wakesQuery.isFetching} onClick={() => void wakesQuery.refetch()} type="button" aria-label="Refresh wake history">
-                        <RefreshCw aria-hidden="true" />
+                        <RefreshCw aria-hidden="true" className={wakesQuery.isFetching ? "spin-icon" : undefined} />
                       </button>
                     </div>
                   }
@@ -707,7 +768,7 @@ function RouteCard({
   latestWake: WakeRun | null;
   onArchive: () => void;
   onRun: () => void;
-  onSaveSettings: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; auto_submit_enabled: boolean }) => void;
+  onSaveSettings: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; manual_sizing_enabled: boolean; auto_submit_enabled: boolean }) => void;
   onSelect: () => void;
   route: DeploymentRoute;
   selected: boolean;
@@ -829,34 +890,60 @@ function ExchangeHealthPill({ health, loading }: { health: ExchangeHealth | null
 
 function ExecutionSettings({ compact = false, onSave, route, saving }: {
   compact?: boolean;
-  onSave: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; auto_submit_enabled: boolean }) => void;
+  onSave: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; manual_sizing_enabled: boolean; auto_submit_enabled: boolean }) => void;
   route: DeploymentRoute;
   saving: boolean;
 }) {
+  const bundleSizing = routeBundleSizing(route);
+  const effectiveSizing = effectiveRouteSizing(route);
   const [cron, setCron] = useState(String(route.cron_interval_minutes ?? 15));
   const [exchange, setExchange] = useState(route.execution_adapter ?? "okx");
   const [account, setAccount] = useState(route.exchange_account ?? "default");
-  const [margin, setMargin] = useState(Number(route.margin_allocation_pct ?? 10));
-  const [leverage, setLeverage] = useState(Number(route.leverage ?? 1));
+  const [manualSizing, setManualSizing] = useState(Boolean(route.manual_sizing_enabled));
+  const [margin, setMargin] = useState(Number(route.margin_allocation_pct ?? bundleSizing.margin_allocation_pct ?? 10));
+  const [leverage, setLeverage] = useState(Number(route.leverage ?? bundleSizing.leverage ?? 1));
   const [autoSubmit, setAutoSubmit] = useState(Boolean(route.auto_submit_enabled));
 
   useEffect(() => {
     setCron(String(route.cron_interval_minutes ?? 15));
     setExchange(route.execution_adapter ?? "okx");
     setAccount(route.exchange_account ?? "default");
-    setMargin(Number(route.margin_allocation_pct ?? 10));
-    setLeverage(Number(route.leverage ?? 1));
+    setManualSizing(Boolean(route.manual_sizing_enabled));
+    setMargin(Number(route.margin_allocation_pct ?? bundleSizing.margin_allocation_pct ?? 10));
+    setLeverage(Number(route.leverage ?? bundleSizing.leverage ?? 1));
     setAutoSubmit(Boolean(route.auto_submit_enabled));
-  }, [route.route_id, route.cron_interval_minutes, route.execution_adapter, route.exchange_account, route.margin_allocation_pct, route.leverage, route.auto_submit_enabled]);
+  }, [
+    route.route_id,
+    route.cron_interval_minutes,
+    route.execution_adapter,
+    route.exchange_account,
+    route.margin_allocation_pct,
+    route.leverage,
+    route.manual_sizing_enabled,
+    route.auto_submit_enabled,
+    bundleSizing.margin_allocation_pct,
+    bundleSizing.leverage
+  ]);
 
   const cronMinutes = Number(cron);
+  const savedManualSizing = Boolean(route.manual_sizing_enabled);
   const dirty = cronMinutes !== route.cron_interval_minutes
     || exchange !== route.execution_adapter
     || account !== route.exchange_account
-    || margin !== route.margin_allocation_pct
-    || leverage !== route.leverage
+    || manualSizing !== savedManualSizing
+    || (manualSizing && margin !== route.margin_allocation_pct)
+    || (manualSizing && leverage !== route.leverage)
     || autoSubmit !== route.auto_submit_enabled;
   const valid = Number.isInteger(cronMinutes) && cronMinutes >= 1 && cronMinutes <= 1440 && margin >= 0.1 && margin <= 100 && leverage >= 1 && leverage <= 125;
+  const displayMargin = manualSizing ? margin : bundleSizing.margin_allocation_pct;
+  const displayLeverage = manualSizing ? leverage : bundleSizing.leverage;
+  const toggleManualSizing = (enabled: boolean) => {
+    setManualSizing(enabled);
+    if (enabled && !manualSizing) {
+      setMargin(bundleSizing.margin_allocation_pct || Number(route.margin_allocation_pct ?? 10));
+      setLeverage(bundleSizing.leverage || Number(route.leverage ?? 1));
+    }
+  };
 
   return (
     <div className={compact ? "execution-settings-v2 execution-settings-v2--compact" : "execution-settings-v2"}>
@@ -875,12 +962,24 @@ function ExecutionSettings({ compact = false, onSave, route, saving }: {
         <input value={account} onChange={(event) => setAccount(event.target.value)} />
       </label>
       <label className="slider-row-v2">
-        <span>Full position margin {formatPercent(margin)}</span>
-        <input min="1" max="100" step="1" type="range" value={margin} onChange={(event) => setMargin(Number(event.target.value))} />
+        <span>Full position margin {formatPercent(displayMargin)}</span>
+        {manualSizing ? (
+          <input min="1" max="100" step="1" type="range" value={margin} onChange={(event) => setMargin(Number(event.target.value))} />
+        ) : (
+          <strong>{formatPercent(bundleSizing.margin_allocation_pct)} from Stage 4</strong>
+        )}
       </label>
       <label className="slider-row-v2">
-        <span>Leverage {formatNumber(leverage)}x</span>
-        <input min="1" max="20" step="1" type="range" value={leverage} onChange={(event) => setLeverage(Number(event.target.value))} />
+        <span>Leverage {formatNumber(displayLeverage)}x</span>
+        {manualSizing ? (
+          <input min="1" max="20" step="1" type="range" value={leverage} onChange={(event) => setLeverage(Number(event.target.value))} />
+        ) : (
+          <strong>{formatNumber(bundleSizing.leverage)}x from Stage 4</strong>
+        )}
+      </label>
+      <label className="checkbox-row-v2">
+        <span>Manual Sizing Override</span>
+        <input type="checkbox" checked={manualSizing} onChange={(event) => toggleManualSizing(event.target.checked)} />
       </label>
       <label className="checkbox-row-v2">
         <span>Live Orders</span>
@@ -895,6 +994,7 @@ function ExecutionSettings({ compact = false, onSave, route, saving }: {
           exchange_account: account,
           margin_allocation_pct: margin,
           leverage,
+          manual_sizing_enabled: manualSizing,
           auto_submit_enabled: autoSubmit
         })}
         type="button"
@@ -908,7 +1008,8 @@ function ExecutionSettings({ compact = false, onSave, route, saving }: {
 function BundleSetupMini({ latestWake, route }: { latestWake: WakeRun | null; route: DeploymentRoute }) {
   const setup = routeSetup(route);
   const legs = pyramidMaxLegs(route);
-  const margin = Number(route.margin_allocation_pct ?? 0);
+  const sizing = effectiveRouteSizing(route);
+  const margin = Number(sizing.margin_allocation_pct ?? 0);
   const perLegMarginPct = legs > 0 ? margin / legs : margin;
   return (
     <div className="bundle-setup-mini">
@@ -922,7 +1023,7 @@ function BundleSetupMini({ latestWake, route }: { latestWake: WakeRun | null; ro
       </div>
       <div>
         <span>Leg Margin</span>
-        <strong>{formatPercent(perLegMarginPct)}</strong>
+        <strong>{formatPercent(perLegMarginPct)} · {formatNumber(sizing.leverage)}x</strong>
       </div>
       <div>
         <span>Last Wake</span>
@@ -935,7 +1036,8 @@ function BundleSetupMini({ latestWake, route }: { latestWake: WakeRun | null; ro
 function BundleReadout({ latestWake, route }: { latestWake: WakeRun | null; route: DeploymentRoute }) {
   const setup = routeSetup(route);
   const legs = pyramidMaxLegs(route);
-  const margin = Number(route.margin_allocation_pct ?? 0);
+  const sizing = effectiveRouteSizing(route);
+  const margin = Number(sizing.margin_allocation_pct ?? 0);
   const perLegMarginPct = legs > 0 ? margin / legs : margin;
   return (
     <div className="field-stack">
@@ -943,8 +1045,9 @@ function BundleReadout({ latestWake, route }: { latestWake: WakeRun | null; rout
       <FieldRow label="Pyramid legs" value={formatNumber(legs)} />
       <FieldRow label="Step" value={formatSetupValue(readRecordValue(readRecordValue(setup, "pyramid"), "step_pct") ?? readRecordValue(setup, "step_pct"), "%")} />
       <FieldRow label="Hard hold gate" value={formatSetupValue(setup.max_hold_hours ?? readRecordValue(route.active_bundle?.execution_setup, "hard_exit_after_hours"), "h")} />
+      <FieldRow label="Sizing source" value={sizing.source} />
       <FieldRow label="Per-leg margin" value={`${formatPercent(perLegMarginPct)} of account`} />
-      <FieldRow label="Initial notional" value={`${formatPercent(perLegMarginPct * Number(route.leverage ?? 1))} of account`} />
+      <FieldRow label="Initial notional" value={`${formatPercent(perLegMarginPct * Number(sizing.leverage ?? 1))} of account`} />
       <FieldRow label="Last branch" value={latestWake?.branch ?? "n/a"} />
     </div>
   );

@@ -1,11 +1,15 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowLeft, FileJson, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { ArrowLeft, FileJson, MoreVertical, Plus, RefreshCw, SlidersHorizontal, X } from "lucide-react";
 import {
+  createSignalSet,
   extendSignalPoolFromLocalCandles,
+  fetchMarketDataCatalog,
   fetchSignalEngines,
   fetchSignals,
   fetchSignalSets,
+  updateSignalEngine,
+  type CatalogAsset,
   type SignalEngine,
   type SignalPoolExtendResult,
   type SignalRecord,
@@ -87,7 +91,7 @@ function signalUpdateResultText(result: SignalPoolExtendResult | undefined): str
 
 function engineRequiredData(engine: SignalEngine | undefined): Array<{ label: string; value: string }> {
   const codeRef = engine?.code_ref ?? {};
-  const requiredData = Array.isArray(codeRef.required_data) ? codeRef.required_data : null;
+  const requiredData = Array.isArray(engine?.required_data) ? engine.required_data : Array.isArray(codeRef.required_data) ? codeRef.required_data : null;
   if (!requiredData?.length) {
     return [
       { label: "Canonical input", value: "Raw 5m Parquet candles" },
@@ -99,6 +103,34 @@ function engineRequiredData(engine: SignalEngine | undefined): Array<{ label: st
     label: `Requirement ${index + 1}`,
     value: typeof item === "string" ? item : JSON.stringify(item)
   }));
+}
+
+function engineRequirements(engine: SignalEngine | undefined): Array<Record<string, unknown>> {
+  if (Array.isArray(engine?.required_data)) {
+    return engine.required_data;
+  }
+  if (engine?.code_ref && Array.isArray(engine.code_ref.required_data)) {
+    return engine.code_ref.required_data as Array<Record<string, unknown>>;
+  }
+  return [];
+}
+
+function assetRequirementState(asset: CatalogAsset, engine: SignalEngine | undefined): { eligible: boolean; missing: string[] } {
+  const requirements = engineRequirements(engine);
+  const missing = requirements
+    .filter((requirement) => {
+      const dataType = String(requirement.data_type ?? "");
+      const origin = String(requirement.origin ?? requirement.data_origin ?? "");
+      const timeframe = String(requirement.timeframe ?? "");
+      return !asset.datasets.some(
+        (dataset) =>
+          dataset.data_type === dataType &&
+          dataset.data_origin === origin &&
+          String(dataset.timeframe ?? "") === timeframe
+      );
+    })
+    .map((requirement) => `${String(requirement.origin ?? requirement.data_origin ?? "raw")} ${String(requirement.data_type ?? "data")} ${String(requirement.timeframe ?? "")}`.trim());
+  return { eligible: missing.length === 0, missing };
 }
 
 function PacketPreview({ error, loading, signals }: { error: Error | null; loading: boolean; signals?: SignalRecord[] }) {
@@ -125,7 +157,13 @@ function PacketPreview({ error, loading, signals }: { error: Error | null; loadi
 
 export function EnginesPage() {
   const { searchParams } = useAppRouter();
+  const [menuEngineId, setMenuEngineId] = useState<string | null>(null);
+  const [renameEngine, setRenameEngine] = useState<SignalEngine | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [addTickerOpen, setAddTickerOpen] = useState(false);
+  const [selectedTickerAssets, setSelectedTickerAssets] = useState<string[]>([]);
   const enginesQuery = useQuery({ queryKey: ["signal-engines"], queryFn: fetchSignalEngines });
+  const catalogQuery = useQuery({ queryKey: ["market-data-catalog"], queryFn: fetchMarketDataCatalog });
   const selectedEngine = selectEngine(enginesQuery.data?.engines, searchParams);
   const engineId = selectedEngine?.signal_engine_id ?? "";
   const signalSetsQuery = useQuery({
@@ -154,9 +192,69 @@ export function EnginesPage() {
     }
   });
 
+  const renameMutation = useMutation({
+    mutationFn: ({ engineId, name }: { engineId: string; name: string }) => updateSignalEngine(engineId, { name }),
+    onSuccess: (result) => {
+      setRenameEngine(null);
+      setMenuEngineId(null);
+      void queryClient.invalidateQueries({ queryKey: ["signal-engines"] });
+      updateEngineUrl({ engine: result.engine.signal_engine_id });
+    }
+  });
+
+  const createSignalSetMutation = useMutation({
+    mutationFn: async ({ signal_engine_id, assets }: { signal_engine_id: string; assets: string[] }) => {
+      const created = await Promise.all(assets.map((asset) => createSignalSet({ signal_engine_id, asset })));
+      return {
+        signal_engine_id,
+        signal_sets: created.map((result) => result.signal_set)
+      };
+    },
+    onSuccess: (result) => {
+      setAddTickerOpen(false);
+      setSelectedTickerAssets([]);
+      const firstSignalSet = result.signal_sets[0];
+      if (firstSignalSet) {
+        updateEngineUrl({ engine: firstSignalSet.signal_engine_id, asset: firstSignalSet.asset, signalSetKey: firstSignalSet.signal_set_key });
+      }
+      void queryClient.invalidateQueries({ queryKey: ["signal-engines"] });
+      void queryClient.invalidateQueries({ queryKey: ["signal-sets", result.signal_engine_id] });
+    }
+  });
+
   const selectedUpdateResult = signalUpdateMutation.data?.signal_set_key === selectedSignalSet?.signal_set_key ? signalUpdateMutation.data : undefined;
   const selectedUpdateError = signalUpdateMutation.variables?.asset === selectedSignalSet?.asset ? signalUpdateMutation.error : undefined;
   const isUpdatingSelected = signalUpdateMutation.isPending && signalUpdateMutation.variables?.asset === selectedSignalSet?.asset;
+  const renameError = renameMutation.error;
+  const createSignalSetError = createSignalSetMutation.error;
+  const selectedTickerSet = useMemo(() => new Set(selectedTickerAssets), [selectedTickerAssets]);
+  const availableTickerAssets = useMemo(() => {
+    if (!selectedEngine || !catalogQuery.data) {
+      return [];
+    }
+    return catalogQuery.data.assets
+      .filter((asset) => assetRequirementState(asset, selectedEngine).eligible && !signalSets.some((set) => set.asset === asset.asset))
+      .map((asset) => asset.asset);
+  }, [catalogQuery.data, selectedEngine, signalSets]);
+  const allAvailableSelected = availableTickerAssets.length > 0 && availableTickerAssets.every((asset) => selectedTickerSet.has(asset));
+
+  function openAddTickerModal() {
+    setSelectedTickerAssets([]);
+    setAddTickerOpen(true);
+  }
+
+  function closeAddTickerModal() {
+    setSelectedTickerAssets([]);
+    setAddTickerOpen(false);
+  }
+
+  function toggleTickerAsset(asset: string) {
+    setSelectedTickerAssets((current) => (current.includes(asset) ? current.filter((item) => item !== asset) : [...current, asset]));
+  }
+
+  function toggleAllAvailableTickers() {
+    setSelectedTickerAssets(allAvailableSelected ? [] : availableTickerAssets);
+  }
 
   return (
     <div className="page page--workspace">
@@ -173,12 +271,31 @@ export function EnginesPage() {
                 {enginesQuery.error ? <div className="state-line state-line--error">{enginesQuery.error.message}</div> : null}
                 {enginesQuery.data?.engines.length === 0 ? <div className="state-line">No signal engines registered.</div> : null}
                 {enginesQuery.data?.engines.map((engine) => (
-                  <button className="entity-row" key={engine.signal_engine_id} onClick={() => updateEngineUrl({ engine: engine.signal_engine_id })} type="button">
-                    <strong>{engine.name}</strong>
-                    <span>
-                      {engine.signal_engine_id}@{engine.version ?? "n/a"} · {formatNumber(engine.signal_set_count)} sets · {formatNumber(engine.packet_count)} packets
-                    </span>
-                  </button>
+                  <div className="entity-row entity-row--with-menu" key={engine.signal_engine_id}>
+                    <button className="entity-row__main" onClick={() => updateEngineUrl({ engine: engine.signal_engine_id })} type="button">
+                      <strong>{engine.name}</strong>
+                      <span>
+                        {engine.signal_engine_id}@{engine.version ?? "n/a"} · {formatNumber(engine.signal_set_count)} sets · {formatNumber(engine.packet_count)} packets
+                      </span>
+                    </button>
+                    <button className="icon-button icon-button--bare" onClick={() => setMenuEngineId(menuEngineId === engine.signal_engine_id ? null : engine.signal_engine_id)} type="button" aria-label={`Open ${engine.name} menu`}>
+                      <MoreVertical aria-hidden="true" />
+                    </button>
+                    {menuEngineId === engine.signal_engine_id ? (
+                      <div className="card-menu">
+                        <button
+                          onClick={() => {
+                            setRenameEngine(engine);
+                            setRenameValue(engine.name);
+                            setMenuEngineId(null);
+                          }}
+                          type="button"
+                        >
+                          Rename
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
                 ))}
               </>
             ) : (
@@ -256,7 +373,26 @@ export function EnginesPage() {
                     { key: "id", header: "ID", render: (row) => <span className="mono">{row.signal_engine_id}</span> },
                     { key: "version", header: "Version", render: (row) => row.version ?? "n/a" },
                     { key: "sets", header: "Pools", align: "right", render: (row) => formatNumber(row.signal_set_count) },
-                    { key: "packets", header: "Packets", align: "right", render: (row) => formatNumber(row.packet_count) }
+                    { key: "packets", header: "Packets", align: "right", render: (row) => formatNumber(row.packet_count) },
+                    {
+                      key: "menu",
+                      header: "",
+                      align: "right",
+                      render: (row) => (
+                        <button
+                          className="icon-button icon-button--bare"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setRenameEngine(row);
+                            setRenameValue(row.name);
+                          }}
+                          type="button"
+                          aria-label={`Rename ${row.name}`}
+                        >
+                          <MoreVertical aria-hidden="true" />
+                        </button>
+                      )
+                    }
                   ]}
                   getRowKey={(row) => row.signal_engine_id}
                   onRowClick={(row) => updateEngineUrl({ engine: row.signal_engine_id })}
@@ -273,6 +409,10 @@ export function EnginesPage() {
               </div>
               <div className="header-actions">
                 {selectedState ? <StatusBadge tone={selectedState.tone}>{selectedState.label}</StatusBadge> : null}
+                <button className="button button--secondary" onClick={openAddTickerModal} type="button">
+                  <Plus aria-hidden="true" />
+                  Add Ticker
+                </button>
                 <button
                   className="button button--secondary"
                   disabled={!selectedSignalSet || signalUpdateMutation.isPending}
@@ -350,6 +490,104 @@ export function EnginesPage() {
           )
         }
       />
+      {renameEngine ? (
+        <div className="terminal-modal-backdrop">
+          <section className="terminal-modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="rename-engine-title">
+            <header className="terminal-modal__header">
+              <div>
+                <span className="eyebrow">Engine display name</span>
+                <h2 id="rename-engine-title">Rename Engine</h2>
+              </div>
+              <button className="icon-button" onClick={() => setRenameEngine(null)} type="button" aria-label="Close rename dialog">
+                <X aria-hidden="true" />
+              </button>
+            </header>
+            <div className="modal-stack">
+              <label>
+                Display name
+                <input value={renameValue} onChange={(event) => setRenameValue(event.target.value)} />
+              </label>
+              {renameError ? <div className="state-line state-line--error">{renameError.message}</div> : null}
+              <div className="modal-actions">
+                <button className="button button--secondary" onClick={() => setRenameEngine(null)} type="button">Cancel</button>
+                <button
+                  className="button button--primary"
+                  disabled={!renameValue.trim() || renameMutation.isPending}
+                  onClick={() => renameMutation.mutate({ engineId: renameEngine.signal_engine_id, name: renameValue.trim() })}
+                  type="button"
+                >
+                  {renameMutation.isPending ? "Renaming" : "Rename"}
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
+      {addTickerOpen && selectedEngine ? (
+        <div className="terminal-modal-backdrop">
+          <section className="terminal-modal add-ticker-modal" role="dialog" aria-modal="true" aria-labelledby="add-ticker-title">
+            <header className="terminal-modal__header">
+              <div>
+                <span className="eyebrow">{selectedEngine.name}</span>
+                <h2 id="add-ticker-title">Add Ticker</h2>
+              </div>
+              <button className="icon-button" onClick={closeAddTickerModal} type="button" aria-label="Close add ticker dialog">
+                <X aria-hidden="true" />
+              </button>
+            </header>
+            <div className="add-ticker-toolbar">
+              <div>
+                <strong>{selectedTickerAssets.length} selected</strong>
+                <span>{availableTickerAssets.length} ready from local data</span>
+              </div>
+              <div className="header-actions">
+                <button className="button button--secondary" disabled={availableTickerAssets.length === 0 || createSignalSetMutation.isPending} onClick={toggleAllAvailableTickers} type="button">
+                  {allAvailableSelected ? "Clear" : "Select All Ready"}
+                </button>
+                <button
+                  className="button button--primary"
+                  disabled={selectedTickerAssets.length === 0 || createSignalSetMutation.isPending}
+                  onClick={() => createSignalSetMutation.mutate({ signal_engine_id: selectedEngine.signal_engine_id, assets: selectedTickerAssets })}
+                  type="button"
+                >
+                  {createSignalSetMutation.isPending ? "Importing" : `Bulk Import ${selectedTickerAssets.length || ""}`.trim()}
+                </button>
+              </div>
+            </div>
+            <div className="add-ticker-list">
+              {catalogQuery.isLoading ? <div className="state-line">Loading data catalog...</div> : null}
+              {catalogQuery.error ? <div className="state-line state-line--error">{catalogQuery.error.message}</div> : null}
+              {catalogQuery.data?.assets.map((asset) => {
+                const state = assetRequirementState(asset, selectedEngine);
+                const existing = signalSets.some((set) => set.asset === asset.asset);
+                const selected = selectedTickerSet.has(asset.asset);
+                return (
+                  <button
+                    className={[
+                      "ticker-option",
+                      selected ? "is-selected" : "",
+                      !state.eligible || existing ? "is-disabled" : ""
+                    ].filter(Boolean).join(" ")}
+                    disabled={!state.eligible || existing || createSignalSetMutation.isPending}
+                    key={asset.asset}
+                    onClick={() => toggleTickerAsset(asset.asset)}
+                    type="button"
+                  >
+                    <div>
+                      <strong>{asset.asset}</strong>
+                      <span>{asset.datasets.length} local refs</span>
+                    </div>
+                    <StatusBadge tone={existing ? "info" : state.eligible ? "pass" : "warn"}>{existing ? "Added" : state.eligible ? "Ready" : "Missing data"}</StatusBadge>
+                    {!state.eligible ? <small>Missing {state.missing.join(", ")}</small> : null}
+                  </button>
+                );
+              })}
+              {catalogQuery.data?.assets.length === 0 ? <div className="state-line">No local data assets are available.</div> : null}
+              {createSignalSetError ? <div className="state-line state-line--error">{createSignalSetError.message}</div> : null}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

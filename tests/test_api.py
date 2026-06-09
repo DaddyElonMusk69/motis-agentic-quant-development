@@ -27,6 +27,8 @@ class StubRuntimeRepository:
         self.window_requests = []
         self.window_signals = None
         self.candle_ref = None
+        self.signal_sets = []
+        self.candle_refs = {}
 
     def list_signal_engines(self):
         if hasattr(self, "signal_engines"):
@@ -85,8 +87,47 @@ class StubRuntimeRepository:
         ]
 
     def get_signal_set(self, signal_set_key):
-        assert signal_set_key == "vegas_ema:BTC:2026-BTC-2h-dedupe-vote2"
-        return self.list_signal_sets("vegas_ema")[0]
+        if signal_set_key == "vegas_ema:BTC:2026-BTC-2h-dedupe-vote2":
+            return self.list_signal_sets("vegas_ema")[0]
+        for signal_set in self.signal_sets:
+            if signal_set["signal_set_key"] == signal_set_key:
+                return signal_set
+        return None
+
+    def register_signal_engine(self, registration):
+        engines = list(self.list_signal_engines())
+        stored = {
+            "signal_engine_id": registration["signal_engine_id"],
+            "name": registration["name"],
+            "description": registration.get("description", ""),
+            "version": registration["version"],
+            "code_ref": registration.get("code_ref", {}),
+            "required_data": registration.get("required_data", []),
+            "output_envelope_version": registration.get("output_envelope_version", "signal_packet.v2"),
+            "runtime_entrypoint": registration.get("runtime_entrypoint"),
+            "live_scanner_entrypoint": registration.get("live_scanner_entrypoint"),
+            "configuration_schema": registration.get("configuration_schema", {}),
+            "signal_set_count": 0,
+            "packet_count": 0,
+        }
+        self.signal_engines = [
+            stored if engine["signal_engine_id"] == stored["signal_engine_id"] else engine
+            for engine in engines
+            if engine["signal_engine_id"] != stored["signal_engine_id"]
+        ]
+        self.signal_engines.append(stored)
+
+    def update_signal_engine(self, signal_engine_id, **values):
+        engines = list(self.list_signal_engines())
+        self.signal_engines = [
+            {**engine, **values} if engine["signal_engine_id"] == signal_engine_id else engine
+            for engine in engines
+        ]
+        return next((engine for engine in self.signal_engines if engine["signal_engine_id"] == signal_engine_id), None)
+
+    def upsert_signal_set(self, registration):
+        existing = [item for item in self.signal_sets if item["signal_set_key"] != registration["signal_set_key"]]
+        self.signal_sets = [*existing, registration]
 
     def create_strategy_development_run(self, run):
         self.stage0_run = run
@@ -276,6 +317,8 @@ class StubRuntimeRepository:
         }
 
     def get_candle_ref(self, *, asset, timeframe, origin, data_type="candles"):
+        if self.candle_refs:
+            return self.candle_refs.get((asset.upper(), data_type, origin, timeframe))
         return self.candle_ref
 
     def existing_rnd_by_signal_set(self):
@@ -369,8 +412,8 @@ def test_signal_engine_catalog_endpoints_expose_sets_and_packets():
     )
 
     assert engines_response.status_code == 200
-    assert engines_response.json()["engines"][0]["signal_engine_id"] == "vegas_ema"
-    assert engines_response.json()["engines"][0]["packet_count"] == 340
+    vegas_engine = next(engine for engine in engines_response.json()["engines"] if engine["signal_engine_id"] == "vegas_ema")
+    assert vegas_engine["packet_count"] == 340
     assert sets_response.status_code == 200
     assert sets_response.json()["signal_sets"][0]["manifest"]["parameters"]["vote_threshold"] == 2
     assert signals_response.status_code == 200
@@ -378,6 +421,190 @@ def test_signal_engine_catalog_endpoints_expose_sets_and_packets():
         "active_timeframes": ["2h"],
         "interactions": [],
     }
+
+
+def test_signal_engine_catalog_includes_repo_registry_entries(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    registry_root = tmp_path / "artifacts" / "signal_engine"
+    registry_root.mkdir(parents=True)
+    (registry_root / "engine_registry.json").write_text(
+        json.dumps(
+            {
+                "bollinger": {
+                    "signal_engine_id": "bollinger",
+                    "version": "0.1",
+                    "name": "Bollinger Bands",
+                    "description": "Contract registry engine",
+                    "code_ref": {
+                        "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/bollinger_base.py"
+                    },
+                    "required_data": [{"data_type": "candles", "origin": "raw", "timeframe": "5m"}],
+                    "output_envelope_version": "signal_packet.v2",
+                    "runtime_entrypoint": "quant_terminal_worker.signal_engines.bollinger:generate_training_signals",
+                    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.bollinger:scan_live_signal",
+                    "configuration_schema": {},
+                }
+            }
+        )
+    )
+    repository = StubRuntimeRepository()
+    repository.signal_engines = []
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get("/api/v1/signal-engines")
+
+    assert response.status_code == 200
+    engines = response.json()["engines"]
+    assert engines[0]["signal_engine_id"] == "bollinger"
+    assert engines[0]["signal_set_count"] == 0
+    assert engines[0]["packet_count"] == 0
+
+
+def test_signal_engine_rename_materializes_registry_engine(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    registry_root = tmp_path / "artifacts" / "signal_engine"
+    registry_root.mkdir(parents=True)
+    (registry_root / "engine_registry.json").write_text(
+        json.dumps(
+            {
+                "bollinger": {
+                    "signal_engine_id": "bollinger",
+                    "version": "0.1",
+                    "name": "Bollinger Bands",
+                    "description": "Contract registry engine",
+                    "code_ref": {},
+                    "required_data": [{"data_type": "candles", "origin": "raw", "timeframe": "5m"}],
+                    "output_envelope_version": "signal_packet.v2",
+                    "runtime_entrypoint": "quant_terminal_worker.signal_engines.bollinger:generate_training_signals",
+                    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.bollinger:scan_live_signal",
+                    "configuration_schema": {},
+                }
+            }
+        )
+    )
+    repository = StubRuntimeRepository()
+    repository.signal_engines = []
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.patch("/api/v1/signal-engines/bollinger", json={"name": "BB Mean Reversion"})
+
+    assert response.status_code == 200
+    assert response.json()["engine"]["name"] == "BB Mean Reversion"
+    assert repository.list_signal_engines()[0]["signal_engine_id"] == "bollinger"
+    assert repository.list_signal_engines()[0]["name"] == "BB Mean Reversion"
+
+
+def test_signal_pool_create_requires_engine_data_refs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    registry_root = tmp_path / "artifacts" / "signal_engine"
+    registry_root.mkdir(parents=True)
+    (registry_root / "engine_registry.json").write_text(
+        json.dumps(
+            {
+                "bollinger": {
+                    "signal_engine_id": "bollinger",
+                    "version": "0.1",
+                    "name": "Bollinger Bands",
+                    "description": "Contract registry engine",
+                    "code_ref": {},
+                    "required_data": [
+                        {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                        {
+                            "data_type": "candles",
+                            "origin": "derived",
+                            "timeframe": "4h",
+                            "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                        },
+                    ],
+                    "output_envelope_version": "signal_packet.v2",
+                    "runtime_entrypoint": "quant_terminal_worker.signal_engines.bollinger:generate_training_signals",
+                    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.bollinger:scan_live_signal",
+                    "configuration_schema": {"default_parameters": {"vote_threshold": 2}},
+                }
+            }
+        )
+    )
+    repository = StubRuntimeRepository()
+    repository.signal_engines = []
+    repository.candle_refs = {
+        ("AAVE", "candles", "raw", "5m"): {
+            "asset": "AAVE",
+            "instrument": "AAVE-USDT-SWAP",
+            "dataset_id": "AAVE-raw-5m",
+            "data_type": "candles",
+            "data_origin": "raw",
+            "timeframe": "5m",
+        }
+    }
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post("/api/v1/signal-engines/bollinger/signal-sets", json={"asset": "AAVE"})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Missing required local data for AAVE: derived candles 4h"
+
+
+def test_signal_pool_create_adds_canonical_pool_for_data_asset(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    registry_root = tmp_path / "artifacts" / "signal_engine"
+    registry_root.mkdir(parents=True)
+    (registry_root / "engine_registry.json").write_text(
+        json.dumps(
+            {
+                "bollinger": {
+                    "signal_engine_id": "bollinger",
+                    "version": "0.1",
+                    "name": "Bollinger Bands",
+                    "description": "Contract registry engine",
+                    "code_ref": {},
+                    "required_data": [
+                        {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                        {
+                            "data_type": "candles",
+                            "origin": "derived",
+                            "timeframe": "4h",
+                            "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                        },
+                    ],
+                    "output_envelope_version": "signal_packet.v2",
+                    "runtime_entrypoint": "quant_terminal_worker.signal_engines.bollinger:generate_training_signals",
+                    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.bollinger:scan_live_signal",
+                    "configuration_schema": {"default_parameters": {"vote_threshold": 2}},
+                }
+            }
+        )
+    )
+    repository = StubRuntimeRepository()
+    repository.signal_engines = []
+    repository.candle_refs = {
+        ("AAVE", "candles", "raw", "5m"): {
+            "asset": "AAVE",
+            "instrument": "AAVE-USDT-SWAP",
+            "dataset_id": "AAVE-raw-5m",
+            "data_type": "candles",
+            "data_origin": "raw",
+            "timeframe": "5m",
+        },
+        ("AAVE", "candles", "derived", "4h"): {
+            "asset": "AAVE",
+            "instrument": "AAVE-USDT-SWAP",
+            "dataset_id": "AAVE-derived-4h",
+            "data_type": "candles",
+            "data_origin": "derived",
+            "timeframe": "4h",
+        },
+    }
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post("/api/v1/signal-engines/bollinger/signal-sets", json={"asset": "AAVE"})
+
+    assert response.status_code == 200
+    signal_set = response.json()["signal_set"]
+    assert signal_set["signal_set_key"] == "bollinger:AAVE:AAVE-bollinger-canonical"
+    assert signal_set["signal_set_id"] == "AAVE-bollinger-canonical"
+    assert signal_set["packet_count"] == 0
+    assert signal_set["manifest"]["parameters"] == {"vote_threshold": 2}
+    assert signal_set["manifest"]["data_refs"] == ["AAVE-raw-5m", "AAVE-derived-4h"]
 
 
 def test_signal_pool_extend_endpoint_uses_local_extension_service():
@@ -3267,6 +3494,11 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
             {
                 "best_candidate_id": "pyramid",
                 "best_candidate": {"candidate_id": "pyramid", "net_expectancy_pct": 0.24},
+                "simulation_inputs": {
+                    "initial_capital_usdt": 1000,
+                    "margin_allocation_pct": 30,
+                    "leverage": 5,
+                },
                 "cost_assumptions": {"fees_bps_per_side": 5},
                 "slice_windows": [],
                 "candidates": [],
@@ -3292,6 +3524,7 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
             "exchange_account": "main-live-01",
             "margin_allocation_pct": 30,
             "leverage": 5,
+            "manual_sizing_enabled": True,
         },
     )
     wake_response = client.post("/api/v1/trading/routes/aave-live/wake")
@@ -3301,11 +3534,16 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     assert promoted["bundle"]["status"] == "promoted"
     assert promoted["bundle"]["execution_setup"]["forward_hours"] == 36
     assert promoted["bundle"]["execution_setup"]["hard_exit_after_hours"] == 36
+    assert promoted["bundle"]["execution_setup"]["sizing"]["margin_allocation_pct"] == 30
+    assert promoted["bundle"]["execution_setup"]["sizing"]["leverage"] == 5
     manifest = json.loads((tmp_path / promoted["bundle"]["bundle_uri"] / "manifest.json").read_text())
     assert manifest["contract_version"] == "engine_strategy_contract.v1"
     assert manifest["signal_engine_spec"]["signal_engine_id"] == "vegas_ema"
     assert promoted["route"]["route_id"] == "aave-live"
     assert promoted["route"]["enabled"] is False
+    assert promoted["route"]["margin_allocation_pct"] == 30
+    assert promoted["route"]["leverage"] == 5
+    assert promoted["route"]["manual_sizing_enabled"] is False
     assert promoted["route"]["blockers"] == ["route_disabled", "data_not_warmed", "route_not_manually_armed"]
     assert (tmp_path / promoted["bundle"]["bundle_uri"] / "bundle.json").exists()
     assert routes_response.status_code == 200
@@ -3315,6 +3553,7 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     assert settings_response.json()["route"]["exchange_account"] == "main-live-01"
     assert settings_response.json()["route"]["margin_allocation_pct"] == 30
     assert settings_response.json()["route"]["leverage"] == 5
+    assert settings_response.json()["route"]["manual_sizing_enabled"] is True
     assert wake_response.status_code == 200
     assert wake_response.json()["wake"]["status"] == "blocked"
     assert wake_response.json()["wake"]["branch"] == "route_gate"

@@ -18,6 +18,10 @@ def load_execution_bundle(bundle: dict[str, Any], *, workspace_root: Path) -> di
     execution_setup = bundle.get("execution_setup") or {}
     if setup_path.is_file():
         execution_setup = json.loads(setup_path.read_text())
+    if isinstance(execution_setup, dict) and not isinstance(execution_setup.get("sizing"), dict):
+        sizing = _stage4_sizing_from_bundle(bundle=bundle, workspace_root=workspace_root)
+        if sizing:
+            execution_setup = {**execution_setup, "sizing": sizing}
     return {
         "bundle": bundle,
         "bundle_root": bundle_root,
@@ -37,3 +41,37 @@ def load_strategy_module(strategy_path: Path) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _stage4_sizing_from_bundle(*, bundle: dict[str, Any], workspace_root: Path) -> dict[str, Any]:
+    path_value = bundle.get("source_stage4_result_path")
+    if not isinstance(path_value, str) or not path_value:
+        evidence_refs = bundle.get("evidence_refs") if isinstance(bundle.get("evidence_refs"), dict) else {}
+        path_value = evidence_refs.get("stage4_realized_expectancy")
+    if not isinstance(path_value, str) or not path_value:
+        return {}
+    stage4_path = Path(path_value)
+    if not stage4_path.is_absolute():
+        stage4_path = workspace_root / stage4_path
+    if not stage4_path.is_file():
+        return {}
+    payload = json.loads(stage4_path.read_text())
+    inputs = payload.get("simulation_inputs") if isinstance(payload.get("simulation_inputs"), dict) else {}
+    margin = _positive_number(inputs.get("margin_allocation_pct"))
+    leverage = _positive_number(inputs.get("leverage"))
+    if margin is None or leverage is None:
+        return {}
+    return {
+        "source": "stage4_realized_expectancy",
+        "initial_capital_usdt": inputs.get("initial_capital_usdt"),
+        "margin_allocation_pct": margin,
+        "leverage": leverage,
+    }
+
+
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None

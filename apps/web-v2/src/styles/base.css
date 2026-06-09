@@ -134,6 +134,17 @@ h2 {
   padding: 0;
 }
 
+.icon-button--bare {
+  background: transparent;
+  border-color: transparent;
+}
+
+.icon-button--bare:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-primary);
+}
+
 .spin-icon {
   animation: spin-icon 0.9s linear infinite;
 }

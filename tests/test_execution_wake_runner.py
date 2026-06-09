@@ -973,6 +973,7 @@ def test_wake_entry_intent_uses_route_margin_percent_and_leverage_per_pyramid_le
     bundle = _bundle(
         tmp_path,
         setup={
+            "sizing": {"margin_allocation_pct": 30, "leverage": 5},
             "setup": {
                 "entry_model": "market",
                 "tp_pct": 2.0,
@@ -983,8 +984,9 @@ def test_wake_entry_intent_uses_route_margin_percent_and_leverage_per_pyramid_le
     )
     route = {
         **_route(bundle),
-        "margin_allocation_pct": 30.0,
-        "leverage": 5.0,
+        "margin_allocation_pct": 5.0,
+        "leverage": 2.0,
+        "manual_sizing_enabled": False,
     }
     repository = FakeRepository(route=route, bundle=bundle)
     adapter = FakeAdapter()
@@ -1009,19 +1011,63 @@ def test_wake_entry_intent_uses_route_margin_percent_and_leverage_per_pyramid_le
     assert intent["notional_usd"] == 500
     assert intent["target_currency"] == "margin"
     assert intent["leverage"] == 5.0
-    assert intent["sizing_source"] == "route_margin_allocation"
+    assert intent["sizing_source"] == "bundle_stage4_sizing"
     assert intent["account_equity_usd"] == 1000
     assert intent["margin_allocation_pct"] == 30.0
     assert intent["pyramid_max_legs"] == 3
     assert intent["margin_usd"] == 100
 
 
-def test_wake_entry_sizing_reads_actual_okx_balance_list_shape(tmp_path):
-    bundle = _bundle(tmp_path, setup={"setup": {"pyramid": {"max_legs": 3}}})
+def test_wake_entry_intent_manual_sizing_override_takes_route_values(tmp_path):
+    bundle = _bundle(
+        tmp_path,
+        setup={
+            "sizing": {"margin_allocation_pct": 30, "leverage": 5},
+            "setup": {
+                "entry_model": "market",
+                "tp_pct": 2.0,
+                "sl_pct": 1.0,
+                "pyramid": {"max_legs": 2},
+            },
+        },
+    )
     route = {
         **_route(bundle),
-        "margin_allocation_pct": 30.0,
-        "leverage": 5.0,
+        "margin_allocation_pct": 20.0,
+        "leverage": 3.0,
+        "manual_sizing_enabled": True,
+    }
+    repository = FakeRepository(route=route, bundle=bundle)
+    adapter = FakeAdapter()
+    adapter.snapshot = lambda instrument: {
+        "instrument": instrument,
+        "positions": [],
+        "open_orders": [],
+        "protection_orders": [],
+        "balance": {"data": [{"ccy": "USDT", "totalEq": "1000", "availBal": "950"}]},
+        "recent_fills": [],
+    }
+
+    wake = run_route_wake(
+        route_id="aave-live",
+        repository=repository,
+        adapter=adapter,
+        live_signal_scanner=lambda **kwargs: _signal("sig-1"),
+    )
+
+    intent = wake["order_intents"][0]
+    assert intent["quantity"] == "100"
+    assert intent["notional_usd"] == 300
+    assert intent["leverage"] == 3.0
+    assert intent["sizing_source"] == "manual_route_override"
+    assert intent["margin_allocation_pct"] == 20.0
+
+
+def test_wake_entry_sizing_reads_actual_okx_balance_list_shape(tmp_path):
+    bundle = _bundle(tmp_path, setup={"sizing": {"margin_allocation_pct": 30, "leverage": 5}, "setup": {"pyramid": {"max_legs": 3}}})
+    route = {
+        **_route(bundle),
+        "manual_sizing_enabled": False,
     }
     repository = FakeRepository(route=route, bundle=bundle)
     adapter = FakeAdapter()

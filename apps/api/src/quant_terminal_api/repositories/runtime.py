@@ -79,6 +79,18 @@ class RuntimeRepository:
                 )
             )
 
+    def update_signal_engine(self, signal_engine_id: str, **values: Any) -> dict[str, Any] | None:
+        allowed = {key: value for key, value in values.items() if key in {"name", "description"}}
+        if not allowed:
+            return next((engine for engine in self.list_signal_engines() if engine["signal_engine_id"] == signal_engine_id), None)
+        with self.engine.begin() as connection:
+            connection.execute(
+                signal_engines.update()
+                .where(signal_engines.c.signal_engine_id == signal_engine_id)
+                .values(**allowed)
+            )
+        return next((engine for engine in self.list_signal_engines() if engine["signal_engine_id"] == signal_engine_id), None)
+
     def register_strategy(self, registration: dict[str, Any]) -> None:
         with self.engine.begin() as connection:
             connection.execute(
@@ -769,8 +781,9 @@ class RuntimeRepository:
             "execution_adapter": execution_adapter,
             "exchange_account": exchange_account,
             "cron_interval_minutes": _execution_setup_cron_minutes(bundle.get("execution_setup")),
-            "margin_allocation_pct": 10.0,
+            "margin_allocation_pct": _execution_setup_margin_allocation_pct(bundle.get("execution_setup")),
             "leverage": _execution_setup_leverage(bundle.get("execution_setup")),
+            "manual_sizing_enabled": False,
             "scheduler_status": "stopped",
             "auto_submit_enabled": False,
             "last_wake_at": None,
@@ -897,6 +910,7 @@ class RuntimeRepository:
             "cron_interval_minutes",
             "margin_allocation_pct",
             "leverage",
+            "manual_sizing_enabled",
             "scheduler_status",
             "auto_submit_enabled",
             "last_wake_at",
@@ -1470,6 +1484,7 @@ class RuntimeRepository:
                     "cron_interval_minutes": values["cron_interval_minutes"],
                     "margin_allocation_pct": values["margin_allocation_pct"],
                     "leverage": values["leverage"],
+                    "manual_sizing_enabled": values["manual_sizing_enabled"],
                     "scheduler_status": values["scheduler_status"],
                     "auto_submit_enabled": values["auto_submit_enabled"],
                     "last_wake_at": values["last_wake_at"],
@@ -1535,7 +1550,11 @@ def _execution_setup_cron_minutes(execution_setup: Any) -> int:
 def _execution_setup_leverage(execution_setup: Any) -> float:
     value = None
     if isinstance(execution_setup, dict):
-        value = execution_setup.get("leverage")
+        sizing = execution_setup.get("sizing")
+        if isinstance(sizing, dict):
+            value = sizing.get("leverage")
+        if value is None:
+            value = execution_setup.get("leverage")
         nested = execution_setup.get("setup")
         if value is None and isinstance(nested, dict):
             value = nested.get("leverage")
@@ -1544,6 +1563,24 @@ def _execution_setup_leverage(execution_setup: Any) -> float:
     except (TypeError, ValueError):
         leverage = 1.0
     return leverage if leverage > 0 else 1.0
+
+
+def _execution_setup_margin_allocation_pct(execution_setup: Any) -> float:
+    value = None
+    if isinstance(execution_setup, dict):
+        sizing = execution_setup.get("sizing")
+        if isinstance(sizing, dict):
+            value = sizing.get("margin_allocation_pct")
+        if value is None:
+            value = execution_setup.get("margin_allocation_pct")
+        nested = execution_setup.get("setup")
+        if value is None and isinstance(nested, dict):
+            value = nested.get("margin_allocation_pct")
+    try:
+        margin = float(value) if value is not None else 10.0
+    except (TypeError, ValueError):
+        margin = 10.0
+    return margin if margin > 0 else 10.0
 
 
 def _route_blockers(route: dict[str, Any]) -> list[str]:

@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 type TerminalPanelProps = {
-  title: string;
+  title: ReactNode;
   eyebrow?: string;
   children: ReactNode;
   actions?: ReactNode;
@@ -13,7 +13,7 @@ export function TerminalPanel({ title, eyebrow, children, actions, className }: 
     <section className={className ? `terminal-panel ${className}` : "terminal-panel"}>
       <header className="terminal-panel__header">
         <div>
-          {eyebrow ? <span>{eyebrow}</span> : null}
+          {eyebrow ? <span className="terminal-panel__eyebrow">{eyebrow}</span> : null}
           <h2>{title}</h2>
         </div>
         {actions ? <div className="terminal-panel__actions">{actions}</div> : null}

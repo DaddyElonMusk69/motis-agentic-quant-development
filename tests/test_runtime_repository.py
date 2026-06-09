@@ -1040,7 +1040,10 @@ def test_runtime_repository_persists_execution_bundle_route_wake_and_signal_cons
         "source_stage4_result_path": "dev/training_sessions/aave/promotion/stage4_realized_expectancy.json",
         "bundle_uri": "artifacts/execution_bundles/aave-vegas_ema-strategy-abc123",
         "strategy_module_ref": "artifacts/execution_bundles/aave-vegas_ema-strategy-abc123/strategy.py",
-        "execution_setup": {"stage4_candidate_id": "candidate-1"},
+        "execution_setup": {
+            "stage4_candidate_id": "candidate-1",
+            "sizing": {"margin_allocation_pct": 30, "leverage": 5},
+        },
         "risk_limits": {"max_notional_usd": 1000, "max_daily_loss_usd": 250},
         "evidence_refs": {"stage4_optimal": "stage4_optimal.json"},
         "content_hash": "abc123",
@@ -1076,8 +1079,9 @@ def test_runtime_repository_persists_execution_bundle_route_wake_and_signal_cons
     assert route["manually_armed"] is False
     assert route["cron_interval_minutes"] == 15
     assert route["exchange_account"] == "default"
-    assert route["margin_allocation_pct"] == 10.0
-    assert route["leverage"] == 1.0
+    assert route["margin_allocation_pct"] == 30.0
+    assert route["leverage"] == 5.0
+    assert route["manual_sizing_enabled"] is False
     assert route["active_bundle_id"] == stored_bundle["bundle_id"]
     assert route["blockers"] == ["route_disabled", "data_not_warmed", "route_not_manually_armed"]
     enabled_route = repository.update_deployment_route_gate(
