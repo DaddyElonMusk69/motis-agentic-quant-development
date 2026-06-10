@@ -74,7 +74,7 @@ def test_okx_cli_adapter_runs_json_command(tmp_path: Path):
 
     assert result["data"] == [{"close": "100"}]
     assert result["argv"] == [
-        "--demo",
+        "--live",
         "--json",
         "market",
         "candles",
@@ -84,6 +84,25 @@ def test_okx_cli_adapter_runs_json_command(tmp_path: Path):
         "--limit",
         "2",
     ]
+
+
+def test_okx_cli_adapter_allows_explicit_demo_market_mode(tmp_path: Path):
+    cli = tmp_path / "okx"
+    cli.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json",
+                "print(json.dumps({'argv': __import__('sys').argv[1:], 'data': []}))",
+            ]
+        )
+    )
+    cli.chmod(0o755)
+    adapter = OKXAdapter(config={"backend": "okx_cli", "cli_path": str(cli), "mode": "demo", "market_mode": "demo"})
+
+    result = adapter.market_candles("BTC-USDT-SWAP", bar="5m", limit=2)
+
+    assert result["argv"][:4] == ["--demo", "--json", "market", "candles"]
 
 
 def test_okx_cli_adapter_wraps_market_candle_array_output(tmp_path: Path):

@@ -166,18 +166,23 @@ def test_fill_raw_candle_dataset_rebuilds_matching_derived_candle_datasets(tmp_p
             "end_ts": "2026-06-01T00:00:00Z",
         }
     ]
-    assert read_candles(derived_month_path) == [
-        {
-            "timestamp": "2026-06-01T00:00:00Z",
-            "open": 100.0,
-            "high": 106.0,
-            "low": 99.0,
-            "close": 104.0,
-            "volume": 21.25,
-        }
-    ]
+    rebuilt_row = read_candles(derived_month_path)[0]
+    assert {
+        key: rebuilt_row[key]
+        for key in ("timestamp", "open", "high", "low", "close", "volume")
+    } == {
+        "timestamp": "2026-06-01T00:00:00Z",
+        "open": 100.0,
+        "high": 106.0,
+        "low": 99.0,
+        "close": 104.0,
+        "volume": 21.25,
+    }
+    assert rebuilt_row["ema_676"] == 104.0
+    assert rebuilt_row["ema_warmup_count_676"] == 1
     assert repository.updated_registrations[-1]["dataset_id"] == "btc-derived-10m"
-    assert repository.updated_registrations[-1]["quality_status"] == "rebuilt"
+    assert repository.updated_registrations[-1]["quality_status"] == "ema_enriched"
+    assert repository.updated_registrations[-1]["schema_descriptor"]["ema"]["periods"] == [36, 43, 144, 169, 576, 676]
 
 
 def test_fill_raw_candle_dataset_pages_back_from_latest_until_gap_is_covered(tmp_path: Path):

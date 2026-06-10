@@ -215,18 +215,10 @@ def validate_execution_bundle_contract(bundle: dict[str, Any]) -> list[str]:
         and setup.get("max_hold_hours") in (None, "")
     ):
         raise ContractValidationError("execution setup missing hard_exit_after_hours")
-    final_tp = _first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct")
-    initial_sl = _first_present(setup, "initial_sl_pct", "sl_pct")
-    if final_tp in (None, ""):
-        raise ContractValidationError("execution setup missing final_tp_pct")
-    if initial_sl in (None, ""):
-        raise ContractValidationError("execution setup missing initial_sl_pct")
-    protection_enabled = _truthy(setup.get("protection_enabled"))
-    if protection_enabled:
-        if setup.get("protect_trigger_pct") in (None, ""):
-            raise ContractValidationError("protected execution setup missing protect_trigger_pct")
-        if setup.get("trail_sl_pct") in (None, ""):
-            raise ContractValidationError("protected execution setup missing trail_sl_pct")
+    if setup.get("policy_mode") == "side_specific":
+        _validate_side_specific_execution_setup(setup)
+    else:
+        _validate_exit_policy_fields(setup, label="execution setup")
     pyramid = setup.get("pyramid")
     if pyramid is not None:
         if not isinstance(pyramid, dict):
@@ -240,6 +232,36 @@ def validate_execution_bundle_contract(bundle: dict[str, Any]) -> list[str]:
 
 def validate_execution_bundle(path_or_bundle_id: str | Path) -> list[str]:
     return validate_execution_bundle_contract(_load_execution_bundle_mapping(path_or_bundle_id))
+
+
+def _validate_side_specific_execution_setup(setup: dict[str, Any]) -> None:
+    side_policies = setup.get("side_policies")
+    if not isinstance(side_policies, dict):
+        raise ContractValidationError("side-specific execution setup missing side_policies")
+    for side in ("LONG", "SHORT"):
+        policy = side_policies.get(side)
+        if not isinstance(policy, dict):
+            raise ContractValidationError(f"{side} execution setup missing side policy")
+        _validate_exit_policy_fields(policy, label=f"{side} execution setup")
+
+
+def _validate_exit_policy_fields(setup: dict[str, Any], *, label: str) -> None:
+    final_tp = _first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct")
+    initial_sl = _first_present(setup, "initial_sl_pct", "sl_pct")
+    if final_tp in (None, ""):
+        raise ContractValidationError(f"{label} missing final_tp_pct")
+    if initial_sl in (None, ""):
+        raise ContractValidationError(f"{label} missing initial_sl_pct")
+    protection_enabled = _truthy(setup.get("protection_enabled"))
+    if protection_enabled:
+        if setup.get("protect_trigger_pct") in (None, ""):
+            raise ContractValidationError(f"protected {label} missing protect_trigger_pct")
+        if setup.get("trail_sl_pct") in (None, ""):
+            raise ContractValidationError(f"protected {label} missing trail_sl_pct")
+        if _numeric(setup.get("protect_trigger_pct")) <= 0:
+            raise ContractValidationError(f"protected {label} requires positive protect_trigger_pct")
+        if _numeric(setup.get("trail_sl_pct")) <= 0:
+            raise ContractValidationError(f"protected {label} requires positive trail_sl_pct")
 
 
 def _validate_required_data(required_data: list[dict[str, Any]]) -> None:
@@ -380,3 +402,10 @@ def _first_present(value: dict[str, Any], *keys: str) -> Any:
 
 def _truthy(value: Any) -> bool:
     return value is True or str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _numeric(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

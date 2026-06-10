@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Stage 0a: Calibrate the significance threshold for natural direction.
+"""Stage 0a: Calibrate the meaningful-move threshold for natural direction.
 
-Scans a range of thresholds (e.g., 0.2% to 2.0%) and measures:
+Scans a range of thresholds (e.g., 0.2% to 3.0%) and measures:
   - Direction split: LONG/SHORT ratio. Near 50/50 = random assignment.
   - Reversal rate: % of signals that reverse past threshold in opposite direction.
-  - Travel adequacy: P25 of first_move_pct at this threshold.
+  - Clean resolution: % of signals that resolve without later crossing the opposite boundary.
+  - Time to resolution.
 
-The stable range is where reversal < 15% AND travel P25 >= 1.0%.
+The selected threshold is the first meaningful move boundary. It is not a
+risk/SL model; downstream stages derive stop and exit policy separately.
 """
 
 import csv
 import json
 import sys
 import argparse
+import statistics
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -159,6 +162,7 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
     if first_hit_idx is None:
         return {"natural_direction": None, "first_move_pct": 0, "reversed": False,
                 "status": "index_error"}
+    resolution_minutes = int((candles[first_hit_idx]["ts"] - signal_ts).total_seconds() // 60)
 
     # Now compute first_move_pct: how far in natural direction before reversing
     # past threshold the other way
@@ -195,6 +199,7 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
         "natural_direction": natural_direction,
         "first_move_pct": round(first_move_pct, 4),
         "reversed": reversed_,
+        "resolution_minutes": resolution_minutes,
         "status": "ok"
     }
 
@@ -212,17 +217,168 @@ def percentiles(values: list, *pcts) -> dict:
     return result
 
 
-def main():
+def _normalized(value: float, values: list[float], *, higher_is_better: bool = True) -> float:
+    low = min(values)
+    high = max(values)
+    if high == low:
+        return 1.0
+    normalized = (value - low) / (high - low)
+    if not higher_is_better:
+        normalized = 1.0 - normalized
+    return round(normalized, 6)
+
+
+def _clean_resolution_rate(row: dict) -> float:
+    total_signals = float(row.get("total_signals") or 0)
+    if total_signals <= 0:
+        total_signals = float(row.get("total_valid", 0)) + float(row.get("no_trigger", 0))
+    if total_signals <= 0:
+        return 0.0
+    clean_count = float(row.get("clean_resolution_count", row.get("total_valid", 0) - row.get("reversed_count", 0)))
+    return clean_count / total_signals
+
+
+def _snapback_rate(row: dict) -> float:
+    if "snapback_rate" in row:
+        return float(row["snapback_rate"])
+    if row.get("reversal_rate_pct") is not None:
+        return float(row["reversal_rate_pct"]) / 100.0
+    total_valid = float(row.get("total_valid", 0))
+    if total_valid <= 0:
+        return 0.0
+    return float(row.get("reversed_count", 0)) / total_valid
+
+
+def rank_adaptive_threshold_rows(rows: list[dict]) -> list[dict]:
+    clean_values = [_clean_resolution_rate(row) for row in rows]
+    snapback_values = [_snapback_rate(row) for row in rows]
+    time_values = [
+        float(row["median_resolution_minutes"] if row.get("median_resolution_minutes") is not None else 10**9)
+        for row in rows
+    ]
+    annotated = []
+    for row in rows:
+        clean_rate = _clean_resolution_rate(row)
+        snapback_rate = _snapback_rate(row)
+        median_resolution = float(row["median_resolution_minutes"] if row.get("median_resolution_minutes") is not None else 10**9)
+        clean_component = _normalized(clean_rate, clean_values)
+        snapback_component = _normalized(snapback_rate, snapback_values, higher_is_better=False)
+        time_component = _normalized(median_resolution, time_values, higher_is_better=False)
+        adaptive_score = round(
+            clean_component * 0.50
+            + snapback_component * 0.35
+            + time_component * 0.15,
+            6,
+        )
+        annotated.append({
+            **row,
+            "clean_resolution_rate": round(clean_rate, 6),
+            "snapback_rate": round(snapback_rate, 6),
+            "adaptive_score": adaptive_score,
+            "score_components": {
+                "clean_resolution": clean_component,
+                "snapback": snapback_component,
+                "time_to_resolution": time_component,
+            },
+            "score_weights": {
+                "clean_resolution": 0.50,
+                "snapback": 0.35,
+                "time_to_resolution": 0.15,
+            },
+        })
+
+    ranked = sorted(
+        annotated,
+        key=lambda row: (
+            -float(row["adaptive_score"]),
+            float(row["snapback_rate"]),
+            float(row["median_resolution_minutes"] if row.get("median_resolution_minutes") is not None else 10**9),
+            float(row["threshold_pct"]),
+        ),
+    )
+    if not ranked:
+        return []
+    stable_floor = float(ranked[0]["adaptive_score"]) * 0.95
+    return [
+        {
+            **row,
+            "stable_band_member": float(row["adaptive_score"]) >= stable_floor,
+            "stable_band_score_floor": round(stable_floor, 6),
+        }
+        for row in ranked
+    ]
+
+
+def select_snapback_knee_threshold(rows: list[dict]) -> float:
+    stable_rows = sorted(
+        [row for row in rows if row.get("stable_band_member")],
+        key=lambda row: float(row["threshold_pct"]),
+    )
+    if len(stable_rows) < 2:
+        return float((stable_rows or rows)[0]["threshold_pct"])
+    start_snapback = float(stable_rows[0]["snapback_rate"])
+    end_snapback = float(stable_rows[-1]["snapback_rate"])
+    total_improvement = start_snapback - end_snapback
+    if total_improvement <= 0:
+        return float(max(stable_rows, key=lambda row: float(row["adaptive_score"]))["threshold_pct"])
+    target_snapback = start_snapback - (total_improvement * 0.5)
+    for row in stable_rows:
+        if float(row["snapback_rate"]) <= target_snapback:
+            return float(row["threshold_pct"])
+    return float(stable_rows[-1]["threshold_pct"])
+
+
+def select_adaptive_meaningful_move_threshold(rows: list[dict]) -> dict:
+    ranked = rank_adaptive_threshold_rows(rows)
+    if not ranked:
+        raise ValueError("cannot select threshold from empty scan results")
+    chosen = select_snapback_knee_threshold(ranked)
+    stable_members = [row for row in ranked if row["stable_band_member"]]
+    stable_thresholds = [float(row["threshold_pct"]) for row in stable_members]
+    ordered = sorted(
+        [
+            {
+                **row,
+                "selection_method": "adaptive_snapback_knee"
+                if float(row["threshold_pct"]) == chosen
+                else "adaptive_score_rank",
+            }
+            for row in ranked
+        ],
+        key=lambda row: (
+            0 if float(row["threshold_pct"]) == chosen else 1,
+            -float(row["adaptive_score"]),
+            float(row["snapback_rate"]),
+            float(row["threshold_pct"]),
+        ),
+    )
+    return {
+        "chosen_threshold_pct": chosen,
+        "stable_range": [
+            min(stable_thresholds) if stable_thresholds else chosen,
+            max(stable_thresholds) if stable_thresholds else chosen,
+        ],
+        "selection_method": "adaptive_snapback_knee",
+        "ranked_thresholds": ordered,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stage 0a: significance threshold calibration")
     parser.add_argument("signal_dir", help="Directory of signal JSON files")
     parser.add_argument("--candles", required=True, help="Path to 5m candles CSV")
     parser.add_argument("--forward-hours", type=int, default=36)
     parser.add_argument("--threshold-range", nargs=3, type=float,
-                        default=[0.2, 2.0, 0.1],
+                        default=[0.2, 3.0, 0.1],
                         help="Start, end, step for threshold scan (pct)")
     parser.add_argument("--out", required=True, help="Canonical output JSON path")
     parser.add_argument("--asset", default="UNKNOWN")
     parser.add_argument("--vote-threshold", type=int, default=0)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     threshold_start, threshold_end, threshold_step = args.threshold_range
@@ -294,6 +450,7 @@ def main():
         reversed_count = 0
         no_trigger = 0
         travel_pcts = []
+        resolution_minutes = []
 
         for sd in signal_data:
             r = analyze_signal(candles, sd["signal_ts"], sd["ref_price"],
@@ -314,6 +471,8 @@ def main():
             if r["reversed"]:
                 reversed_count += 1
             travel_pcts.append(r["first_move_pct"])
+            if r.get("resolution_minutes") is not None:
+                resolution_minutes.append(int(r["resolution_minutes"]))
 
         total_valid = longs + shorts
         if total_valid == 0:
@@ -323,6 +482,7 @@ def main():
         rev_pct = reversed_count / total_valid * 100 if total_valid > 0 else 0
         no_trig_pct = no_trigger / len(signal_data) * 100
         pcts = percentiles(travel_pcts, 25, 50, 75)
+        median_resolution_minutes = int(statistics.median(resolution_minutes)) if resolution_minutes else None
 
         travel_p25 = pcts.get("p25", 0)
         travel_p50 = pcts.get("p50", 0)
@@ -347,12 +507,17 @@ def main():
 
         results.append({
             "threshold_pct": threshold,
+            "total_signals": len(signal_data),
             "long_count": longs,
             "short_count": shorts,
             "total_valid": total_valid,
             "no_trigger": no_trigger,
             "no_trigger_pct": round(no_trig_pct, 1),
+            "reversed_count": reversed_count,
             "reversal_rate_pct": round(rev_pct, 1),
+            "clean_resolution_count": total_valid - reversed_count,
+            "clean_resolution_rate": round((total_valid - reversed_count) / len(signal_data), 6),
+            "median_resolution_minutes": median_resolution_minutes,
             "travel_p25": round(travel_p25, 2),
             "travel_p50": round(travel_p50, 2),
             "reversal_ok": rev_pct < 15,
@@ -360,37 +525,24 @@ def main():
             "split_ok": not (35 <= (longs / total_valid * 100) <= 65 if total_valid > 0 else True),
         })
 
-    # ── Find stable range ────────────────────────────────────────────
+    # ── Select meaningful-move threshold ─────────────────────────────
     print(f"\n{'='*70}")
-    print(f"STABLE RANGE ANALYSIS")
+    print(f"MEANINGFUL-MOVE THRESHOLD SELECTION")
     print(f"{'='*70}")
 
-    stable = [r for r in results if r["reversal_ok"] and r["travel_ok"]]
-    if stable:
-        print(f"\nThresholds passing both reversal < 15% AND travel P25 >= 1.0%:")
-        for r in stable:
-            split_val = r["long_count"] / r["total_valid"] * 100 if r["total_valid"] > 0 else 0
-            print(f"  {r['threshold_pct']:.1f}%  rev={r['reversal_rate_pct']:.1f}%  "
-                  f"travel_p25={r['travel_p25']:.2f}%  split={split_val:.0f}/{100-split_val:.0f}")
-
-        if len(stable) >= 1:
-            mid = stable[len(stable) // 2]
-            chosen = mid["threshold_pct"]
-            low = stable[0]["threshold_pct"]
-            high = stable[-1]["threshold_pct"]
-            print(f"\n  Stable range: {low:.1f}% – {high:.1f}%")
-            print(f"  Chosen threshold (midpoint): {chosen:.1f}%")
-        else:
-            chosen = stable[0]["threshold_pct"]
-            print(f"\n  Only one stable threshold: {chosen:.1f}%")
-    else:
-        print("\nNo threshold passes both criteria!")
-        # Find the best compromise
-        best = min(results, key=lambda r: (r["reversal_rate_pct"] if not r["reversal_ok"] else 0)
-                                          + (abs(1.0 - r["travel_p25"]) * 10 if not r["travel_ok"] else 0))
-        chosen = best["threshold_pct"]
-        print(f"  Best compromise: {chosen:.1f}% (rev={best['reversal_rate_pct']:.1f}%, "
-              f"travel_p25={best['travel_p25']:.2f}%)")
+    selection = select_adaptive_meaningful_move_threshold(results)
+    chosen = selection["chosen_threshold_pct"]
+    low, high = selection["stable_range"]
+    print("\nAdaptive meaningful-move top thresholds:")
+    for r in selection["ranked_thresholds"][:5]:
+        print(
+            f"  {r['threshold_pct']:.1f}%  score={r['adaptive_score']:.6f}  "
+            f"clean={r['clean_resolution_rate'] * 100:.1f}%  "
+            f"snapback={r['snapback_rate'] * 100:.1f}%  "
+            f"median_resolution={r['median_resolution_minutes']}m"
+        )
+    print(f"\n  Stable range: {low:.1f}% – {high:.1f}%")
+    print(f"  Chosen threshold ({selection['selection_method']}): {chosen:.1f}%")
 
     # ── Save ──────────────────────────────────────────────────────────
     out_path = args.out
@@ -401,8 +553,12 @@ def main():
         "total_signals": len(signal_data),
         "forward_hours": forward_hours,
         "threshold_range": [threshold_start, threshold_end, threshold_step],
-        "stable_range": [low if stable else chosen, high if stable else chosen],
+        "stable_range": [low, high],
         "chosen_threshold_pct": chosen,
+        "threshold_semantics": "first_meaningful_move",
+        "selection_method": selection["selection_method"],
+        "adaptive_stable_range": selection["stable_range"],
+        "adaptive_top_thresholds": selection["ranked_thresholds"][:5],
         "scan_results": results,
     }
 

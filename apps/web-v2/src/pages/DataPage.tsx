@@ -1,9 +1,12 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Database, RefreshCw, Search, UploadCloud } from "lucide-react";
 import {
   fetchDatasetCandles,
+  fetchJob,
   fetchMarketDataCatalog,
+  isJobResponse,
+  refreshMarketDataEma,
   refreshMarketDataDataset,
   type CatalogResponse,
   type Dataset,
@@ -17,12 +20,17 @@ import { FieldRow } from "../components/FieldRow";
 import { SplitPane } from "../components/SplitPane";
 import { StatusBadge } from "../components/StatusBadge";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorkerRuntimeNotice } from "../components/WorkerRuntimeNotice";
 
 type DatasetTypeOption = {
   dataType: string;
   label: string;
   count: number;
 };
+
+type RefreshRequest =
+  | { kind: "candles"; datasetId: string }
+  | { kind: "ema"; asset: string };
 
 function getSelectedAsset(catalog: CatalogResponse | undefined, searchParams: URLSearchParams): string {
   const requested = searchParams.get("asset");
@@ -49,13 +57,18 @@ function getDataTypeOptions(catalog: CatalogResponse | undefined, selectedAsset:
   for (const dataset of datasets) {
     counts.set(dataset.data_type, (counts.get(dataset.data_type) ?? 0) + 1);
   }
-  return Array.from(counts.entries())
+  const options = Array.from(counts.entries())
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([dataType, count]) => ({
       dataType,
       label: dataType === "candles" ? "Candle data" : titleize(dataType),
       count
     }));
+  const derivedCandles = datasets.filter((dataset) => dataset.data_type === "candles" && dataset.data_origin === "derived");
+  if (derivedCandles.length) {
+    options.push({ dataType: "ema", label: "EMA", count: derivedCandles.length });
+  }
+  return options;
 }
 
 function getSelectedDataType(catalog: CatalogResponse | undefined, selectedAsset: string, searchParams: URLSearchParams): string {
@@ -90,22 +103,32 @@ function updateDataUrl(next: { asset?: string; dataset?: string; dataType?: stri
 
 function datasetsForType(catalog: CatalogResponse | undefined, selectedAsset: string, dataType: string): Dataset[] {
   const datasets = catalog?.assets.find((asset) => asset.asset === selectedAsset)?.datasets ?? [];
+  if (dataType === "ema") {
+    return datasets.filter((dataset) => dataset.data_type === "candles" && dataset.data_origin === "derived");
+  }
   return datasets.filter((dataset) => dataset.data_type === dataType);
 }
 
-function getPrimaryDatasetForType(datasets: Dataset[]): Dataset | undefined {
+function getPrimaryDatasetForType(datasets: Dataset[], dataType?: string): Dataset | undefined {
+  if (dataType === "ema") {
+    return datasets.find((dataset) => dataset.timeframe === "2h") ?? datasets[0];
+  }
   return datasets.find((dataset) => dataset.data_origin === "raw") ?? datasets[0];
 }
 
-function getRefreshTargetForType(datasets: Dataset[], dataType: string): Dataset | undefined {
+function getRefreshTargetForType(datasets: Dataset[], dataType: string, selectedAsset: string): RefreshRequest | undefined {
+  if (dataType === "ema" && datasets.length) {
+    return { kind: "ema", asset: selectedAsset };
+  }
   if (dataType !== "candles") {
     return undefined;
   }
-  return datasets.find((dataset) => dataset.data_origin === "raw" && dataset.timeframe === "5m") ?? datasets.find((dataset) => dataset.data_origin === "raw");
+  const dataset = datasets.find((item) => item.data_origin === "raw" && item.timeframe === "5m") ?? datasets.find((item) => item.data_origin === "raw");
+  return dataset ? { kind: "candles", datasetId: dataset.dataset_id } : undefined;
 }
 
 function datasetStatusTone(dataset: Dataset): "pass" | "warn" | "info" | "idle" {
-  if (dataset.quality_status === "updated" || dataset.quality_status === "ingested" || dataset.quality_status === "rebuilt") {
+  if (dataset.quality_status === "updated" || dataset.quality_status === "ingested" || dataset.quality_status === "rebuilt" || dataset.quality_status === "ema_enriched") {
     return "pass";
   }
   if (dataset.quality_status === "blocked" || dataset.quality_status === "failed") {
@@ -124,6 +147,12 @@ function refreshResultText(result: RefreshPlan | undefined): string {
   if (result.status === "filled") {
     return `Added ${formatNumber(result.rows_added ?? 0)} rows, rebuilt ${formatNumber(result.derived_rebuilt?.length ?? 0)} derived datasets.`;
   }
+  if (result.status === "enriched") {
+    return `Enriched ${formatNumber(result.enriched_count ?? result.enriched?.length ?? 0)} EMA datasets.`;
+  }
+  if (result.status === "noop" && result.enriched_count !== undefined) {
+    return "No EMA datasets were updated.";
+  }
   if (result.status === "current") {
     return `Current through ${formatTimestamp(result.end_ts ?? null)}.`;
   }
@@ -136,6 +165,26 @@ function refreshResultText(result: RefreshPlan | undefined): string {
   return result.reason ?? result.status;
 }
 
+function datasetBelongsToCategory(dataset: Dataset, dataType: string): boolean {
+  if (dataType === "ema") {
+    return dataset.data_type === "candles" && dataset.data_origin === "derived";
+  }
+  return dataset.data_type === dataType;
+}
+
+function hasEmaColumns(dataset: Dataset): boolean {
+  const schema = dataset.schema_descriptor ?? {};
+  const ema = schema.ema;
+  return Boolean(ema && typeof ema === "object");
+}
+
+function refreshRequestKey(request: RefreshRequest | undefined): string | undefined {
+  if (!request) {
+    return undefined;
+  }
+  return request.kind === "ema" ? `ema:${request.asset}` : request.datasetId;
+}
+
 function titleize(value: string): string {
   return value
     .split(/[_-]/)
@@ -146,6 +195,7 @@ function titleize(value: string): string {
 
 export function DataPage() {
   const { searchParams } = useAppRouter();
+  const [activeRefreshJobId, setActiveRefreshJobId] = useState<string | null>(null);
   const catalogQuery = useQuery({ queryKey: ["market-data-catalog"], queryFn: fetchMarketDataCatalog });
   const catalog = catalogQuery.data;
   const selectedAsset = getSelectedAsset(catalog, searchParams);
@@ -153,28 +203,57 @@ export function DataPage() {
   const typeOptions = useMemo(() => getDataTypeOptions(catalog, selectedAsset), [catalog, selectedAsset]);
   const visibleDatasets = useMemo(() => datasetsForType(catalog, selectedAsset, selectedDataType), [catalog, selectedAsset, selectedDataType]);
   const requestedDataset = getSelectedDataset(catalog, selectedAsset, searchParams);
-  const selectedDataset = requestedDataset?.asset === selectedAsset && requestedDataset.data_type === selectedDataType ? requestedDataset : getPrimaryDatasetForType(visibleDatasets);
-  const refreshTarget = getRefreshTargetForType(visibleDatasets, selectedDataType);
+  const selectedDataset = requestedDataset?.asset === selectedAsset && datasetBelongsToCategory(requestedDataset, selectedDataType) ? requestedDataset : getPrimaryDatasetForType(visibleDatasets, selectedDataType);
+  const refreshTarget = getRefreshTargetForType(visibleDatasets, selectedDataType, selectedAsset);
+  const refreshTargetKey = refreshRequestKey(refreshTarget);
 
   const candlePreviewQuery = useQuery({
     enabled: Boolean(selectedDataset && selectedDataset.data_type === "candles"),
     queryKey: ["market-data-candles", selectedDataset?.dataset_id],
     queryFn: () => fetchDatasetCandles(selectedDataset!.dataset_id, 25)
   });
+  const refreshJobQuery = useQuery({
+    enabled: Boolean(activeRefreshJobId),
+    queryKey: ["runtime-job", activeRefreshJobId],
+    queryFn: () => fetchJob(activeRefreshJobId!),
+    refetchInterval: (query) => {
+      const job = query.state.data?.job;
+      return !job || ["queued", "running"].includes(job.status) ? 1500 : false;
+    }
+  });
 
   const refreshMutation = useMutation({
-    mutationFn: refreshMarketDataDataset,
+    mutationFn: (request: RefreshRequest) => request.kind === "ema" ? refreshMarketDataEma(request.asset) : refreshMarketDataDataset(request.datasetId),
     onSuccess: (result) => {
+      if (isJobResponse(result)) {
+        setActiveRefreshJobId(result.job.job_id);
+        return;
+      }
       void queryClient.invalidateQueries({ queryKey: ["market-data-catalog"] });
       void queryClient.invalidateQueries({ queryKey: ["market-data-candles", result.dataset_id] });
     }
   });
 
   const canRefreshType = Boolean(refreshTarget);
-  const selectedRefreshResult = refreshMutation.data?.dataset_id === refreshTarget?.dataset_id ? refreshMutation.data : undefined;
-  const selectedRefreshError = refreshMutation.variables === refreshTarget?.dataset_id ? refreshMutation.error : undefined;
+  const refreshResult = isJobResponse(refreshMutation.data) ? undefined : refreshMutation.data;
+  const selectedRefreshResult = refreshResult && (selectedDataType === "ema" ? refreshResult.asset === selectedAsset || refreshResult.status === "enriched" : refreshResult.dataset_id === refreshTargetKey) ? refreshResult : undefined;
+  const selectedRefreshError = refreshRequestKey(refreshMutation.variables) === refreshTargetKey ? refreshMutation.error : undefined;
   const selectedTypeLabel = typeOptions.find((option) => option.dataType === selectedDataType)?.label ?? titleize(selectedDataType || "data");
-  const isRefreshingType = refreshMutation.isPending && refreshMutation.variables === refreshTarget?.dataset_id;
+  const refreshJob = refreshJobQuery.data?.job ?? null;
+  const refreshJobRunning = Boolean(refreshJob && ["queued", "running"].includes(refreshJob.status));
+  const isRefreshingType = (refreshMutation.isPending && refreshRequestKey(refreshMutation.variables) === refreshTargetKey) || refreshJobRunning;
+
+  useEffect(() => {
+    if (!refreshJob || ["queued", "running"].includes(refreshJob.status)) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: ["market-data-catalog"] });
+    if (selectedDataset?.dataset_id) {
+      void queryClient.invalidateQueries({ queryKey: ["market-data-candles", selectedDataset.dataset_id] });
+    }
+    const timeout = window.setTimeout(() => setActiveRefreshJobId(null), refreshJob.status === "completed" ? 2500 : 5000);
+    return () => window.clearTimeout(timeout);
+  }, [refreshJob?.status, selectedDataset?.dataset_id]);
 
   return (
     <div className="page page--workspace">
@@ -196,7 +275,7 @@ export function DataPage() {
                   key={asset.asset}
                   onClick={() => {
                     const firstType = getDataTypeOptions(catalog, asset.asset)[0]?.dataType ?? "";
-                    const firstDataset = getPrimaryDatasetForType(datasetsForType(catalog, asset.asset, firstType));
+                    const firstDataset = getPrimaryDatasetForType(datasetsForType(catalog, asset.asset, firstType), firstType);
                     updateDataUrl({ asset: asset.asset, dataType: firstType, dataset: firstDataset?.dataset_id });
                   }}
                   type="button"
@@ -231,7 +310,7 @@ export function DataPage() {
                   className={selectedDataType === option.dataType ? "filter-chip is-active" : "filter-chip"}
                   key={option.dataType}
                   onClick={() => {
-                    const firstDataset = getPrimaryDatasetForType(datasetsForType(catalog, selectedAsset, option.dataType));
+                    const firstDataset = getPrimaryDatasetForType(datasetsForType(catalog, selectedAsset, option.dataType), option.dataType);
                     updateDataUrl({ dataType: option.dataType, dataset: firstDataset?.dataset_id });
                   }}
                   type="button"
@@ -247,9 +326,9 @@ export function DataPage() {
                 selectedDataset ? (
                   <button
                     className="button button--primary"
-                    disabled={!canRefreshType || refreshMutation.isPending}
-                    onClick={() => refreshTarget && refreshMutation.mutate(refreshTarget.dataset_id)}
-                    title={canRefreshType ? `Fill ${selectedTypeLabel.toLowerCase()} to current time` : "Fill is supported for raw candle data only"}
+                    disabled={!canRefreshType || isRefreshingType}
+                    onClick={() => refreshTarget && refreshMutation.mutate(refreshTarget)}
+                    title={canRefreshType ? `Fill ${selectedTypeLabel.toLowerCase()} to current time` : "Fill is supported for candle and EMA data only"}
                     type="button"
                   >
                     <UploadCloud aria-hidden="true" />
@@ -263,16 +342,27 @@ export function DataPage() {
                 <div className="progress-card">
                   <div className="progress-card__header">
                     <strong>Updating {selectedTypeLabel.toLowerCase()}</strong>
-                    <span>OKX download + Parquet persist + derived rebuild</span>
+                    <span>{refreshJob ? `${refreshJob.status} · ${refreshJob.current_step ?? "waiting"}` : selectedDataType === "ema" ? "Derived candle scan + EMA enrichment" : "OKX download + Parquet persist + derived rebuild"}</span>
                   </div>
                   <div className="progress-rail" aria-label="Data fill in progress">
                     <span />
                   </div>
                   <div className="progress-steps">
-                    <span>Fetch raw candles</span>
-                    <span>Persist canonical Parquet</span>
-                    <span>Rebuild derived candles</span>
+                    {selectedDataType === "ema" ? (
+                      <>
+                        <span>Read derived candles</span>
+                        <span>Compute recursive EMA</span>
+                        <span>Persist enriched Parquet</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>Fetch raw candles</span>
+                        <span>Persist canonical Parquet</span>
+                        <span>Rebuild derived candles</span>
+                      </>
+                    )}
                   </div>
+                  <WorkerRuntimeNotice active={isRefreshingType} job={refreshJob} />
                 </div>
               ) : null}
               <DataTable
@@ -283,11 +373,12 @@ export function DataPage() {
                   { key: "start", header: "Start", render: (row) => <span className="mono">{formatTimestamp(row.start_ts)}</span> },
                   { key: "end", header: "End", render: (row) => <span className="mono">{formatTimestamp(row.end_ts)}</span> },
                   { key: "rows", header: "Rows", align: "right", render: (row) => formatNumber(row.row_count) },
+                  ...(selectedDataType === "ema" ? [{ key: "ema", header: "EMA", align: "right" as const, render: (row: Dataset) => <StatusBadge tone={hasEmaColumns(row) ? "pass" : "warn"}>{hasEmaColumns(row) ? "Ready" : "Missing"}</StatusBadge> }] : []),
                   { key: "status", header: "Status", align: "right", render: (row) => <StatusBadge tone={datasetStatusTone(row)}>{row.quality_status}</StatusBadge> }
                 ]}
                 getRowClassName={(row) => (row.dataset_id === selectedDataset?.dataset_id ? "is-selected" : undefined)}
                 getRowKey={(row) => row.dataset_id}
-                onRowClick={(row) => updateDataUrl({ asset: row.asset, dataType: row.data_type, dataset: row.dataset_id })}
+                onRowClick={(row) => updateDataUrl({ asset: row.asset, dataType: selectedDataType, dataset: row.dataset_id })}
                 rows={visibleDatasets}
               />
             </TerminalPanel>
@@ -298,7 +389,7 @@ export function DataPage() {
                   <div className="field-grid">
                     <FieldRow label="Asset" value={selectedDataset.asset} />
                     <FieldRow label="Instrument" value={selectedDataset.instrument} />
-                    <FieldRow label="Type" value={`${selectedDataset.data_type} / ${selectedDataset.data_origin}`} />
+                    <FieldRow label="Type" value={selectedDataType === "ema" ? `ema / ${selectedDataset.data_origin} candles` : `${selectedDataset.data_type} / ${selectedDataset.data_origin}`} />
                     <FieldRow label="Timeframe" value={selectedDataset.timeframe ?? "event"} />
                     <FieldRow label="Start UTC" value={formatTimestamp(selectedDataset.start_ts)} />
                     <FieldRow label="End UTC" value={formatTimestamp(selectedDataset.end_ts)} />
@@ -306,6 +397,7 @@ export function DataPage() {
                     <FieldRow label="Ingestion" value={selectedDataset.ingestion_version} />
                     <FieldRow label="Source of truth" value={selectedDataset.storage_backend === "parquet" ? "Parquet refs" : selectedDataset.storage_backend} />
                     <FieldRow label="Quality" value={selectedDataset.quality_status} />
+                    {selectedDataType === "ema" ? <FieldRow label="EMA columns" value={hasEmaColumns(selectedDataset) ? "Ready" : "Missing"} /> : null}
                   </div>
                 ) : (
                   <div className="state-line">No dataset selected.</div>
@@ -316,7 +408,7 @@ export function DataPage() {
               <TerminalPanel title="Fill Result">
                 <div className="state-card">
                   <Database aria-hidden="true" />
-                  <span>{selectedRefreshError ? selectedRefreshError.message : refreshResultText(selectedRefreshResult)}</span>
+                  <span>{selectedRefreshError ? selectedRefreshError.message : refreshJob ? `${refreshJob.status}: ${refreshJob.current_step ?? refreshJob.job_type}` : refreshResultText(selectedRefreshResult)}</span>
                 </div>
                 {selectedRefreshResult?.derived_rebuilt?.length ? (
                   <div className="derived-list">
@@ -331,7 +423,7 @@ export function DataPage() {
               </TerminalPanel>
             </div>
 
-            <TerminalPanel title="Candle Preview">
+            <TerminalPanel title={selectedDataType === "ema" ? "EMA Preview" : "Candle Preview"}>
               {selectedDataset?.data_type !== "candles" ? <div className="state-line">Preview is available for candle datasets only.</div> : null}
               {candlePreviewQuery.isLoading ? <div className="state-line">Loading candle preview...</div> : null}
               {candlePreviewQuery.error ? <div className="state-line state-line--error">{candlePreviewQuery.error.message}</div> : null}
@@ -343,6 +435,11 @@ export function DataPage() {
                     { key: "high", header: "High", align: "right", render: (row) => formatCompactValue(row.high) },
                     { key: "low", header: "Low", align: "right", render: (row) => formatCompactValue(row.low) },
                     { key: "close", header: "Close", align: "right", render: (row) => formatCompactValue(row.close) },
+                    ...(selectedDataType === "ema" ? [
+                      { key: "ema_36", header: "EMA 36", align: "right" as const, render: (row: Record<string, unknown>) => formatCompactValue(row.ema_36) },
+                      { key: "ema_144", header: "EMA 144", align: "right" as const, render: (row: Record<string, unknown>) => formatCompactValue(row.ema_144) },
+                      { key: "ema_676", header: "EMA 676", align: "right" as const, render: (row: Record<string, unknown>) => formatCompactValue(row.ema_676) }
+                    ] : []),
                     { key: "volume", header: "Volume", align: "right", render: (row) => formatCompactValue(row.volume ?? row.vol) }
                   ]}
                   getRowKey={(row) => String(row.timestamp ?? row.ts ?? JSON.stringify(row))}

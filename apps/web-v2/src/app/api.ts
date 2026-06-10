@@ -12,6 +12,7 @@ export type Dataset = {
   row_count: number | null;
   storage_backend: string;
   storage_uri: string;
+  schema_descriptor?: Record<string, unknown>;
   quality_status: string;
   ingestion_version: string;
 };
@@ -44,8 +45,53 @@ export type RefreshPlan = {
   rows_added?: number;
   row_count?: number;
   derived_rebuilt?: Array<{ dataset_id: string; timeframe: string; row_count: number }>;
+  enriched?: Array<{ dataset_id: string; timeframe: string; row_count: number; ema_columns?: string[] }>;
+  enriched_count?: number;
+  skipped_count?: number;
   reason?: string;
 };
+
+export type RuntimeJob = {
+  job_id: string;
+  job_type: string;
+  scope_key: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+  error: Record<string, unknown>;
+  current_step?: string | null;
+  created_at?: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+};
+
+export type WorkerRuntimeStatus = {
+  status: "online" | "stale" | "offline" | string;
+  online: boolean;
+  active_worker_count: number;
+  stale_worker_count: number;
+  queued_job_count: number;
+  running_job_count: number;
+  stale_after_seconds: number;
+  checked_at: string;
+  workers: Array<{
+    worker_id: string;
+    status: string;
+    current_job_id?: string | null;
+    current_step?: string | null;
+    started_at: string;
+    last_seen_at: string;
+  }>;
+};
+
+export type AsyncJobResponse = {
+  accepted: true;
+  job: RuntimeJob;
+};
+
+export function isJobResponse(value: unknown): value is AsyncJobResponse {
+  return Boolean(value && typeof value === "object" && (value as AsyncJobResponse).accepted === true && (value as AsyncJobResponse).job);
+}
 
 export type CandlePreviewResponse = {
   dataset_id: string;
@@ -338,7 +384,8 @@ export type Stage1IterationDetail = {
 };
 
 export type Stage2CaptureRate = {
-  reached: number;
+  reached?: number;
+  hit?: number;
   total: number;
   rate: number;
 };
@@ -359,32 +406,50 @@ export type Stage2CaptureState = {
   };
   results: Record<string, Record<string, Stage2CaptureRate>>;
   cohorts?: Record<string, Record<string, Stage2CaptureRate>>;
+  sl_results?: Record<string, Record<string, Stage2CaptureRate>>;
+  side_splits?: Record<"LONG" | "SHORT", {
+    count: number;
+    results: Record<string, Record<string, Stage2CaptureRate>>;
+    sl_results: Record<string, Record<string, Stage2CaptureRate>>;
+  }>;
   stage3_input?: {
     tp_range_source?: string;
     recommended_tp_min_pct?: number;
     recommended_tp_max_pct?: number;
+    sl_range_source?: string;
+    recommended_sl_min_pct?: number;
+    recommended_sl_max_pct?: number;
   };
   tp_levels?: number[];
+  sl_levels?: number[];
   total_trade_decisions?: number;
   match_count?: number;
   mismatch_count?: number;
   recommended_tp_min_pct?: number | null;
   recommended_tp_max_pct?: number | null;
+  recommended_sl_min_pct?: number | null;
+  recommended_sl_max_pct?: number | null;
+};
+
+export type Stage2PolicyValues = {
+  lock_profit_pct?: number;
+  initial_sl_pct?: number;
+  protect_trigger_pct?: number;
+  trail_sl_pct?: number;
 };
 
 export type Stage2ExitPolicyState = {
   exists: boolean;
   policy_path?: string | null;
   created_at?: string | null;
-  policy: {
-    lock_profit_pct?: number;
-    protect_trigger_pct?: number;
-    trail_sl_pct?: number;
-  };
+  policy_mode?: "shared" | "side_specific" | string | null;
+  policy: Stage2PolicyValues;
+  side_policies?: Record<"LONG" | "SHORT", Stage2PolicyValues>;
 };
 
 export type Stage3GridSetup = {
   config_id?: string;
+  policy_mode?: "shared" | "side_specific" | string | null;
   tp: number;
   sl: number;
   final_tp_pct?: number;
@@ -412,6 +477,12 @@ export type Stage3GridSetup = {
   net_pnl_pct?: number;
   fees_pct?: number;
   rr_ratio: number;
+  side_policies?: Record<"LONG" | "SHORT", Stage2PolicyValues & {
+    final_tp_pct?: number;
+    initial_sl_multiplier?: number;
+    protection_enabled?: boolean;
+    hard_exit_hours?: number;
+  }>;
   agreement_split?: Record<string, { tp_count: number; sl_count: number; neither: number; total: number }>;
   mismatch_split?: Record<string, { tp_count: number; sl_count: number; neither: number; total: number }>;
 };
@@ -433,8 +504,10 @@ export type Stage3GridState = {
   tp_values?: number[];
   sl_values?: number[];
   fees_bps_per_side?: number | null;
+  policy_mode?: "shared" | "side_specific" | string | null;
   stage0_risk_policy?: {
     initial_sl_pct?: number;
+    stage0_meaningful_move_threshold_pct?: number;
     hard_exit_hours?: number;
   };
   stage2_exit_policy?: Stage2ExitPolicyState | Record<string, unknown>;
@@ -461,6 +534,7 @@ export type Stage3PyramidRecord = {
   sl_pct?: number;
   source_candidate_id?: string;
   source_setup?: {
+    policy_mode?: "shared" | "side_specific" | string | null;
     protection_enabled?: boolean;
     protect_trigger_pct?: number;
     trail_sl_pct?: number;
@@ -468,6 +542,11 @@ export type Stage3PyramidRecord = {
     initial_sl_pct?: number;
     tp_pct?: number;
     sl_pct?: number;
+    side_policies?: Record<"LONG" | "SHORT", Stage2PolicyValues & {
+      final_tp_pct?: number;
+      protection_enabled?: boolean;
+      hard_exit_hours?: number;
+    }>;
   };
   baseline_pnl_pct?: number;
   pnl_pct: number;
@@ -516,14 +595,25 @@ export type Stage4CandidateResult = {
   margin_allocation_pct?: number;
   leverage?: number;
   setup?: {
+    policy_mode?: "shared" | "side_specific" | string | null;
     protection_enabled?: boolean;
     tp_pct?: number;
     sl_pct?: number;
     final_tp_pct?: number;
+    lock_profit_pct?: number;
     initial_sl_pct?: number;
     protect_trigger_pct?: number;
     trail_sl_pct?: number;
     max_hold_hours?: number;
+    hard_exit_hours?: number;
+    side_policies?: Record<"LONG" | "SHORT", Stage2PolicyValues & {
+      final_tp_pct?: number;
+      lock_profit_pct?: number;
+      initial_sl_pct?: number;
+      protection_enabled?: boolean;
+      hard_exit_hours?: number;
+      max_hold_hours?: number;
+    }>;
     pyramid?: {
       step_pct?: number;
       max_legs?: number;
@@ -787,10 +877,24 @@ export function fetchMarketDataCatalog(): Promise<CatalogResponse> {
   return requestJson<CatalogResponse>("/api/v1/market-data/catalog");
 }
 
-export function refreshMarketDataDataset(datasetId: string): Promise<RefreshPlan> {
-  return requestJson<RefreshPlan>(`/api/v1/market-data/${datasetId}/refresh`, {
+export function refreshMarketDataDataset(datasetId: string): Promise<RefreshPlan | AsyncJobResponse> {
+  return requestJson<RefreshPlan | AsyncJobResponse>(`/api/v1/market-data/${datasetId}/refresh`, {
     method: "POST"
   });
+}
+
+export function refreshMarketDataEma(asset: string): Promise<RefreshPlan | AsyncJobResponse> {
+  return requestJson<RefreshPlan | AsyncJobResponse>(`/api/v1/market-data/assets/${asset}/ema/refresh`, {
+    method: "POST"
+  });
+}
+
+export function fetchJob(jobId: string): Promise<{ job: RuntimeJob }> {
+  return requestJson<{ job: RuntimeJob }>(`/api/v1/jobs/${jobId}`);
+}
+
+export function fetchWorkerRuntimeStatus(): Promise<{ worker_runtime: WorkerRuntimeStatus }> {
+  return requestJson<{ worker_runtime: WorkerRuntimeStatus }>("/api/v1/jobs/runtime");
 }
 
 export function fetchDatasetCandles(datasetId: string, limit = 25): Promise<CandlePreviewResponse> {
@@ -826,8 +930,8 @@ export function fetchSignals(signalSetKey: string, limit = 5): Promise<{ signals
   return requestJson<{ signals: SignalRecord[] }>(`/api/v1/signals?${params.toString()}`);
 }
 
-export function extendSignalPoolFromLocalCandles(request: { signal_engine_id: string; asset: string }): Promise<SignalPoolExtendResult> {
-  return requestJson<SignalPoolExtendResult>(`/api/v1/signal-engines/${request.signal_engine_id}/signal-sets/${request.asset}/extend-local`, {
+export function extendSignalPoolFromLocalCandles(request: { signal_engine_id: string; asset: string }): Promise<SignalPoolExtendResult | AsyncJobResponse> {
+  return requestJson<SignalPoolExtendResult | AsyncJobResponse>(`/api/v1/signal-engines/${request.signal_engine_id}/signal-sets/${request.asset}/extend-local`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({})
@@ -877,8 +981,8 @@ export function createStage0UniverseRun(request: {
   });
 }
 
-export function executeStage0CandidateBatch(request: { universe_run_id: string; limit: number }): Promise<Stage0BatchExecutionResponse> {
-  return requestJson<Stage0BatchExecutionResponse>(`/api/v1/research/stage0-universe-runs/${request.universe_run_id}/candidates/execute-batch`, {
+export function executeStage0CandidateBatch(request: { universe_run_id: string; limit: number }): Promise<Stage0BatchExecutionResponse | AsyncJobResponse> {
+  return requestJson<Stage0BatchExecutionResponse | AsyncJobResponse>(`/api/v1/research/stage0-universe-runs/${request.universe_run_id}/candidates/execute-batch`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ limit: request.limit })
@@ -972,9 +1076,9 @@ export function scoreStage1Iteration(request: {
   session_id: string;
   iteration_id: string;
   sample_role?: Stage1SampleRole;
-}): Promise<{ score: Stage1TrainingScore }> {
+}): Promise<{ score: Stage1TrainingScore } | AsyncJobResponse> {
   const endpoint = request.sample_role === "walk_forward_test" ? "score-walk-forward" : "score-training";
-  return requestJson<{ score: Stage1TrainingScore }>(
+  return requestJson<{ score: Stage1TrainingScore } | AsyncJobResponse>(
     `/api/v1/research/stage1-sessions/${request.session_id}/iterations/${request.iteration_id}/${endpoint}`,
     { method: "POST" }
   );
@@ -999,7 +1103,7 @@ export function runStage1CanonicalReadout(request: {
   frozen_strategy_path: string;
   slice_metrics: Record<string, Stage1TrainingScore["metrics"]>;
   match_count: number;
-}; gate: Stage1GateSummary }> {
+}; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${request.session_id}/canonical-stage1a`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1007,44 +1111,45 @@ export function runStage1CanonicalReadout(request: {
   });
 }
 
-export function runStage2CaptureCurve(sessionId: string): Promise<{ stage2_capture: Stage2CaptureState; gate: Stage1GateSummary }> {
+export function runStage2CaptureCurve(sessionId: string): Promise<{ stage2_capture: Stage2CaptureState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage2/capture-curve`, { method: "POST" });
 }
 
 export function promoteStage2ExitPolicy(request: {
   session_id: string;
-  lock_profit_pct: number;
-  protect_trigger_pct: number;
-  trail_sl_pct: number;
+  side_policies: Record<"LONG" | "SHORT", {
+    lock_profit_pct: number;
+    initial_sl_pct: number;
+    protect_trigger_pct: number;
+    trail_sl_pct: number;
+  }>;
 }): Promise<{ stage2_exit_policy: Stage2ExitPolicyState; gate: Stage1GateSummary }> {
   return requestJson(`/api/v1/research/stage1-sessions/${request.session_id}/stage2/exit-policy`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      lock_profit_pct: request.lock_profit_pct,
-      protect_trigger_pct: request.protect_trigger_pct,
-      trail_sl_pct: request.trail_sl_pct
+      side_policies: request.side_policies
     })
   });
 }
 
-export function runStage3GridSearch(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary }> {
+export function runStage3GridSearch(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage3/grid-search`, { method: "POST" });
 }
 
-export function runStage3FixedSl(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary }> {
+export function runStage3FixedSl(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage3/fixed-sl`, { method: "POST" });
 }
 
-export function runStage3ExactProtection(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary }> {
+export function runStage3ExactProtection(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage3/exact-protection`, { method: "POST" });
 }
 
-export function runStage3LocalVariants(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary }> {
+export function runStage3LocalVariants(sessionId: string): Promise<{ stage3_grid: Stage3GridState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage3/local-variants`, { method: "POST" });
 }
 
-export function runStage3Pyramid(sessionId: string): Promise<{ stage3_pyramid: Stage3PyramidState; gate: Stage1GateSummary }> {
+export function runStage3Pyramid(sessionId: string): Promise<{ stage3_pyramid: Stage3PyramidState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage3/pyramid`, { method: "POST" });
 }
 
@@ -1055,7 +1160,7 @@ export type Stage4RealizedExpectancyRequest = {
   leverage: number;
 };
 
-export function runStage4RealizedExpectancy(request: Stage4RealizedExpectancyRequest): Promise<{ stage4_realized_expectancy: Stage4RealizedExpectancyState; gate: Stage1GateSummary }> {
+export function runStage4RealizedExpectancy(request: Stage4RealizedExpectancyRequest): Promise<{ stage4_realized_expectancy: Stage4RealizedExpectancyState; gate: Stage1GateSummary } | AsyncJobResponse> {
   return requestJson(`/api/v1/research/stage1-sessions/${request.session_id}/stage4/realized-expectancy`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

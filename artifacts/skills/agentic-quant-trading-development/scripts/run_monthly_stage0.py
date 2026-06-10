@@ -61,7 +61,7 @@ class Candidate:
     vote_threshold: int = 2
     window_minutes: int = 120
     forward_hours: int = 36
-    threshold_range: tuple[float, float, float] = (0.2, 2.0, 0.1)
+    threshold_range: tuple[float, float, float] = (0.2, 3.0, 0.1)
     scanner_args: dict[str, Any] | None = None
 
     @property
@@ -197,7 +197,7 @@ def load_candidates(path: Path, windows: Windows) -> list[Candidate]:
             signal_engine_id = str(raw["signal_engine_id"])
         except KeyError as exc:
             raise MonthlyStage0Error(f"candidate {index} missing required field: {exc.args[0]}") from exc
-        threshold_range = raw.get("threshold_range", [0.2, 2.0, 0.1])
+        threshold_range = raw.get("threshold_range", [0.2, 3.0, 0.1])
         if not (isinstance(threshold_range, list) and len(threshold_range) == 3):
             raise MonthlyStage0Error(f"candidate {index} threshold_range must be [start, end, step]")
         candidates.append(

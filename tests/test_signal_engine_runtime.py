@@ -17,12 +17,15 @@ from quant_terminal_sdk.engine_contracts import (
     validate_signal_packet,
     validate_strategy_module,
 )
+from quant_terminal_sdk.market_data_reader import MarketDataReader
 from quant_terminal_worker.execution.live_signal_scan import scan_latest_live_signal
 from quant_terminal_worker.execution.wake_runner import run_route_wake
 from quant_terminal_worker.ingestion.legacy_signals import build_signal_set_key
 from quant_terminal_worker.ingestion.signal_pool_extension import extend_signal_pool_from_local_candles
 from quant_terminal_worker.signal_engines import vegas_ema
-from quant_terminal_worker.signal_engines.runtime import resolve_signal_engine
+from quant_terminal_worker.signal_engines.vegas_ema_recursive import recursive_ema_update
+from quant_terminal_worker.signal_engines.vegas_ema_recursive import generate_training_signals as generate_recursive_training_signals
+from quant_terminal_worker.signal_engines.runtime import EngineTrainingContext, resolve_signal_engine
 
 
 def test_resolve_signal_engine_prefers_canonical_db_spec(tmp_path: Path):
@@ -220,6 +223,193 @@ def test_bollinger_live_scan_scans_latest_parquet_candle_only(tmp_path: Path):
     assert signal["payload"]["evidence"]["active_timeframes"] == ["4h"]
 
 
+def test_recursive_vegas_registry_entry_is_contract_compliant():
+    validate_signal_engine_spec("vegas_ema_recursive")
+    validate_strategy_module("packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py")
+
+
+def test_recursive_vegas_updates_completed_ema_with_active_candle():
+    value = recursive_ema_update("100", 3, "110")
+
+    assert value == 105
+
+
+def test_recursive_vegas_training_dispatch_uses_enriched_ema_rows(tmp_path: Path):
+    root, repository = _workspace_with_recursive_vegas_pool(tmp_path)
+    _register_recursive_vegas_refs(repository, root=root, asset="AAVE")
+
+    result = extend_signal_pool_from_local_candles(
+        workspace_root=root,
+        repository=repository,
+        signal_engine_id="vegas_ema_recursive",
+        asset="AAVE",
+        target_end="2026-06-01T00:05:00Z",
+    )
+
+    assert result["status"] == "extended"
+    signals = repository.list_signals(signal_set_key=build_signal_set_key("vegas_ema_recursive", "AAVE", "AAVE-vegas_ema_recursive-canonical"))
+    packet = signals[0]["payload"]
+    validate_signal_packet(packet)
+    assert packet["evidence"]["ema_mode"] == "recursive_precomputed_completed_htf_plus_active_candle"
+    assert packet["interactions"][0]["timeframe"] == "2h"
+    assert "charts" in packet
+    assert "direction" not in packet
+    assert "direction" not in packet["evidence"]
+
+
+def test_recursive_vegas_live_scan_preserves_training_packet_shape(tmp_path: Path):
+    root, repository = _workspace_with_recursive_vegas_pool(tmp_path)
+    _register_recursive_vegas_refs(repository, root=root, asset="AAVE")
+    route = {
+        **_route(root),
+        "route_id": "aave-live",
+        "signal_engine_id": "vegas_ema_recursive",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "active_bundle": {
+            "execution_setup": {
+                "engine_parameters": {
+                    "timeframes": ["2h"],
+                    "context_bars": 1,
+                    "vote_threshold": 1,
+                    "proximity_threshold": "0.01",
+                }
+            }
+        },
+    }
+
+    signal = scan_latest_live_signal(route=route, repository=repository, workspace_root=root)
+
+    assert signal is not None
+    assert signal["signal_engine_id"] == "vegas_ema_recursive"
+    assert signal["payload"]["evidence"]["pattern"] == "vegas_ema_tunnel_proximity"
+    assert signal["payload"]["interactions"][0]["timeframe"] == "2h"
+    assert "charts" in signal["payload"]
+
+
+def test_recursive_vegas_training_can_stream_packets_in_chunks(tmp_path: Path):
+    root, repository = _workspace_with_recursive_vegas_pool(tmp_path)
+    _register_recursive_vegas_refs(repository, root=root, asset="AAVE")
+    reader = MarketDataReader(repository=repository, workspace_root=root)
+    streamed_chunks = []
+
+    output = generate_recursive_training_signals(
+        EngineTrainingContext(
+            asset="AAVE",
+            instrument="AAVE-USDT-SWAP",
+            signal_set=repository.get_signal_set(build_signal_set_key("vegas_ema_recursive", "AAVE", "AAVE-vegas_ema_recursive-canonical")),
+            signal_set_key=build_signal_set_key("vegas_ema_recursive", "AAVE", "AAVE-vegas_ema_recursive-canonical"),
+            parameters={"timeframes": ["2h"], "context_bars": 1, "vote_threshold": 1, "proximity_threshold": "0.01"},
+            market_data_reader=reader,
+            spec=resolve_signal_engine("vegas_ema_recursive", repository=repository, workspace_root=root).spec,
+            workspace_root=root,
+            repository=repository,
+            start=datetime.fromisoformat("2026-06-01T00:00:00+00:00"),
+            end=datetime.fromisoformat("2026-06-01T00:05:00+00:00"),
+            raw_candle_end=datetime.fromisoformat("2026-06-01T00:05:00+00:00"),
+            packet_sink=lambda packets: streamed_chunks.append(list(packets)),
+            packet_chunk_size=1,
+        )
+    )
+
+    assert output.result.generated_packet_count == 1
+    assert output.packets == []
+    assert len(streamed_chunks) == 1
+
+
+def test_5m_cluster_vegas_registry_entry_is_contract_compliant():
+    validate_signal_engine_spec("vegas_ema_5m_cluster")
+    resolved = resolve_signal_engine("vegas_ema_5m_cluster", repository=_repository(), workspace_root=Path.cwd())
+    assert resolved.spec.code_ref["base_strategy_path"] == "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_5m_hft_base.py"
+    validate_strategy_module(resolved.spec.code_ref["base_strategy_path"])
+
+
+def test_5m_cluster_vegas_training_dispatch_uses_derived_5m_ema_rows(tmp_path: Path):
+    root, repository = _workspace_with_5m_cluster_pool(tmp_path)
+    _register_5m_cluster_refs(repository, root=root, asset="AAVE")
+
+    result = extend_signal_pool_from_local_candles(
+        workspace_root=root,
+        repository=repository,
+        signal_engine_id="vegas_ema_5m_cluster",
+        asset="AAVE",
+        target_end="2026-06-01T00:05:00Z",
+    )
+
+    assert result["status"] == "extended"
+    signals = repository.list_signals(signal_set_key=build_signal_set_key("vegas_ema_5m_cluster", "AAVE", "AAVE-vegas_ema_5m_cluster-canonical"))
+    packet = signals[0]["payload"]
+    validate_signal_packet(packet)
+    assert packet["evidence"]["pattern"] == "vegas_ema_5m_cluster_proximity"
+    assert packet["evidence"]["ema_mode"] == "precomputed_5m_ema_cluster"
+    assert packet["evidence"]["vote_threshold"] == 3
+    assert packet["evidence"]["matched_ema_count"] == 3
+    assert packet["evidence"]["matched_periods"] == [36, 43, 144]
+    assert packet["evidence"]["trigger_timeframe"] == "5m"
+    assert packet["evidence"]["context_timeframes"] == ["2h", "1d"]
+    assert packet["active_timeframes"] == ["5m"]
+    assert set(packet["charts"]) == {"5m", "2h", "1d"}
+    assert packet["charts"]["5m"]["role"] == "trigger"
+    assert packet["charts"]["2h"]["role"] == "context"
+    assert packet["charts"]["1d"]["role"] == "context"
+    assert "direction" not in packet
+    assert "direction" not in packet["evidence"]
+
+
+def test_5m_cluster_vegas_live_scan_reads_latest_derived_5m_row(tmp_path: Path):
+    root, repository = _workspace_with_5m_cluster_pool(tmp_path)
+    _register_5m_cluster_refs(repository, root=root, asset="AAVE")
+    route = {
+        **_route(root),
+        "route_id": "aave-live",
+        "signal_engine_id": "vegas_ema_5m_cluster",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+    }
+
+    signal = scan_latest_live_signal(route=route, repository=repository, workspace_root=root)
+
+    assert signal is not None
+    assert signal["signal_engine_id"] == "vegas_ema_5m_cluster"
+    assert signal["payload_schema"] == "signal_packet.v2"
+    assert signal["payload"]["evidence"]["active_timeframes"] == ["5m"]
+    assert signal["payload"]["evidence"]["context_timeframes"] == ["2h", "1d"]
+    assert signal["payload"]["evidence"]["matched_ema_count"] == 3
+    assert set(signal["payload"]["charts"]) == {"5m", "2h", "1d"}
+    assert signal["payload"]["interactions"][0]["timeframe"] == "5m"
+
+
+def test_5m_cluster_vegas_live_scan_requires_three_near_ema_rails(tmp_path: Path):
+    root, repository = _workspace_with_5m_cluster_pool(tmp_path)
+    _register_5m_cluster_refs(
+        repository,
+        root=root,
+        asset="AAVE",
+        latest_ema_values={
+            36: 100,
+            43: 100,
+            144: 102,
+            169: 102,
+            576: 102,
+            676: 102,
+        },
+    )
+    route = {
+        **_route(root),
+        "route_id": "aave-live",
+        "signal_engine_id": "vegas_ema_5m_cluster",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+    }
+
+    signal = scan_latest_live_signal(route=route, repository=repository, workspace_root=root)
+
+    assert signal is None
+
+
 def test_generic_live_scan_returns_non_vegas_packet_from_latest_parquet(tmp_path: Path):
     root, repository = _workspace_with_threshold_pool(tmp_path)
     _register_candle_ref(
@@ -399,6 +589,102 @@ def _workspace_with_bollinger_pool(tmp_path: Path) -> tuple[Path, RuntimeReposit
     return root, repository
 
 
+def _workspace_with_recursive_vegas_pool(tmp_path: Path) -> tuple[Path, RuntimeRepository]:
+    root = tmp_path / "workspace-recursive-vegas"
+    root.mkdir()
+    repository = _repository()
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema_recursive",
+            "name": "Vegas EMA Recursive",
+            "description": "",
+            "version": "0.1",
+            "code_ref": {
+                "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py",
+            },
+            "supported_input_data_types": ["candles"],
+            "required_data": [
+                {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                {
+                    "data_type": "candles",
+                    "origin": "derived",
+                    "timeframe": "2h",
+                    "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                },
+            ],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_recursive:generate_training_signals",
+            "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_recursive:scan_live_signal",
+            "configuration_schema": {
+                "default_parameters": {
+                    "timeframes": ["2h"],
+                    "context_bars": 1,
+                    "vote_threshold": 1,
+                    "proximity_threshold": "0.01",
+                    "dedupe_window_minutes": 120,
+                }
+            },
+        }
+    )
+    asset = "AAVE"
+    repository.upsert_signal_set(
+        {
+            "signal_set_key": build_signal_set_key("vegas_ema_recursive", asset, f"{asset}-vegas_ema_recursive-canonical"),
+            "signal_set_id": f"{asset}-vegas_ema_recursive-canonical",
+            "signal_engine_id": "vegas_ema_recursive",
+            "signal_engine_version": "0.1",
+            "asset": asset,
+            "instrument": f"{asset}-USDT-SWAP",
+            "start_ts": None,
+            "end_ts": None,
+            "packet_count": 0,
+            "payload_schema": "signal_packet.v2",
+            "source_path": "canonicalized:signals",
+            "manifest": {
+                "parameters": {
+                    "timeframes": ["2h"],
+                    "context_bars": 1,
+                    "vote_threshold": 1,
+                    "proximity_threshold": "0.01",
+                }
+            },
+        }
+    )
+    return root, repository
+
+
+def _workspace_with_5m_cluster_pool(tmp_path: Path) -> tuple[Path, RuntimeRepository]:
+    root = tmp_path / "workspace-5m-cluster-vegas"
+    root.mkdir()
+    repository = _repository()
+    _register_5m_cluster_engine(repository)
+    asset = "AAVE"
+    repository.upsert_signal_set(
+        {
+            "signal_set_key": build_signal_set_key("vegas_ema_5m_cluster", asset, f"{asset}-vegas_ema_5m_cluster-canonical"),
+            "signal_set_id": f"{asset}-vegas_ema_5m_cluster-canonical",
+            "signal_engine_id": "vegas_ema_5m_cluster",
+            "signal_engine_version": "0.1",
+            "asset": asset,
+            "instrument": f"{asset}-USDT-SWAP",
+            "start_ts": None,
+            "end_ts": None,
+            "packet_count": 0,
+            "payload_schema": "signal_packet.v2",
+            "source_path": "canonicalized:signals",
+            "manifest": {
+                "parameters": {
+                    "context_bars": 2,
+                    "vote_threshold": 3,
+                    "proximity_threshold": "0.002",
+                    "dedupe_window_minutes": 120,
+                }
+            },
+        }
+    )
+    return root, repository
+
+
 def _register_threshold_engine(repository: RuntimeRepository) -> None:
     repository.register_signal_engine(
         {
@@ -448,6 +734,60 @@ def _register_bollinger_engine(repository: RuntimeRepository) -> None:
                     "bb_period": 2,
                     "vote_threshold": 1,
                     "proximity_threshold": "0.03",
+                }
+            },
+        }
+    )
+
+
+def _register_5m_cluster_engine(repository: RuntimeRepository) -> None:
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "vegas_ema_5m_cluster",
+            "name": "Vegas 5m EMA Cluster",
+            "description": "5m-only Vegas EMA rail cluster proximity engine.",
+            "version": "0.1",
+            "code_ref": {
+                "path": "apps/worker/src/quant_terminal_worker/signal_engines/vegas_ema_5m_cluster.py",
+                "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py",
+            },
+            "supported_input_data_types": ["candles"],
+            "required_data": [
+                {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                {
+                    "data_type": "candles",
+                    "origin": "derived",
+                    "timeframe": "5m",
+                    "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                    "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"],
+                },
+                {
+                    "data_type": "candles",
+                    "origin": "derived",
+                    "timeframe": "2h",
+                    "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                    "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"],
+                },
+                {
+                    "data_type": "candles",
+                    "origin": "derived",
+                    "timeframe": "1d",
+                    "source": {"data_type": "candles", "origin": "raw", "timeframe": "5m"},
+                    "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"],
+                },
+            ],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_5m_cluster:generate_training_signals",
+            "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_5m_cluster:scan_live_signal",
+            "configuration_schema": {
+                "default_parameters": {
+                    "context_bars": 80,
+                    "proximity_threshold": "0.002",
+                    "vote_threshold": 3,
+                    "dedupe_window_minutes": 120,
+                    "ema_mode": "precomputed_5m_ema_cluster",
+                    "context_timeframes": ["2h", "1d"],
+                    "ema_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"],
                 }
             },
         }
@@ -544,6 +884,56 @@ def _register_bollinger_refs(
     _register_candle_ref(repository, root=root, asset=asset, timeframe="4h", origin="derived", rows=derived_rows)
 
 
+def _register_recursive_vegas_refs(
+    repository: RuntimeRepository,
+    *,
+    root: Path,
+    asset: str,
+) -> None:
+    raw_rows = [
+        _candle_row("2026-06-01T00:00:00Z", open_=100, close=100),
+        _candle_row("2026-06-01T00:05:00Z", open_=100, close=100),
+    ]
+    derived_rows = [
+        _ema_candle_row("2026-05-31T22:00:00Z", close=100),
+    ]
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="5m", origin="raw", rows=raw_rows)
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="2h", origin="derived", rows=derived_rows)
+
+
+def _register_5m_cluster_refs(
+    repository: RuntimeRepository,
+    *,
+    root: Path,
+    asset: str,
+    latest_ema_values: dict[int, float] | None = None,
+) -> None:
+    latest_ema_values = latest_ema_values or {
+        36: 100,
+        43: 100.1,
+        144: 99.9,
+        169: 102,
+        576: 102,
+        676: 102,
+    }
+    raw_rows = [
+        _candle_row("2026-06-01T00:00:00Z", open_=100, close=100),
+        _candle_row("2026-06-01T00:05:00Z", open_=100, close=100),
+    ]
+    derived_rows = [
+        _ema_cluster_row("2026-06-01T00:00:00Z", close=100, ema_values={36: 105, 43: 105, 144: 105, 169: 105, 576: 105, 676: 105}),
+        _ema_cluster_row("2026-06-01T00:05:00Z", close=100, ema_values=latest_ema_values),
+    ]
+    context_rows = [
+        _ema_cluster_row("2026-05-31T00:00:00Z", close=95, ema_values={36: 94, 43: 94, 144: 93, 169: 93, 576: 92, 676: 92}),
+        _ema_cluster_row("2026-06-01T00:00:00Z", close=100, ema_values={36: 99, 43: 99, 144: 98, 169: 98, 576: 97, 676: 97}),
+    ]
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="5m", origin="raw", rows=raw_rows)
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="5m", origin="derived", rows=derived_rows)
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="2h", origin="derived", rows=context_rows)
+    _register_candle_ref(repository, root=root, asset=asset, timeframe="1d", origin="derived", rows=context_rows)
+
+
 def _register_candle_ref(
     repository: RuntimeRepository,
     *,
@@ -591,6 +981,22 @@ def _candle_row(timestamp: str, *, open_: float, close: float) -> dict[str, obje
         "vol_ccy_quote": 1.0,
         "confirm": 1,
     }
+
+
+def _ema_candle_row(timestamp: str, *, close: float) -> dict[str, object]:
+    row = _candle_row(timestamp, open_=close, close=close)
+    for period in (36, 43, 144, 169, 576, 676):
+        row[f"ema_{period}"] = close
+        row[f"ema_warmup_count_{period}"] = period
+    return row
+
+
+def _ema_cluster_row(timestamp: str, *, close: float, ema_values: dict[int, float]) -> dict[str, object]:
+    row = _candle_row(timestamp, open_=close, close=close)
+    for period in (36, 43, 144, 169, 576, 676):
+        row[f"ema_{period}"] = ema_values[period]
+        row[f"ema_warmup_count_{period}"] = period
+    return row
 
 
 def _route(root: Path) -> dict[str, object]:

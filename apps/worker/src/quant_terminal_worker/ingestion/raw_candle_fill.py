@@ -168,6 +168,8 @@ def _rebuild_derived_refs(
     repository: MarketDataRefRepository,
 ) -> list[dict[str, Any]]:
     rebuilt: list[dict[str, Any]] = []
+    from quant_terminal_worker.ingestion.ema_enrichment import enrich_rows_with_ema, _schema_with_ema
+
     for derived_registration in repository.list_derived_refs_for_raw(raw_registration):
         timeframe = derived_registration["timeframe"]
         derived_rows = _derive_candles(
@@ -177,6 +179,7 @@ def _rebuild_derived_refs(
         )
         if not derived_rows:
             continue
+        derived_rows = enrich_rows_with_ema(derived_rows)
 
         _write_dataset_rows(Path(derived_registration["storage_uri"]), derived_rows)
         updated_registration = {
@@ -184,9 +187,9 @@ def _rebuild_derived_refs(
             "start_ts": derived_rows[0]["timestamp"],
             "end_ts": derived_rows[-1]["timestamp"],
             "row_count": len(derived_rows),
-            "quality_status": "rebuilt",
+            "quality_status": "ema_enriched",
             "schema_descriptor": {
-                **derived_registration.get("schema_descriptor", {}),
+                **_schema_with_ema(derived_registration.get("schema_descriptor", {}), periods=(36, 43, 144, 169, 576, 676)),
                 "origin": "derived",
                 "derived_from_dataset_id": raw_registration["dataset_id"],
             },

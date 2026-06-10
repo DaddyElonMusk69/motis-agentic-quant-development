@@ -323,21 +323,22 @@ def _simulate_account_position(
     slippage_bps_per_side: float,
 ) -> dict[str, Any]:
     direction = item["direction"]
+    policy = _candidate_policy_for_direction(candidate, direction)
     signal_ts = item["signal_ts"]
     entry_price = float(item["reference_price"])
-    max_legs = int((candidate.get("pyramid") or {}).get("max_legs", 1))
+    max_legs = int((policy.get("pyramid") or {}).get("max_legs", 1))
     max_legs = max(1, max_legs)
     position_margin_budget = equity_before * margin_allocation_pct / 100
     per_leg_margin = position_margin_budget / max_legs
     fee_rate = fees_bps_per_side / 10_000
     slippage_rate = slippage_bps_per_side / 10_000
-    cutoff = signal_ts + timedelta(hours=candidate["max_hold_hours"])
-    tp_pct = candidate["tp_pct"]
-    sl_pct = candidate["sl_pct"]
-    protection_enabled = bool(candidate.get("protection_enabled", False))
-    protect_trigger_pct = candidate.get("protect_trigger_pct")
-    trail_sl_pct = candidate.get("trail_sl_pct")
-    pyramid = candidate.get("pyramid") or {}
+    cutoff = signal_ts + timedelta(hours=policy["max_hold_hours"])
+    tp_pct = policy["tp_pct"]
+    sl_pct = policy["sl_pct"]
+    protection_enabled = bool(policy.get("protection_enabled", False))
+    protect_trigger_pct = policy.get("protect_trigger_pct")
+    trail_sl_pct = policy.get("trail_sl_pct")
+    pyramid = policy.get("pyramid") or {}
     step_pct = float(pyramid.get("step_pct", 999))
     sl_breakeven = bool(pyramid.get("sl_breakeven", False))
     sl_price = entry_price * (1 - sl_pct / 100) if direction == "LONG" else entry_price * (1 + sl_pct / 100)
@@ -429,7 +430,7 @@ def _simulate_account_position(
 
     if active:
         exit_ts = cutoff if last_candle is None else last_candle["timestamp"]
-        exit_price = entry_price if candidate["timeout_policy"] == "zero" or last_candle is None else last_candle["close"]
+        exit_price = entry_price if policy["timeout_policy"] == "zero" or last_candle is None else last_candle["close"]
         for leg in active:
             _close_leg(
                 leg,
@@ -450,7 +451,7 @@ def _simulate_account_position(
     statuses = {leg["exit_status"] for leg in legs}
     exit_status = next(iter(statuses)) if len(statuses) == 1 else "MIXED"
     last_exit = max(legs, key=lambda leg: _coerce_datetime(leg["exit_ts"]))
-    base = _trade_base(item=item, candidate=candidate)
+    base = _trade_base(item=item, candidate=policy)
     return {
         **base,
         "position_id": position_id,
@@ -825,6 +826,9 @@ def _normalize_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "max_hold_hours": float(setup.get("max_hold_hours", DEFAULT_FORWARD_HOURS)),
             "leverage": float(setup.get("leverage", DEFAULT_LEVERAGE)),
         }
+        if setup.get("policy_mode") == "side_specific":
+            candidate["policy_mode"] = "side_specific"
+            candidate["side_policies"] = _normalize_side_policies(setup, fallback=candidate)
         if candidate["protection_enabled"]:
             if setup.get("protect_trigger_pct") is None or setup.get("trail_sl_pct") is None:
                 raise ValueError("Protected Stage 4 candidates require protect_trigger_pct and trail_sl_pct.")
@@ -838,6 +842,57 @@ def _normalize_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
             }
         normalized.append(candidate)
     return normalized
+
+
+def _normalize_side_policies(setup: dict[str, Any], *, fallback: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    source = setup.get("side_policies")
+    if not isinstance(source, dict):
+        raise ValueError("Side-specific Stage 4 candidates require side_policies.")
+    policies: dict[str, dict[str, Any]] = {}
+    for side in ("LONG", "SHORT"):
+        raw = source.get(side)
+        if not isinstance(raw, dict):
+            raise ValueError(f"Side-specific Stage 4 candidate is missing {side} policy.")
+        final_tp = raw.get("final_tp_pct", raw.get("lock_profit_pct", raw.get("tp_pct")))
+        initial_sl = raw.get("initial_sl_pct", raw.get("sl_pct"))
+        if final_tp is None or initial_sl is None:
+            raise ValueError(f"Side-specific Stage 4 {side} policy requires final_tp_pct and initial_sl_pct.")
+        protection_enabled = bool(raw.get("protection_enabled", fallback.get("protection_enabled", False)))
+        policy = {
+            "protection_enabled": protection_enabled,
+            "tp_pct": float(final_tp),
+            "sl_pct": float(initial_sl),
+            "final_tp_pct": float(final_tp),
+            "lock_profit_pct": float(final_tp),
+            "initial_sl_pct": float(initial_sl),
+            "timeout_policy": fallback["timeout_policy"],
+            "max_hold_hours": float(raw.get("hard_exit_hours", fallback["max_hold_hours"])),
+            "leverage": fallback["leverage"],
+        }
+        if protection_enabled:
+            if raw.get("protect_trigger_pct") is None or raw.get("trail_sl_pct") is None:
+                raise ValueError(f"Protected Stage 4 {side} policy requires protect_trigger_pct and trail_sl_pct.")
+            policy["protect_trigger_pct"] = float(raw["protect_trigger_pct"])
+            policy["trail_sl_pct"] = float(raw["trail_sl_pct"])
+        policies[side] = policy
+    return policies
+
+
+def _candidate_policy_for_direction(candidate: dict[str, Any], direction: str) -> dict[str, Any]:
+    if candidate.get("policy_mode") != "side_specific":
+        return candidate
+    side_policy = candidate["side_policies"][str(direction).upper()]
+    policy = {
+        **candidate,
+        **side_policy,
+        "candidate_id": candidate["candidate_id"],
+        "entry_model": candidate["entry_model"],
+        "policy_mode": "side_specific",
+        "side_policies": candidate["side_policies"],
+    }
+    if candidate.get("pyramid"):
+        policy["pyramid"] = candidate["pyramid"]
+    return policy
 
 
 def _choose_best_candidate(results: list[dict[str, Any]]) -> dict[str, Any]:

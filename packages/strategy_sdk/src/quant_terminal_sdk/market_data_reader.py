@@ -68,6 +68,35 @@ class MarketDataReader:
             confirmed_only=confirmed_only,
         )
 
+    def get_rows(
+        self,
+        *,
+        asset: str,
+        timeframe: str,
+        origin: str,
+        data_type: str = "candles",
+        start: str | datetime | None = None,
+        end: str | datetime | None = None,
+        confirmed_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        ref = self.repository.get_candle_ref(
+            asset=asset.upper(),
+            timeframe=timeframe,
+            origin=origin,
+            data_type=data_type,
+        )
+        if ref is None:
+            raise ValueError(
+                f"Canonical {origin} {data_type} data is missing for {asset.upper()} {timeframe}."
+            )
+        return read_rows_from_ref(
+            ref,
+            workspace_root=self.workspace_root,
+            start=start,
+            end=end,
+            confirmed_only=confirmed_only,
+        )
+
 
 def read_candles_from_ref(
     ref: dict[str, Any],
@@ -95,6 +124,36 @@ def read_candles_from_ref(
             if end_ts is not None and candle.timestamp > end_ts:
                 continue
             rows_by_timestamp[candle.timestamp] = candle
+
+    return [rows_by_timestamp[timestamp] for timestamp in sorted(rows_by_timestamp)]
+
+
+def read_rows_from_ref(
+    ref: dict[str, Any],
+    *,
+    workspace_root: str | Path,
+    start: str | datetime | None = None,
+    end: str | datetime | None = None,
+    confirmed_only: bool = True,
+) -> list[dict[str, Any]]:
+    if ref.get("storage_backend") != "parquet":
+        raise ValueError(f"Canonical market data ref is not parquet-backed: {ref.get('dataset_id')}")
+
+    storage_uri = _resolve_storage_uri(workspace_root=Path(workspace_root), value=ref["storage_uri"])
+    start_ts = _coerce_optional_datetime(start)
+    end_ts = _coerce_optional_datetime(end)
+    rows_by_timestamp: dict[datetime, dict[str, Any]] = {}
+
+    for file in sorted(storage_uri.glob("year=*/month=*/data.parquet")):
+        for row in pq.read_table(file).to_pylist():
+            timestamp = _coerce_datetime(row.get("timestamp") or row.get("ts"))
+            if confirmed_only and int(row.get("confirm", 1)) != 1:
+                continue
+            if start_ts is not None and timestamp < start_ts:
+                continue
+            if end_ts is not None and timestamp > end_ts:
+                continue
+            rows_by_timestamp[timestamp] = {**row, "timestamp": timestamp}
 
     return [rows_by_timestamp[timestamp] for timestamp in sorted(rows_by_timestamp)]
 

@@ -1,4 +1,5 @@
 import json
+import importlib
 from pathlib import Path
 
 import pytest
@@ -150,6 +151,78 @@ def test_execution_bundle_requires_live_exit_policy_fields():
         validate_execution_bundle_contract(bundle)
 
 
+def test_execution_bundle_accepts_side_specific_exit_policy_without_shared_fallback():
+    bundle = {
+        "bundle_id": "bundle-1",
+        "execution_setup": {
+            "schema_version": "0.1",
+            "forward_hours": 24,
+            "hard_exit_after_hours": 24,
+            "setup": {
+                "policy_mode": "side_specific",
+                "side_policies": {
+                    "LONG": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 1.5,
+                        "initial_sl_pct": 0.6,
+                    },
+                    "SHORT": {
+                        "protection_enabled": True,
+                        "final_tp_pct": 1.1,
+                        "initial_sl_pct": 0.8,
+                        "protect_trigger_pct": 0.5,
+                        "trail_sl_pct": 0.3,
+                    },
+                },
+            },
+        },
+    }
+
+    assert validate_execution_bundle_contract(bundle) == []
+
+
+def test_execution_bundle_rejects_incomplete_side_specific_exit_policy():
+    bundle = {
+        "bundle_id": "bundle-1",
+        "execution_setup": {
+            "schema_version": "0.1",
+            "forward_hours": 24,
+            "hard_exit_after_hours": 24,
+            "setup": {
+                "policy_mode": "side_specific",
+                "side_policies": {
+                    "LONG": {"protection_enabled": False, "final_tp_pct": 1.5, "initial_sl_pct": 0.6},
+                    "SHORT": {"protection_enabled": False, "final_tp_pct": 1.1},
+                },
+            },
+        },
+    }
+
+    with pytest.raises(ContractValidationError, match="SHORT execution setup missing initial_sl_pct"):
+        validate_execution_bundle_contract(bundle)
+
+
+def test_execution_bundle_rejects_zero_protected_sl():
+    bundle = {
+        "bundle_id": "bundle-1",
+        "execution_setup": {
+            "schema_version": "0.1",
+            "forward_hours": 24,
+            "hard_exit_after_hours": 24,
+            "setup": {
+                "protection_enabled": True,
+                "final_tp_pct": 1.5,
+                "initial_sl_pct": 0.6,
+                "protect_trigger_pct": 0.5,
+                "trail_sl_pct": 0,
+            },
+        },
+    }
+
+    with pytest.raises(ContractValidationError, match="positive trail_sl_pct"):
+        validate_execution_bundle_contract(bundle)
+
+
 def test_training_and_live_scan_result_contracts():
     training = TrainingSignalGenerationResult(
         status="appended",
@@ -204,7 +277,100 @@ def test_engine_strategy_template_pair_validates():
     assert validate_strategy_module(template_root / "strategy.py") == []
 
 
+def test_5m_vegas_hft_base_strategy_validates():
+    assert validate_strategy_module("packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_5m_hft_base.py") == []
+
+
+def test_5m_vegas_hft_base_enters_with_aligned_context():
+    strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_5m_hft_base")
+
+    decision = strategy.decide(
+        {
+            "signal": {
+                "signal_id": "vegas_ema_5m_cluster:ETH:test:20260608T060000Z",
+                "payload": _cluster_payload(
+                    matched_periods=[36, 43, 144],
+                    five_minute_closes=[100, 100.2, 100.4, 100.7],
+                    two_hour_closes=[98, 99, 100, 101],
+                    one_day_closes=[90, 94, 98, 102],
+                    ema_values={"36": "101.0", "43": "100.8", "144": "100.2", "169": "99.8", "576": "99.0", "676": "98.8"},
+                ),
+            },
+            "runtime_mode": "backtest",
+        }
+    )
+
+    assert decision["action"] == "ENTER"
+    assert decision["direction"] == "LONG"
+    assert decision["reason_code"] == "aligned_5m_cluster_with_2h_1d_context"
+    assert decision["diagnostics"]["matched_ema_count"] == 3
+
+
+def test_5m_vegas_hft_base_skips_without_required_context():
+    strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_5m_hft_base")
+
+    decision = strategy.decide(
+        {
+            "signal": {
+                "signal_id": "vegas_ema_5m_cluster:ETH:test:20260608T060000Z",
+                "payload": {"evidence": {"matched_periods": [36, 43, 144]}, "charts": {"5m": {}}},
+            }
+        }
+    )
+
+    assert decision["action"] == "SKIP"
+    assert decision["direction"] == "FLAT"
+    assert decision["reason_code"] == "missing_required_5m_2h_or_1d_context"
+
+
 def test_current_aave_execution_bundle_validates_with_legacy_aliases():
     bundle_id = "aave-vegas_ema-aave-vegas_ema-strategy-v01-3bee1a88652e"
 
     assert validate_execution_bundle(bundle_id) == []
+
+
+def _cluster_payload(
+    *,
+    matched_periods: list[int],
+    five_minute_closes: list[float],
+    two_hour_closes: list[float],
+    one_day_closes: list[float],
+    ema_values: dict[str, str],
+) -> dict[str, object]:
+    columns = ["ts", "open", "high", "low", "close", "volume", "vol_ccy", "vol_ccy_quote", "confirm"]
+    return {
+        "schema_version": "signal_packet.v2",
+        "asset": "ETH",
+        "instrument": "ETH-USDT-SWAP",
+        "timestamp": "2026-06-08T06:00:00Z",
+        "active_timeframes": ["5m"],
+        "evidence": {
+            "pattern": "vegas_ema_5m_cluster_proximity",
+            "trigger_timeframe": "5m",
+            "context_timeframes": ["2h", "1d"],
+            "matched_ema_count": len(matched_periods),
+            "matched_periods": matched_periods,
+        },
+        "charts": {
+            "5m": {
+                "role": "trigger",
+                "columns": columns,
+                "completed_candles": [_candle_row(index, close) for index, close in enumerate(five_minute_closes)],
+                "ema_values": ema_values,
+            },
+            "2h": {
+                "role": "context",
+                "columns": columns,
+                "completed_candles": [_candle_row(index, close) for index, close in enumerate(two_hour_closes)],
+            },
+            "1d": {
+                "role": "context",
+                "columns": columns,
+                "completed_candles": [_candle_row(index, close) for index, close in enumerate(one_day_closes)],
+            },
+        },
+    }
+
+
+def _candle_row(index: int, close: float) -> list[object]:
+    return [f"2026-06-08T00:{index:02d}:00Z", str(close), str(close), str(close), str(close), "1", "1", "1", 1]

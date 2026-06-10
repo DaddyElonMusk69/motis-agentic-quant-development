@@ -16,7 +16,7 @@ def test_stage3_substeps_write_artifacts_incrementally(tmp_path: Path):
     promotion_root = artifact_root / "promotion"
     _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
     _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, protect_trigger_pct=1.0, trail_sl_pct=0.5)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, initial_sl_pct=0.8, protect_trigger_pct=1.0, trail_sl_pct=0.5)
     _write_trade_inputs(
         promotion_root,
         [
@@ -72,7 +72,7 @@ def test_stage3_local_variants_requires_exact_protection_substep(tmp_path: Path)
     promotion_root = artifact_root / "promotion"
     _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
     _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, protect_trigger_pct=1.0, trail_sl_pct=0.5)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, initial_sl_pct=0.8, protect_trigger_pct=1.0, trail_sl_pct=0.5)
     _write_trade_inputs(
         promotion_root,
         [
@@ -97,7 +97,7 @@ def test_run_stage3_policy_test_scores_fixed_baseline_exact_policy_and_shortlist
     promotion_root = artifact_root / "promotion"
     _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
     _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, protect_trigger_pct=1.0, trail_sl_pct=0.5)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.5, initial_sl_pct=0.7, protect_trigger_pct=1.0, trail_sl_pct=0.5)
     _write_trade_inputs(
         promotion_root,
         [
@@ -132,7 +132,7 @@ def test_run_stage3_policy_test_scores_fixed_baseline_exact_policy_and_shortlist
 
     assert result["stage3_mode"] == "numerical_exit_policy"
     assert result["total_executable_decisions"] == 2
-    assert result["stage0_risk_policy"] == {"initial_sl_pct": 1.0, "hard_exit_hours": 2}
+    assert result["stage0_risk_policy"] == {"initial_sl_pct": 0.7, "stage0_meaningful_move_threshold_pct": 1.0, "hard_exit_hours": 2}
     fixed = result["fixed_sl_baseline_result"]
     assert fixed["stage3_step"] == "fixed_sl_baseline"
     assert fixed["protection_enabled"] is False
@@ -163,7 +163,7 @@ def test_stage3_local_variants_use_only_adjacent_stage2_levels_and_sl_multiplier
     promotion_root = artifact_root / "promotion"
     _write_stage0_summary(stage0_root, significance_threshold_pct=0.8, forward_hours=3)
     _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5, 2.0])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, protect_trigger_pct=1.0, trail_sl_pct=1.0)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, initial_sl_pct=0.8, protect_trigger_pct=1.0, trail_sl_pct=1.0)
     _write_trade_inputs(
         promotion_root,
         [
@@ -215,6 +215,106 @@ def test_stage3_local_variants_use_only_adjacent_stage2_levels_and_sl_multiplier
     assert result["stage3c_value_ranges"]["initial_sl_multipliers"] == [0.75, 1.0, 1.25]
 
 
+def test_stage3_uses_side_specific_stage2_policy_by_trade_direction(tmp_path: Path):
+    artifact_root, stage0_root = _stage3_workspace(tmp_path)
+    promotion_root = artifact_root / "promotion"
+    _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
+    _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5])
+    _write_stage2_side_policy(
+        promotion_root,
+        long_policy={"lock_profit_pct": 1.5, "initial_sl_pct": 0.5, "protect_trigger_pct": 1.0, "trail_sl_pct": 0.5},
+        short_policy={"lock_profit_pct": 0.5, "initial_sl_pct": 1.0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+    )
+    _write_trade_inputs(
+        promotion_root,
+        [
+            {
+                "signal_id": "sig-long",
+                "sample_role": "training",
+                "decision_direction": "LONG",
+                "direction": "LONG",
+                "agreement": "MATCH",
+                "signal_ts": "2026-05-01T00:00:00Z",
+                "reference_price": 100,
+            },
+            {
+                "signal_id": "sig-short",
+                "sample_role": "training",
+                "decision_direction": "SHORT",
+                "direction": "SHORT",
+                "agreement": "MATCH",
+                "signal_ts": "2026-05-01T03:00:00Z",
+                "reference_price": 200,
+            },
+        ],
+    )
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 99.6, "close": 100.9},
+        {"timestamp": "2026-05-01T03:05:00Z", "open": 200, "high": 200.2, "low": 198.8, "close": 199.0},
+    ]
+
+    result = run_stage3_fixed_sl_baseline(workspace_root=tmp_path, session=_session(artifact_root, stage0_root), candles=candles)
+
+    fixed = result["fixed_sl_baseline_result"]
+    assert fixed["policy_mode"] == "side_specific"
+    assert fixed["side_policies"]["LONG"]["final_tp_pct"] == 1.5
+    assert fixed["side_policies"]["SHORT"]["final_tp_pct"] == 0.5
+    assert fixed["side_split"]["LONG"]["time_exit_count"] == 1
+    assert fixed["side_split"]["SHORT"]["tp_count"] == 1
+    assert {row["outcome"] for row in fixed["outcomes"]} == {"TIME_EXIT", "TP"}
+
+
+def test_stage3c_side_specific_variants_are_paired_not_cartesian(tmp_path: Path):
+    artifact_root, stage0_root = _stage3_workspace(tmp_path)
+    promotion_root = artifact_root / "promotion"
+    _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
+    _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5])
+    _write_stage2_side_policy(
+        promotion_root,
+        long_policy={"lock_profit_pct": 1.0, "initial_sl_pct": 0.8, "protect_trigger_pct": 1.0, "trail_sl_pct": 0.5},
+        short_policy={"lock_profit_pct": 1.5, "initial_sl_pct": 1.0, "protect_trigger_pct": 1.0, "trail_sl_pct": 0.5},
+    )
+    _write_trade_inputs(
+        promotion_root,
+        [
+            {
+                "signal_id": "sig-long",
+                "sample_role": "training",
+                "decision_direction": "LONG",
+                "direction": "LONG",
+                "agreement": "MATCH",
+                "signal_ts": "2026-05-01T00:00:00Z",
+                "reference_price": 100,
+            },
+            {
+                "signal_id": "sig-short",
+                "sample_role": "walk_forward_test",
+                "decision_direction": "SHORT",
+                "direction": "SHORT",
+                "agreement": "MATCH",
+                "signal_ts": "2026-05-01T01:00:00Z",
+                "reference_price": 200,
+            },
+        ],
+    )
+    session = _session(artifact_root, stage0_root)
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 99.8, "close": 101.0},
+        {"timestamp": "2026-05-01T01:05:00Z", "open": 200, "high": 200.2, "low": 197.0, "close": 198.0},
+    ]
+
+    result = run_stage3_grid_search(workspace_root=tmp_path, session=session, candles=candles, shortlist_size=5)
+
+    variants = result["local_variant_results"]
+    assert variants
+    assert result["policy_mode"] == "side_specific"
+    assert result["stage3c_total_combinations_tested"] == len(variants)
+    assert len(variants) <= 61
+    assert all(row["policy_mode"] == "side_specific" for row in variants)
+    assert all(set(row["side_policies"]) == {"LONG", "SHORT"} for row in variants)
+    assert any(row["side_policies"]["LONG"]["final_tp_pct"] != row["side_policies"]["SHORT"]["final_tp_pct"] for row in variants)
+
+
 def test_stage3_policy_test_refuses_missing_stage2_exit_policy(tmp_path: Path):
     artifact_root, stage0_root = _stage3_workspace(tmp_path)
     promotion_root = artifact_root / "promotion"
@@ -243,7 +343,7 @@ def test_stage3_policy_test_refuses_missing_stage0_risk_policy(tmp_path: Path):
     artifact_root, stage0_root = _stage3_workspace(tmp_path)
     promotion_root = artifact_root / "promotion"
     _write_stage2_capture(promotion_root, tp_levels=[1.0])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, protect_trigger_pct=1.0, trail_sl_pct=0.5)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, initial_sl_pct=1.0, protect_trigger_pct=1.0, trail_sl_pct=0.5)
     _write_trade_inputs(
         promotion_root,
         [
@@ -268,7 +368,7 @@ def test_stage3_policy_rerun_clears_pyramid_and_stage4_artifacts(tmp_path: Path)
     promotion_root = artifact_root / "promotion"
     _write_stage0_summary(stage0_root, significance_threshold_pct=1.0, forward_hours=2)
     _write_stage2_capture(promotion_root, tp_levels=[1.0])
-    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, protect_trigger_pct=1.0, trail_sl_pct=0.5)
+    _write_stage2_policy(promotion_root, lock_profit_pct=1.0, initial_sl_pct=1.0, protect_trigger_pct=1.0, trail_sl_pct=0.5)
     _write_trade_inputs(
         promotion_root,
         [
@@ -362,6 +462,7 @@ def _write_stage2_policy(
     promotion_root: Path,
     *,
     lock_profit_pct: float,
+    initial_sl_pct: float,
     protect_trigger_pct: float,
     trail_sl_pct: float,
 ) -> None:
@@ -372,8 +473,31 @@ def _write_stage2_policy(
                 "artifact_role": "stage2_exit_policy",
                 "policy": {
                     "lock_profit_pct": lock_profit_pct,
+                    "initial_sl_pct": initial_sl_pct,
                     "protect_trigger_pct": protect_trigger_pct,
                     "trail_sl_pct": trail_sl_pct,
+                },
+            }
+        )
+    )
+
+
+def _write_stage2_side_policy(
+    promotion_root: Path,
+    *,
+    long_policy: dict[str, float],
+    short_policy: dict[str, float],
+) -> None:
+    (promotion_root / "stage2_exit_policy.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1",
+                "artifact_role": "stage2_exit_policy",
+                "policy_mode": "side_specific",
+                "policy": long_policy,
+                "side_policies": {
+                    "LONG": long_policy,
+                    "SHORT": short_policy,
                 },
             }
         )

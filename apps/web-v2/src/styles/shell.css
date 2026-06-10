@@ -1007,11 +1007,24 @@
   text-align: right;
 }
 
+.stage2-policy-presets {
+  display: flex;
+  gap: var(--space-2);
+  justify-content: flex-end;
+}
+
 .stage2-policy-grid {
   align-items: end;
   display: grid;
   gap: var(--space-2);
-  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  grid-template-columns: 52px repeat(4, minmax(0, 1fr));
+}
+
+.stage2-policy-grid > strong {
+  color: var(--ink-primary);
+  font-size: 12px;
+  letter-spacing: 0;
+  padding-bottom: 6px;
 }
 
 .stage2-policy-grid label {
@@ -1020,6 +1033,11 @@
 
 .stage2-policy-grid select {
   min-height: 28px;
+}
+
+.stage2-policy-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .stage4-setup-strip {
@@ -1113,6 +1131,85 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.stage4-policy-split {
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: var(--space-2);
+  grid-template-columns: minmax(160px, 0.7fr) repeat(2, minmax(0, 1fr));
+  padding: var(--space-2);
+}
+
+.stage4-policy-split__header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stage4-policy-split__header strong {
+  color: var(--ink-primary);
+  font-size: 13px;
+}
+
+.stage4-policy-split__header span,
+.stage4-policy-split__row em {
+  color: var(--ink-muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.stage4-policy-split__row {
+  align-items: center;
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: var(--space-1);
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+  padding: var(--space-2);
+}
+
+.stage4-policy-split__row strong {
+  color: var(--ink-primary);
+  font-size: 12px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage4-policy-split__row em {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage4-policy-split__side {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-xs);
+  color: var(--ink-secondary);
+  font-size: 10px;
+  font-weight: 800;
+  padding: 2px 5px;
+}
+
+.stage4-policy-split__side--long {
+  background: rgba(23, 184, 144, 0.12);
+  border-color: rgba(23, 184, 144, 0.32);
+  color: #64d5bd;
+}
+
+.stage4-policy-split__side--short {
+  background: rgba(245, 101, 101, 0.12);
+  border-color: rgba(245, 101, 101, 0.32);
+  color: #f39a9a;
 }
 
 .stage4-footnote-grid {
@@ -1365,6 +1462,39 @@
   justify-content: space-between;
 }
 
+.worker-runtime {
+  align-items: center;
+  border: 1px solid var(--line-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--ink-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+
+.worker-runtime svg {
+  height: 14px;
+  width: 14px;
+}
+
+.worker-runtime--ok svg {
+  color: var(--status-live);
+}
+
+.worker-runtime--warn {
+  background: color-mix(in oklch, var(--status-warn) 10%, transparent);
+  border-color: color-mix(in oklch, var(--status-warn) 45%, var(--line-subtle));
+}
+
+.worker-runtime--warn svg {
+  color: var(--status-warn);
+}
+
+.worker-runtime span:last-child {
+  font-size: 11px;
+}
+
 .progress-readout {
   display: flex;
   flex-direction: column;
@@ -1576,6 +1706,24 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+}
+
+.stage4-results-panel {
+  flex: 0 0 auto;
+  min-height: 520px;
+}
+
+.stage4-run-history-panel {
+  flex: 0 0 auto;
+  min-height: 360px;
+}
+
+.stage2-curve-panel {
+  flex: 0 0 auto;
+}
+
+.stage2-curve-panel .table-frame {
+  min-height: 360px;
 }
 
 .table-action-row {
@@ -1914,6 +2062,7 @@
   .workbench-grid,
   .field-grid,
   .stage4-footnote-grid,
+  .stage4-policy-split,
   .stage4-result-strip,
   .stage2-policy-grid,
   .stage4-setup-strip {
@@ -1932,5 +2081,13 @@
   .stage4-number-control,
   .stage4-slider-control {
     grid-template-columns: 72px minmax(0, 1fr) auto;
+  }
+
+  .stage4-results-panel {
+    min-height: 420px;
+  }
+
+  .stage4-run-history-panel {
+    min-height: 300px;
   }
 }

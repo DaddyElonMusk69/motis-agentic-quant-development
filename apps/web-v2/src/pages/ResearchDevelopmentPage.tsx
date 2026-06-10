@@ -7,6 +7,7 @@ import {
   deleteStage1Iteration,
   deleteStage1ResearchSession,
   fetchDevelopmentQueue,
+  fetchJob,
   fetchStage0UniverseRuns,
   fetchStage1AgentPrompt,
   fetchStage1Gate,
@@ -14,6 +15,7 @@ import {
   fetchStage1Iterations,
   fetchStage1ResearchSessions,
   generateStage1FailureAudit,
+  isJobResponse,
   promoteExecutionBundle,
   promoteStage2ExitPolicy,
   runStage1CanonicalReadout,
@@ -36,7 +38,10 @@ import {
   type Stage1SampleRole,
   type Stage1SeedStrategyPreference,
   type Stage1TrainingScore,
-  type Stage2CaptureRate
+  type Stage2CaptureRate,
+  type Stage2PolicyValues,
+  type Stage4CandidateResult,
+  type Stage3GridSetup
 } from "../app/api";
 import { formatNumber } from "../app/format";
 import { queryClient } from "../app/queryClient";
@@ -46,6 +51,7 @@ import { FieldRow } from "../components/FieldRow";
 import { SplitPane } from "../components/SplitPane";
 import { StatusBadge } from "../components/StatusBadge";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorkerRuntimeNotice } from "../components/WorkerRuntimeNotice";
 
 type Stage1EvidenceMode = {
   title: string;
@@ -63,6 +69,44 @@ type Stage1StartChoice = {
   strategyId: string;
   latestAvailable: boolean;
   latestLabel: string;
+};
+
+type ActiveDevelopmentJob = {
+  action: string;
+  jobId: string;
+  label: string;
+  sessionId?: string;
+};
+
+type ExitSide = "LONG" | "SHORT";
+
+type DisplaySidePolicy = Stage2PolicyValues & {
+  final_tp_pct?: number;
+  lock_profit_pct?: number;
+  initial_sl_pct?: number;
+  protection_enabled?: boolean;
+  hard_exit_hours?: number;
+  max_hold_hours?: number;
+};
+
+type DisplayExecutionSetup = {
+  policy_mode?: "shared" | "side_specific" | string | null;
+  protection_enabled?: boolean;
+  tp?: number;
+  sl?: number;
+  tp_pct?: number;
+  sl_pct?: number;
+  final_tp_pct?: number;
+  lock_profit_pct?: number;
+  initial_sl_pct?: number;
+  protect_trigger_pct?: number;
+  trail_sl_pct?: number;
+  pyramid?: {
+    step_pct?: number;
+    max_legs?: number;
+    sl_breakeven?: boolean;
+  };
+  side_policies?: Record<ExitSide, DisplaySidePolicy>;
 };
 
 const stage1Roles: Stage1SampleRole[] = ["training", "walk_forward_test"];
@@ -293,7 +337,8 @@ function formatCaptureRate(value: Stage2CaptureRate | undefined): string {
   if (!value) {
     return "-";
   }
-  return `${value.rate.toFixed(1)}% (${formatNumber(value.reached)}/${formatNumber(value.total)})`;
+  const count = value.reached ?? value.hit ?? 0;
+  return `${value.rate.toFixed(1)}% (${formatNumber(count)}/${formatNumber(value.total)})`;
 }
 
 function formatPct(value: number | undefined | null): string {
@@ -327,6 +372,84 @@ function formatRangeList(values: number[] | undefined): string {
   return `${formatPct(values[0])} - ${formatPct(values[values.length - 1])} (${formatNumber(values.length)})`;
 }
 
+function formatStage3Policy(item: DisplayExecutionSetup | undefined): string {
+  if (item?.policy_mode === "side_specific" && item.side_policies) {
+    const long = item.side_policies.LONG;
+    const short = item.side_policies.SHORT;
+    return `L ${formatPct(long.final_tp_pct ?? long.lock_profit_pct)} / ${formatPct(long.initial_sl_pct)} | S ${formatPct(short.final_tp_pct ?? short.lock_profit_pct)} / ${formatPct(short.initial_sl_pct)}`;
+  }
+  return `${formatPct(item?.final_tp_pct ?? item?.tp)} TP / ${formatPct(item?.initial_sl_pct ?? item?.sl)} SL`;
+}
+
+function formatStage3Protection(item: DisplayExecutionSetup | undefined): string {
+  if (item?.policy_mode === "side_specific" && item.side_policies) {
+    const long = item.side_policies.LONG;
+    const short = item.side_policies.SHORT;
+    if (!long.protection_enabled && !short.protection_enabled) {
+      return "Fixed SL";
+    }
+    return `L ${formatPct(long.protect_trigger_pct)} / ${formatPct(long.trail_sl_pct)} | S ${formatPct(short.protect_trigger_pct)} / ${formatPct(short.trail_sl_pct)}`;
+  }
+  if (item?.protection_enabled === false) {
+    return "Fixed SL";
+  }
+  return `${formatPct(item?.protect_trigger_pct)} / ${formatPct(item?.trail_sl_pct)}`;
+}
+
+function formatPyramidPolicy(item: DisplayExecutionSetup | undefined): string {
+  const pyramid = item?.pyramid;
+  if (!pyramid) {
+    return "off";
+  }
+  const legs = pyramid.max_legs ? `${formatNumber(pyramid.max_legs)} legs` : "pyramid";
+  const step = pyramid.step_pct == null ? "step -" : `step ${formatPct(pyramid.step_pct)}`;
+  return pyramid.sl_breakeven ? `${legs} / ${step} / SL to BE` : `${legs} / ${step}`;
+}
+
+function formatStage3SidePolicy(
+  item: DisplayExecutionSetup | undefined,
+  side: ExitSide
+): string {
+  const sidePolicy = item?.side_policies?.[side];
+  if (sidePolicy) {
+    const finalTp = sidePolicy.final_tp_pct ?? sidePolicy.lock_profit_pct;
+    return `${formatPct(finalTp)} TP / ${formatPct(sidePolicy.initial_sl_pct)} SL`;
+  }
+  return `${formatPct(item?.final_tp_pct ?? item?.tp)} TP / ${formatPct(item?.initial_sl_pct ?? item?.sl)} SL`;
+}
+
+function formatStage3SideProtection(
+  item: DisplayExecutionSetup | undefined,
+  side: ExitSide
+): string {
+  const sidePolicy = item?.side_policies?.[side];
+  if (sidePolicy) {
+    if (!sidePolicy.protection_enabled) {
+      return "Fixed SL";
+    }
+    return `${formatPct(sidePolicy.protect_trigger_pct)} trigger / ${formatPct(sidePolicy.trail_sl_pct)} protected SL`;
+  }
+  if (item?.protection_enabled === false) {
+    return "Fixed SL";
+  }
+  return `${formatPct(item?.protect_trigger_pct)} trigger / ${formatPct(item?.trail_sl_pct)} protected SL`;
+}
+
+function formatStage4ExitMode(setup: DisplayExecutionSetup | undefined): string {
+  if (setup?.policy_mode === "side_specific" && setup.side_policies) {
+    const sides = [setup.side_policies.LONG, setup.side_policies.SHORT];
+    const protectedCount = sides.filter((policy) => Boolean(policy.protection_enabled)).length;
+    if (protectedCount === 0) {
+      return "Fixed SL";
+    }
+    if (protectedCount === sides.length) {
+      return "Protected SL";
+    }
+    return "Split Protection";
+  }
+  return setup?.protection_enabled ? "Protected SL" : "Fixed SL";
+}
+
 function formatUsd(value: number | undefined | null): string {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return "-";
@@ -356,6 +479,7 @@ export function ResearchDevelopmentPage() {
   const [overrideAction, setOverrideAction] = useState<Stage1OverrideAction | null>(null);
   const [selectedIteration, setSelectedIteration] = useState<Stage1IterationSummary | null>(null);
   const [startChoice, setStartChoice] = useState<Stage1StartChoice | null>(null);
+  const [activeJob, setActiveJob] = useState<ActiveDevelopmentJob | null>(null);
   const [stage4Inputs, setStage4Inputs] = useState({
     initial_capital_usdt: 10000,
     margin_allocation_pct: 30,
@@ -398,6 +522,15 @@ export function ResearchDevelopmentPage() {
     queryKey: ["stage1-iteration-detail", session?.session_id, selectedIteration?.iteration_id],
     queryFn: () => fetchStage1IterationDetail({ session_id: session!.session_id, iteration_id: selectedIteration!.iteration_id })
   });
+  const activeJobQuery = useQuery({
+    enabled: Boolean(activeJob?.jobId),
+    queryKey: ["runtime-job", activeJob?.jobId],
+    queryFn: () => fetchJob(activeJob!.jobId),
+    refetchInterval: (query) => {
+      const job = query.state.data?.job;
+      return !job || ["queued", "running"].includes(job.status) ? 1500 : false;
+    }
+  });
 
   const gate = gateQuery.data?.gate ?? row?.stage1_gate ?? null;
   const iterations = iterationsQuery.data?.iterations ?? [];
@@ -419,6 +552,17 @@ export function ResearchDevelopmentPage() {
         item.session_id !== session?.session_id
     ) ?? null;
   }, [plannedStrategyId, row, session?.session_id, sessionsQuery.data?.sessions]);
+  const trackedJob = activeJobQuery.data?.job ?? null;
+  const trackedJobRunning = Boolean(trackedJob && ["queued", "running"].includes(trackedJob.status));
+  const sessionJobRunning = trackedJobRunning && (!activeJob?.sessionId || activeJob.sessionId === session?.session_id);
+  const isJobRunning = (action: string) => sessionJobRunning && activeJob?.action === action;
+  const trackAsyncJob = (result: unknown, action: string, label: string, sessionId?: string): boolean => {
+    if (!isJobResponse(result)) {
+      return false;
+    }
+    setActiveJob({ action, jobId: result.job.job_id, label, sessionId });
+    return true;
+  };
 
   const createSessionMutation = useMutation({
     mutationFn: createStage1ResearchSession,
@@ -451,7 +595,11 @@ export function ResearchDevelopmentPage() {
   });
   const scoreMutation = useMutation({
     mutationFn: scoreStage1Iteration,
-    onSuccess: (_result, variables) => invalidateDevelopment(variables.session_id, pool?.universe_run_id)
+    onSuccess: (result, variables) => {
+      if (!trackAsyncJob(result, "score", "Scoring iteration", variables.session_id)) {
+        invalidateDevelopment(variables.session_id, pool?.universe_run_id);
+      }
+    }
   });
   const auditMutation = useMutation({
     mutationFn: generateStage1FailureAudit,
@@ -459,11 +607,19 @@ export function ResearchDevelopmentPage() {
   });
   const canonicalMutation = useMutation({
     mutationFn: runStage1CanonicalReadout,
-    onSuccess: (_result, variables) => invalidateDevelopment(variables.session_id, pool?.universe_run_id)
+    onSuccess: (result, variables) => {
+      if (!trackAsyncJob(result, "canonical", "Freezing Stage 1", variables.session_id)) {
+        invalidateDevelopment(variables.session_id, pool?.universe_run_id);
+      }
+    }
   });
   const stage2Mutation = useMutation({
     mutationFn: runStage2CaptureCurve,
-    onSuccess: (_result, sessionId) => invalidateDevelopment(sessionId, pool?.universe_run_id)
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage2", "Running Stage 2 capture", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
+      }
+    }
   });
   const stage2ExitPolicyMutation = useMutation({
     mutationFn: promoteStage2ExitPolicy,
@@ -471,23 +627,43 @@ export function ResearchDevelopmentPage() {
   });
   const stage3FixedSlMutation = useMutation({
     mutationFn: runStage3FixedSl,
-    onSuccess: (_result, sessionId) => invalidateDevelopment(sessionId, pool?.universe_run_id)
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage3_fixed", "Testing fixed SL", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
+      }
+    }
   });
   const stage3ExactProtectionMutation = useMutation({
     mutationFn: runStage3ExactProtection,
-    onSuccess: (_result, sessionId) => invalidateDevelopment(sessionId, pool?.universe_run_id)
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage3_exact", "Testing protection", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
+      }
+    }
   });
   const stage3LocalVariantsMutation = useMutation({
     mutationFn: runStage3LocalVariants,
-    onSuccess: (_result, sessionId) => invalidateDevelopment(sessionId, pool?.universe_run_id)
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage3_local", "Testing local variants", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
+      }
+    }
   });
   const stage3PyramidMutation = useMutation({
     mutationFn: runStage3Pyramid,
-    onSuccess: (_result, sessionId) => invalidateDevelopment(sessionId, pool?.universe_run_id)
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage3_pyramid", "Testing pyramiding", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
+      }
+    }
   });
   const stage4Mutation = useMutation({
     mutationFn: runStage4RealizedExpectancy,
-    onSuccess: (_result, variables) => invalidateDevelopment(variables.session_id, pool?.universe_run_id)
+    onSuccess: (result, variables) => {
+      if (!trackAsyncJob(result, "stage4", "Running Stage 4 backtest", variables.session_id)) {
+        invalidateDevelopment(variables.session_id, pool?.universe_run_id);
+      }
+    }
   });
   const promoteMutation = useMutation({
     mutationFn: promoteExecutionBundle,
@@ -509,6 +685,15 @@ export function ResearchDevelopmentPage() {
   useEffect(() => {
     setSelectedIteration(null);
   }, [session?.session_id]);
+
+  useEffect(() => {
+    if (!trackedJob || !activeJob || ["queued", "running"].includes(trackedJob.status)) {
+      return;
+    }
+    invalidateDevelopment(activeJob.sessionId, pool?.universe_run_id);
+    const timeout = window.setTimeout(() => setActiveJob(null), trackedJob.status === "completed" ? 2500 : 5000);
+    return () => window.clearTimeout(timeout);
+  }, [activeJob?.jobId, activeJob?.sessionId, pool?.universe_run_id, trackedJob?.status]);
 
   useEffect(() => {
     const latestInputs = gate?.stage4_realized_expectancy.latest_simulation_inputs;
@@ -701,6 +886,7 @@ export function ResearchDevelopmentPage() {
     iterationsQuery.error,
     gateQuery.error,
     iterationDetailQuery.error,
+    activeJobQuery.error,
     createSessionMutation.error,
     createIterationMutation.error,
     deleteIterationMutation.error,
@@ -793,17 +979,26 @@ export function ResearchDevelopmentPage() {
                 {row ? <StatusBadge tone={stageTone(row)}>{developmentLabel(row)}</StatusBadge> : null}
                 <button
                   className="button button--primary"
-                  disabled={activeStage === "stage1" ? stage1PrimaryAction.disabled : (!row || Boolean(row.next_action.disabled) || createSessionMutation.isPending || createIterationMutation.isPending)}
+                  disabled={activeStage === "stage1" ? stage1PrimaryAction.disabled || sessionJobRunning : (!row || Boolean(row.next_action.disabled) || createSessionMutation.isPending || createIterationMutation.isPending || sessionJobRunning)}
                   onClick={activeStage === "stage1" ? stage1PrimaryAction.run : runNextAction}
                   type="button"
                 >
-                  <Play aria-hidden="true" />
-                  {activeStage === "stage1" ? stage1PrimaryAction.label : row?.next_action.label ?? "Select Candidate"}
+                  {sessionJobRunning ? <RefreshCw aria-hidden="true" className="spin-icon" /> : <Play aria-hidden="true" />}
+                  {sessionJobRunning ? activeJob?.label ?? "Running job" : activeStage === "stage1" ? stage1PrimaryAction.label : row?.next_action.label ?? "Select Candidate"}
                 </button>
               </div>
             </div>
 
             {visibleErrors.map((error) => <div className="state-line state-line--error" key={error.message}>{error.message}</div>)}
+            {activeJob && trackedJob ? (
+              <>
+                <div className={trackedJob.status === "failed" ? "state-line state-line--error" : "state-line"}>
+                  <RefreshCw aria-hidden="true" className={trackedJobRunning ? "spin-icon" : undefined} />
+                  <span>{activeJob.label}: {trackedJob.current_step ?? trackedJob.status}</span>
+                </div>
+                <WorkerRuntimeNotice active={trackedJobRunning} job={trackedJob} />
+              </>
+            ) : null}
 
             <div className="development-summary-strip">
               <div>
@@ -848,7 +1043,7 @@ export function ResearchDevelopmentPage() {
                 onScore={(iteration) => scoreMutation.mutate({ session_id: session!.session_id, iteration_id: iteration.iteration_id, sample_role: stage1RoleForIteration(iteration) })}
                 onStartStage1={requestStartStage1}
                 row={row}
-                runningCanonical={canonicalMutation.isPending}
+                runningCanonical={canonicalMutation.isPending || isJobRunning("canonical")}
                 session={session}
                 startingSession={createSessionMutation.isPending}
               />
@@ -857,10 +1052,10 @@ export function ResearchDevelopmentPage() {
             {activeStage === "stage2" ? (
               <Stage2Panel
                 gate={gate}
-                onPromotePolicy={(policy) => session && stage2ExitPolicyMutation.mutate({ session_id: session.session_id, ...policy })}
+                onPromotePolicy={(policy) => session && stage2ExitPolicyMutation.mutate({ session_id: session.session_id, side_policies: policy })}
                 onRun={() => session && stage2Mutation.mutate(session.session_id)}
                 promotingPolicy={stage2ExitPolicyMutation.isPending}
-                running={stage2Mutation.isPending}
+                running={stage2Mutation.isPending || isJobRunning("stage2")}
               />
             ) : null}
 
@@ -871,10 +1066,10 @@ export function ResearchDevelopmentPage() {
                 onRunFixedSl={() => session && stage3FixedSlMutation.mutate(session.session_id)}
                 onRunLocalVariants={() => session && stage3LocalVariantsMutation.mutate(session.session_id)}
                 onRunPyramid={() => session && stage3PyramidMutation.mutate(session.session_id)}
-                exactProtectionRunning={stage3ExactProtectionMutation.isPending}
-                fixedSlRunning={stage3FixedSlMutation.isPending}
-                localVariantsRunning={stage3LocalVariantsMutation.isPending}
-                pyramidRunning={stage3PyramidMutation.isPending}
+                exactProtectionRunning={stage3ExactProtectionMutation.isPending || isJobRunning("stage3_exact")}
+                fixedSlRunning={stage3FixedSlMutation.isPending || isJobRunning("stage3_fixed")}
+                localVariantsRunning={stage3LocalVariantsMutation.isPending || isJobRunning("stage3_local")}
+                pyramidRunning={stage3PyramidMutation.isPending || isJobRunning("stage3_pyramid")}
               />
             ) : null}
 
@@ -886,7 +1081,7 @@ export function ResearchDevelopmentPage() {
                 inputs={stage4Inputs}
                 onInputsChange={setStage4Inputs}
                 promoting={promoteMutation.isPending}
-                running={stage4Mutation.isPending}
+                running={stage4Mutation.isPending || isJobRunning("stage4")}
               />
             ) : null}
           </>
@@ -1315,15 +1510,161 @@ function StageRunProgress({ detail, steps, title }: { detail: string; steps: str
 
 type Stage2ExitPolicyDraft = {
   lock_profit_pct: number;
+  initial_sl_pct: number;
   protect_trigger_pct: number;
   trail_sl_pct: number;
 };
+
+type Stage2SidePolicyDraft = Record<"LONG" | "SHORT", Stage2ExitPolicyDraft>;
+type Stage2PolicyPreset = "balanced" | "aggressive";
 
 function stage2TpOptions(stage2: Stage1GateSummary["stage2_capture"] | undefined): number[] {
   const values = stage2?.tp_levels?.length
     ? stage2.tp_levels
     : Object.keys(stage2?.results ?? {}).map((value) => Number(value));
   return Array.from(new Set(values.filter((value) => Number.isFinite(value)).map((value) => Number(value.toFixed(1))))).sort((a, b) => a - b);
+}
+
+function stage2SlOptions(stage2: Stage1GateSummary["stage2_capture"] | undefined): number[] {
+  const values = stage2?.sl_levels?.length
+    ? stage2.sl_levels
+    : Object.keys(stage2?.sl_results ?? {}).map((value) => Number(value));
+  return Array.from(new Set(values.filter((value) => Number.isFinite(value)).map((value) => Number(value.toFixed(1))))).sort((a, b) => a - b);
+}
+
+function buildStage2PolicyPreset(
+  stage2: Stage1GateSummary["stage2_capture"] | undefined,
+  tpOptions: number[],
+  slOptions: number[],
+  preset: Stage2PolicyPreset
+): Stage2SidePolicyDraft {
+  const profile = preset === "balanced"
+    ? { finalTpRate: 60, protectRate: 85, maxSlHitRate: 25, trailRatio: 0.5 }
+    : { finalTpRate: 45, protectRate: 75, maxSlHitRate: 35, trailRatio: 0.35 };
+  const fallbackTp = tpOptions[0] ?? 0;
+  const fallbackSl = slOptions[0] ?? 0;
+  return {
+    LONG: buildStage2SidePolicyPreset(stage2, tpOptions, slOptions, "LONG", profile, fallbackTp, fallbackSl),
+    SHORT: buildStage2SidePolicyPreset(stage2, tpOptions, slOptions, "SHORT", profile, fallbackTp, fallbackSl)
+  };
+}
+
+function buildStage2SidePolicyPreset(
+  stage2: Stage1GateSummary["stage2_capture"] | undefined,
+  tpOptions: number[],
+  slOptions: number[],
+  side: "LONG" | "SHORT",
+  profile: { finalTpRate: number; protectRate: number; maxSlHitRate: number; trailRatio: number },
+  fallbackTp: number,
+  fallbackSl: number
+): Stage2ExitPolicyDraft {
+  const split = stage2?.side_splits?.[side];
+  const tpCurve = split?.count ? split.results : stage2?.results;
+  const slCurve = split?.count ? split.sl_results : stage2?.sl_results;
+  const lockProfit = highestLevelAtOrAboveRate(tpOptions, tpCurve, profile.finalTpRate) ?? fallbackTp;
+  const protectOptions = tpOptions.filter((value) => value <= lockProfit);
+  const protectTrigger = highestLevelAtOrAboveRate(protectOptions, tpCurve, profile.protectRate) ?? protectOptions[0] ?? lockProfit;
+  const initialSl = smallestLevelAtOrBelowHitRate(slOptions, slCurve, profile.maxSlHitRate) ?? slOptions[slOptions.length - 1] ?? fallbackSl;
+  const trailSl = nearestLevelAtOrBelow(tpOptions, protectTrigger * profile.trailRatio, protectTrigger) ?? protectTrigger;
+  return {
+    lock_profit_pct: lockProfit,
+    initial_sl_pct: initialSl,
+    protect_trigger_pct: protectTrigger,
+    trail_sl_pct: trailSl
+  };
+}
+
+function highestLevelAtOrAboveRate(
+  levels: number[],
+  curve: Record<string, Record<string, Stage2CaptureRate>> | undefined,
+  minRate: number
+): number | undefined {
+  return [...levels].reverse().find((level) => captureRateAt(curve, level) >= minRate);
+}
+
+function smallestLevelAtOrBelowHitRate(
+  levels: number[],
+  curve: Record<string, Record<string, Stage2CaptureRate>> | undefined,
+  maxRate: number
+): number | undefined {
+  return levels.find((level) => captureRateAt(curve, level) <= maxRate);
+}
+
+function nearestLevelAtOrBelow(levels: number[], target: number, ceiling: number): number | undefined {
+  const candidates = levels.filter((level) => level <= ceiling);
+  if (!candidates.length) {
+    return undefined;
+  }
+  return candidates.reduce((best, level) => {
+    const bestDistance = Math.abs(best - target);
+    const distance = Math.abs(level - target);
+    return distance <= bestDistance ? level : best;
+  }, candidates[0]);
+}
+
+function nearestStage2Level(levels: number[], value: number | undefined, fallback: number): number {
+  if (!levels.length) {
+    return fallback;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return levels.reduce((best, level) => {
+    const bestDistance = Math.abs(best - value);
+    const distance = Math.abs(level - value);
+    return distance < bestDistance ? level : best;
+  }, levels[0]);
+}
+
+function normalizeStage2SidePolicy(
+  draft: Stage2ExitPolicyDraft,
+  tpOptions: number[],
+  slOptions: number[]
+): Stage2ExitPolicyDraft {
+  const fallbackTp = tpOptions[0] ?? 0;
+  const fallbackSl = slOptions[0] ?? 0;
+  const lockProfit = nearestStage2Level(tpOptions, draft.lock_profit_pct, fallbackTp);
+  const protectCandidates = tpOptions.filter((value) => value <= lockProfit);
+  const protectTrigger = nearestStage2Level(protectCandidates.length ? protectCandidates : tpOptions, draft.protect_trigger_pct, fallbackTp);
+  const trailCandidates = tpOptions.filter((value) => value <= protectTrigger);
+  return {
+    lock_profit_pct: lockProfit,
+    initial_sl_pct: nearestStage2Level(slOptions, draft.initial_sl_pct, fallbackSl),
+    protect_trigger_pct: protectTrigger,
+    trail_sl_pct: nearestStage2Level(trailCandidates.length ? trailCandidates : tpOptions, draft.trail_sl_pct, fallbackTp)
+  };
+}
+
+function normalizeStage2PolicyDraft(
+  draft: Stage2SidePolicyDraft,
+  tpOptions: number[],
+  slOptions: number[]
+): Stage2SidePolicyDraft {
+  return {
+    LONG: normalizeStage2SidePolicy(draft.LONG, tpOptions, slOptions),
+    SHORT: normalizeStage2SidePolicy(draft.SHORT, tpOptions, slOptions)
+  };
+}
+
+function stage2PolicyDraftIsValid(draft: Stage2SidePolicyDraft, tpOptions: number[], slOptions: number[]): boolean {
+  if (!tpOptions.length || !slOptions.length) {
+    return false;
+  }
+  return (["LONG", "SHORT"] as const).every((side) => {
+    const policy = draft[side];
+    return (
+      tpOptions.includes(policy.lock_profit_pct)
+      && slOptions.includes(policy.initial_sl_pct)
+      && tpOptions.includes(policy.protect_trigger_pct)
+      && tpOptions.includes(policy.trail_sl_pct)
+      && policy.trail_sl_pct <= policy.protect_trigger_pct
+      && policy.protect_trigger_pct <= policy.lock_profit_pct
+    );
+  });
+}
+
+function captureRateAt(curve: Record<string, Record<string, Stage2CaptureRate>> | undefined, level: number): number {
+  return curve?.[level.toFixed(1)]?.full_cycle?.rate ?? Number.NEGATIVE_INFINITY;
 }
 
 function Stage2Panel({
@@ -1334,7 +1675,7 @@ function Stage2Panel({
   running
 }: {
   gate: Stage1GateSummary | null;
-  onPromotePolicy: (policy: Stage2ExitPolicyDraft) => void;
+  onPromotePolicy: (policy: Stage2SidePolicyDraft) => void;
   onRun: () => void;
   promotingPolicy: boolean;
   running: boolean;
@@ -1343,19 +1684,58 @@ function Stage2Panel({
   const stage2 = gate?.stage2_capture;
   const complete = Boolean(stage2?.exists);
   const policy = gate?.stage2_exit_policy;
+  const longSplit = stage2?.side_splits?.LONG;
+  const shortSplit = stage2?.side_splits?.SHORT;
   const tpOptions = useMemo(() => stage2TpOptions(stage2), [stage2?.results, stage2?.tp_levels]);
-  const [policyDraft, setPolicyDraft] = useState<Stage2ExitPolicyDraft>({ lock_profit_pct: 0, protect_trigger_pct: 0, trail_sl_pct: 0 });
+  const slOptions = useMemo(() => stage2SlOptions(stage2), [stage2?.sl_levels, stage2?.sl_results]);
+  const [policyDraft, setPolicyDraft] = useState<Stage2SidePolicyDraft>({
+    LONG: { lock_profit_pct: 0, initial_sl_pct: 0, protect_trigger_pct: 0, trail_sl_pct: 0 },
+    SHORT: { lock_profit_pct: 0, initial_sl_pct: 0, protect_trigger_pct: 0, trail_sl_pct: 0 }
+  });
 
   useEffect(() => {
-    const fallback = tpOptions[0] ?? 0;
-    setPolicyDraft({
-      lock_profit_pct: policy?.policy.lock_profit_pct ?? fallback,
-      protect_trigger_pct: policy?.policy.protect_trigger_pct ?? fallback,
-      trail_sl_pct: policy?.policy.trail_sl_pct ?? fallback
-    });
-  }, [policy?.policy.lock_profit_pct, policy?.policy.protect_trigger_pct, policy?.policy.trail_sl_pct, tpOptions]);
+    const tpFallback = tpOptions[0] ?? 0;
+    const slFallback = slOptions[0] ?? 0;
+    const existingPolicy = policy?.policy ?? {};
+    const fallbackPolicy = {
+      lock_profit_pct: existingPolicy.lock_profit_pct ?? tpFallback,
+      initial_sl_pct: existingPolicy.initial_sl_pct ?? slFallback,
+      protect_trigger_pct: existingPolicy.protect_trigger_pct ?? tpFallback,
+      trail_sl_pct: existingPolicy.trail_sl_pct ?? tpFallback
+    };
+    setPolicyDraft(normalizeStage2PolicyDraft(
+      {
+        LONG: {
+          lock_profit_pct: policy?.side_policies?.LONG?.lock_profit_pct ?? fallbackPolicy.lock_profit_pct,
+          initial_sl_pct: policy?.side_policies?.LONG?.initial_sl_pct ?? fallbackPolicy.initial_sl_pct,
+          protect_trigger_pct: policy?.side_policies?.LONG?.protect_trigger_pct ?? fallbackPolicy.protect_trigger_pct,
+          trail_sl_pct: policy?.side_policies?.LONG?.trail_sl_pct ?? fallbackPolicy.trail_sl_pct
+        },
+        SHORT: {
+          lock_profit_pct: policy?.side_policies?.SHORT?.lock_profit_pct ?? fallbackPolicy.lock_profit_pct,
+          initial_sl_pct: policy?.side_policies?.SHORT?.initial_sl_pct ?? fallbackPolicy.initial_sl_pct,
+          protect_trigger_pct: policy?.side_policies?.SHORT?.protect_trigger_pct ?? fallbackPolicy.protect_trigger_pct,
+          trail_sl_pct: policy?.side_policies?.SHORT?.trail_sl_pct ?? fallbackPolicy.trail_sl_pct
+        }
+      },
+      tpOptions,
+      slOptions
+    ));
+  }, [policy?.policy?.initial_sl_pct, policy?.policy?.lock_profit_pct, policy?.policy?.protect_trigger_pct, policy?.policy?.trail_sl_pct, policy?.side_policies, slOptions, tpOptions]);
 
-  const policyReady = complete && tpOptions.length > 0;
+  const updateSidePolicy = (side: "LONG" | "SHORT", patch: Partial<Stage2ExitPolicyDraft>) => {
+    setPolicyDraft((current) => ({
+      ...current,
+      [side]: {
+        ...current[side],
+        ...patch
+      }
+    }));
+  };
+
+  const policyReady = complete && tpOptions.length > 0 && slOptions.length > 0;
+  const normalizedPolicyDraft = useMemo(() => normalizeStage2PolicyDraft(policyDraft, tpOptions, slOptions), [policyDraft, slOptions, tpOptions]);
+  const policyDraftValid = stage2PolicyDraftIsValid(normalizedPolicyDraft, tpOptions, slOptions);
   return (
     <div className="development-stage-body">
       <TerminalPanel
@@ -1380,44 +1760,68 @@ function Stage2Panel({
           <FieldRow label="State" value={running ? "running" : !ready ? "locked" : complete ? "complete" : "ready"} />
           <FieldRow label="Profiled matches" value={formatNumber(stage2?.metrics.stage2_profiled_match_count ?? stage2?.metrics.total_match_signals)} />
           <FieldRow label="Stage 3 trade pool" value={`${formatNumber(stage2?.match_count ?? stage2?.metrics.match_count)} MATCH / ${formatNumber(stage2?.mismatch_count ?? stage2?.metrics.mismatch_count)} MISMATCH`} />
+          <FieldRow label="Side split" value={`${formatNumber(longSplit?.count)} LONG / ${formatNumber(shortSplit?.count)} SHORT`} />
           <FieldRow label="TP band" value={`${formatPct(stage2?.recommended_tp_min_pct)} - ${formatPct(stage2?.recommended_tp_max_pct)}`} />
+          <FieldRow label="SL band" value={`${formatPct(stage2?.recommended_sl_min_pct)} - ${formatPct(stage2?.recommended_sl_max_pct)}`} />
           <FieldRow label="Artifact" value="MATCH travel curve + all-trade setup input" />
         </div>
         {policyReady ? (
           <div className="stage2-policy-card">
             <div className="stage2-policy-card__copy">
               <strong>Exit Policy Handoff</strong>
-              <span>{policy?.exists ? "Promoted policy exists. Update it before rerunning Stage 3 if the exit setup changes." : "Select the numerical profit-protection policy before Stage 3."}</span>
+              <span>{policy?.exists ? "Promoted side policy exists. Update it before rerunning Stage 3 if the exit setup changes." : "Select LONG and SHORT numerical profit-protection policies before Stage 3."}</span>
             </div>
-            <div className="stage2-policy-grid">
-              <label>
-                Lock Profit
-                <select
-                  value={policyDraft.lock_profit_pct}
-                  onChange={(event) => setPolicyDraft({ ...policyDraft, lock_profit_pct: Number(event.target.value) })}
-                >
-                  {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
-                </select>
-              </label>
-              <label>
-                Protect Trigger
-                <select
-                  value={policyDraft.protect_trigger_pct}
-                  onChange={(event) => setPolicyDraft({ ...policyDraft, protect_trigger_pct: Number(event.target.value) })}
-                >
-                  {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
-                </select>
-              </label>
-              <label>
-                Trail SL To
-                <select
-                  value={policyDraft.trail_sl_pct}
-                  onChange={(event) => setPolicyDraft({ ...policyDraft, trail_sl_pct: Number(event.target.value) })}
-                >
-                  {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
-                </select>
-              </label>
-              <button className="button button--secondary" disabled={promotingPolicy} onClick={() => onPromotePolicy(policyDraft)} type="button">
+            <div className="stage2-policy-presets">
+              <button className="button button--secondary button--compact" onClick={() => setPolicyDraft(buildStage2PolicyPreset(stage2, tpOptions, slOptions, "balanced"))} type="button">
+                Balanced
+              </button>
+              <button className="button button--secondary button--compact" onClick={() => setPolicyDraft(buildStage2PolicyPreset(stage2, tpOptions, slOptions, "aggressive"))} type="button">
+                Aggressive
+              </button>
+            </div>
+            {(["LONG", "SHORT"] as const).map((side) => (
+              <div className="stage2-policy-grid" key={side}>
+                <strong>{side}</strong>
+                <label>
+                  Lock Profit
+                  <select
+                    value={policyDraft[side].lock_profit_pct}
+                    onChange={(event) => updateSidePolicy(side, { lock_profit_pct: Number(event.target.value) })}
+                  >
+                    {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Initial SL
+                  <select
+                    value={policyDraft[side].initial_sl_pct}
+                    onChange={(event) => updateSidePolicy(side, { initial_sl_pct: Number(event.target.value) })}
+                  >
+                    {slOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Protect Trigger
+                  <select
+                    value={policyDraft[side].protect_trigger_pct}
+                    onChange={(event) => updateSidePolicy(side, { protect_trigger_pct: Number(event.target.value) })}
+                  >
+                    {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Trail SL To
+                  <select
+                    value={policyDraft[side].trail_sl_pct}
+                    onChange={(event) => updateSidePolicy(side, { trail_sl_pct: Number(event.target.value) })}
+                  >
+                    {tpOptions.map((value) => <option key={value} value={value}>{formatPct(value)}</option>)}
+                  </select>
+                </label>
+              </div>
+            ))}
+            <div className="stage2-policy-actions">
+              <button className="button button--secondary" disabled={promotingPolicy || !policyDraftValid} onClick={() => onPromotePolicy(normalizedPolicyDraft)} type="button">
                 <UploadCloud aria-hidden="true" />
                 {promotingPolicy ? "Promoting" : policy?.exists ? "Update Policy" : "Promote Policy"}
               </button>
@@ -1426,16 +1830,34 @@ function Stage2Panel({
         ) : null}
       </TerminalPanel>
       {complete && stage2 ? (
-        <TerminalPanel className="scroll-panel" title="Capture Curve">
+        <TerminalPanel className="scroll-panel stage2-curve-panel" title="TP Capture Curve">
           <DataTable
             columns={[
               { key: "tp", header: "TP", render: (entry) => `${entry.level}%` },
               { key: "training", header: "Training", render: (entry) => formatCaptureRate(entry.rows.training) },
               { key: "walk", header: "Walk-forward", render: (entry) => formatCaptureRate(entry.rows.walk_forward_test) },
-              { key: "full", header: "Full", render: (entry) => formatCaptureRate(entry.rows.full_cycle) }
+              { key: "full", header: "Full", render: (entry) => formatCaptureRate(entry.rows.full_cycle) },
+              { key: "long", header: "LONG", render: (entry) => formatCaptureRate(longSplit?.results?.[entry.level]?.full_cycle) },
+              { key: "short", header: "SHORT", render: (entry) => formatCaptureRate(shortSplit?.results?.[entry.level]?.full_cycle) }
             ]}
             getRowKey={(entry) => entry.level}
             rows={Object.entries(stage2.results).map(([level, rows]) => ({ level, rows }))}
+          />
+        </TerminalPanel>
+      ) : null}
+      {complete && stage2?.sl_results ? (
+        <TerminalPanel className="scroll-panel stage2-curve-panel" title="Matched Adverse SL Curve">
+          <DataTable
+            columns={[
+              { key: "sl", header: "SL", render: (entry) => `${entry.level}%` },
+              { key: "training", header: "Training hit", render: (entry) => formatCaptureRate(entry.rows.training) },
+              { key: "walk", header: "Walk-forward hit", render: (entry) => formatCaptureRate(entry.rows.walk_forward_test) },
+              { key: "full", header: "Full hit", render: (entry) => formatCaptureRate(entry.rows.full_cycle) },
+              { key: "long", header: "LONG hit", render: (entry) => formatCaptureRate(longSplit?.sl_results?.[entry.level]?.full_cycle) },
+              { key: "short", header: "SHORT hit", render: (entry) => formatCaptureRate(shortSplit?.sl_results?.[entry.level]?.full_cycle) }
+            ]}
+            getRowKey={(entry) => entry.level}
+            rows={Object.entries(stage2.sl_results).map(([level, rows]) => ({ level, rows }))}
           />
         </TerminalPanel>
       ) : null}
@@ -1474,7 +1896,8 @@ function Stage3Panel({
   const fixedComplete = Boolean(grid?.fixed_sl_complete || fixed?.config_id);
   const exactComplete = Boolean(grid?.exact_protection_complete || exact?.config_id);
   const localComplete = Boolean(grid?.local_variants_complete || grid?.exists);
-  const stage0InitialSl = grid?.stage0_risk_policy?.initial_sl_pct;
+  const stage2InitialSl = grid?.stage0_risk_policy?.initial_sl_pct;
+  const stage0MeaningfulMove = grid?.stage0_risk_policy?.stage0_meaningful_move_threshold_pct;
   const stage0HardExit = grid?.stage0_risk_policy?.hard_exit_hours;
   const pyramidBest = pyramid?.best ?? {};
   const pyramidBaseline = pyramid?.baseline ?? {};
@@ -1501,18 +1924,20 @@ function Stage3Panel({
           {!policyReady ? <div className="state-line state-line--warn">Promote a Stage 2 exit policy before running Stage 3.</div> : null}
           {fixedSlRunning ? (
             <StageRunProgress
-              detail="Testing the Stage 2 TP with the original Stage 0 stop and no stop movement"
+              detail="Testing the Stage 2 TP with the selected Stage 2 initial stop and no stop movement"
               steps={["Load executable decisions", "Apply fixed TP/SL", "Walk 5m candles", "Write baseline"]}
               title="Running fixed SL baseline"
             />
           ) : null}
           <div className="field-grid">
-            <FieldRow label="Input" value="Stage 2 final TP + Stage 0 risk" />
+            <FieldRow label="Input" value="Stage 2 final TP + selected Stage 2 initial SL" />
             <FieldRow label="Policy" value={policyReady ? "promoted" : "missing"} />
-            <FieldRow label="Original SL" value={formatPct(stage0InitialSl)} />
+            <FieldRow label="Initial SL" value={formatPct(stage2InitialSl)} />
+            <FieldRow label="Stage 0 move" value={formatPct(stage0MeaningfulMove)} />
             <FieldRow label="Hard exit" value={stage0HardExit ? `${formatNumber(stage0HardExit)}h` : "n/a"} />
             <FieldRow label="Executable decisions" value={formatNumber(grid?.total_executable_decisions ?? grid?.total_signals)} />
-            <FieldRow label="TP / SL" value={`${formatPct(fixed?.final_tp_pct ?? fixed?.tp)} / ${formatPct(fixed?.initial_sl_pct ?? fixed?.sl)}`} />
+            <FieldRow label="LONG TP / SL" value={formatStage3SidePolicy(fixed, "LONG")} />
+            <FieldRow label="SHORT TP / SL" value={formatStage3SidePolicy(fixed, "SHORT")} />
             <FieldRow label="Hits" value={`${formatNumber(fixed?.tp_count ?? 0)} TP / ${formatNumber(fixed?.initial_sl_count ?? 0)} SL / ${formatNumber(fixed?.time_exit_count ?? 0)} time`} />
             <FieldRow label="Net PnL" value={formatPct(fixed?.net_pnl_pct ?? fixed?.pnl_pct)} />
           </div>
@@ -1536,8 +1961,10 @@ function Stage3Panel({
           ) : null}
           <div className="field-grid">
             <FieldRow label="Input" value="3A baseline + Stage 2 protection policy" />
-            <FieldRow label="Trigger / protected SL" value={`${formatPct(exact?.protect_trigger_pct)} / ${formatPct(exact?.trail_sl_pct)}`} />
-            <FieldRow label="TP / initial SL" value={`${formatPct(exact?.final_tp_pct ?? exact?.tp)} / ${formatPct(exact?.initial_sl_pct ?? exact?.sl)}`} />
+            <FieldRow label="LONG TP / SL" value={formatStage3SidePolicy(exact, "LONG")} />
+            <FieldRow label="LONG protection" value={formatStage3SideProtection(exact, "LONG")} />
+            <FieldRow label="SHORT TP / SL" value={formatStage3SidePolicy(exact, "SHORT")} />
+            <FieldRow label="SHORT protection" value={formatStage3SideProtection(exact, "SHORT")} />
             <FieldRow label="Hits" value={`${formatNumber(exact?.tp_count ?? 0)} TP / ${formatNumber(exact?.initial_sl_count ?? 0)} init SL / ${formatNumber(exact?.protected_sl_count ?? 0)} protected`} />
             <FieldRow label="Win rate" value={formatPct(exact?.wr)} />
             <FieldRow label="Net PnL" value={formatPct(exact?.net_pnl_pct ?? exact?.pnl_pct)} />
@@ -1574,14 +2001,14 @@ function Stage3Panel({
             <DataTable
               columns={[
                 { key: "mode", header: "Mode", render: (item) => item.protection_enabled ? "Protected" : "Fixed SL" },
-                { key: "setup", header: "Policy", render: (item) => `${formatPct(item.final_tp_pct ?? item.tp)} TP / ${formatPct(item.initial_sl_pct ?? item.sl)} SL` },
-                { key: "protect", header: "Protect / Trail", render: (item) => `${formatPct(item.protect_trigger_pct)} / ${formatPct(item.trail_sl_pct)}` },
+                { key: "setup", header: "L/S TP / SL", render: (item) => formatStage3Policy(item) },
+                { key: "protect", header: "L/S Protect / Trail", render: (item) => formatStage3Protection(item) },
                 { key: "wr", header: "WR", align: "right", render: (item) => formatPct(item.wr) },
                 { key: "hits", header: "TP / Init SL / Prot SL / Time", render: (item) => `${formatNumber(item.tp_count)} / ${formatNumber(item.initial_sl_count ?? 0)} / ${formatNumber(item.protected_sl_count ?? 0)} / ${formatNumber(item.time_exit_count ?? item.neither)}` },
                 { key: "pf", header: "PF", align: "right", render: (item) => item.profit_factor === 999 ? "inf" : item.profit_factor.toFixed(2) },
                 { key: "pnl", header: "PnL", align: "right", render: (item) => formatPct(item.pnl_pct) }
               ]}
-              getRowKey={(item) => `${item.stage3_step}-${item.final_tp_pct ?? item.tp}-${item.initial_sl_pct ?? item.sl}-${item.protect_trigger_pct}-${item.trail_sl_pct}`}
+              getRowKey={(item) => item.config_id ?? `${item.stage3_step}-${item.final_tp_pct ?? item.tp}-${item.initial_sl_pct ?? item.sl}-${item.protect_trigger_pct}-${item.trail_sl_pct}`}
               rows={grid?.top_5 ?? []}
             />
           ) : null}
@@ -1609,7 +2036,8 @@ function Stage3Panel({
             <FieldRow label="Mode" value={pyramid?.exists ? bestPyramidMode : "not tested"} />
             <FieldRow label="Baseline PnL" value={formatPct(pyramidBaseline.pnl_pct)} />
             <FieldRow label="Best legs / step" value={`${formatNumber(pyramidBest.max_legs ?? pyramid?.max_legs)} legs / ${formatPct(pyramidBest.step_pct)}`} />
-            <FieldRow label="TP / SL" value={`${formatPct(pyramidBest.tp_pct ?? pyramid?.tp_pct)} / ${formatPct(pyramidBest.sl_pct ?? pyramid?.sl_pct)}`} />
+            <FieldRow label="Source TP / SL" value={formatStage3Policy(bestSourceSetup)} />
+            <FieldRow label="Source protection" value={formatStage3Protection(bestSourceSetup)} />
             <FieldRow label="Avg legs" value={formatDecimal(pyramidBest.avg_legs_per_signal)} />
             <FieldRow label="Delta vs baseline" value={formatPct(pyramidBest.delta_vs_baseline_pct)} />
             <FieldRow label="Wins / losses" value={`${formatNumber(pyramidBest.wins)} / ${formatNumber(pyramidBest.losses)}`} />
@@ -1619,7 +2047,8 @@ function Stage3Panel({
             <DataTable
               columns={[
                 { key: "source", header: "Source", render: (item) => item.source_candidate_id ? shortId(item.source_candidate_id) : "baseline" },
-                { key: "setup", header: "Setup", render: (item) => `${formatPct(item.tp_pct ?? pyramid.tp_pct)} TP / ${formatPct(item.sl_pct ?? pyramid.sl_pct)} SL` },
+                { key: "setup", header: "Source TP / SL", render: (item) => item.source_setup ? formatStage3Policy(item.source_setup) : `${formatPct(item.tp_pct ?? pyramid.tp_pct)} TP / ${formatPct(item.sl_pct ?? pyramid.sl_pct)} SL` },
+                { key: "protect", header: "Protection", render: (item) => item.source_setup ? formatStage3Protection(item.source_setup) : "-" },
                 { key: "legs", header: "Legs / Step", render: (item) => `${formatNumber(item.max_legs)} / ${item.step_pct == null ? "base" : formatPct(item.step_pct)}` },
                 { key: "avg", header: "Avg Legs", align: "right", render: (item) => formatDecimal(item.avg_legs_per_signal) },
                 { key: "wl", header: "W / L", align: "right", render: (item) => `${formatNumber(item.wins)} / ${formatNumber(item.losses)}` },
@@ -1667,8 +2096,8 @@ function Stage4Panel({
     )
   );
   const runLabel = running ? "Backtesting" : complete ? inputsDirty ? "Run Updated Test" : "Run New Test" : "Run Expectancy";
-  const bestSetup = best.setup ?? {};
-  const exitMode = bestSetup.protection_enabled ? "Protected SL" : "Fixed SL";
+  const bestSetup: Stage4CandidateResult["setup"] = best.setup ?? {};
+  const exitMode = best.candidate_id ? formatStage4ExitMode(bestSetup) : "n/a";
   const pyramid = bestSetup.pyramid;
   return (
     <div className="development-stage-body">
@@ -1760,12 +2189,13 @@ function Stage4Panel({
             <strong>{formatUsd(account.total_fees_usdt)}</strong>
           </div>
         </div>
+        {best.candidate_id ? <Stage4ExitPolicyPanel setup={bestSetup} /> : null}
         <div className="stage4-footnote-grid">
           <FieldRow label="Input" value="Stage 4 candidates + full canonical decisions" />
           <FieldRow label="Simulator" value="Sequential account backtest" />
-          <FieldRow label="Exit mode" value={best.candidate_id ? exitMode : "n/a"} />
-          <FieldRow label="TP / Initial SL" value={`${formatPct(bestSetup.final_tp_pct ?? bestSetup.tp_pct)} / ${formatPct(bestSetup.initial_sl_pct ?? bestSetup.sl_pct)}`} />
-          <FieldRow label="Protect / Trail" value={bestSetup.protection_enabled ? `${formatPct(bestSetup.protect_trigger_pct)} / ${formatPct(bestSetup.trail_sl_pct)}` : "off"} />
+          <FieldRow label="Exit mode" value={exitMode} />
+          <FieldRow label="TP / Initial SL" value={formatStage3Policy(bestSetup)} />
+          <FieldRow label="Protect / Trail" value={formatStage3Protection(bestSetup)} />
           <FieldRow label="Hard exit" value={bestSetup.max_hold_hours ? `${formatNumber(bestSetup.max_hold_hours)}h` : "n/a"} />
           <FieldRow label="Pyramid" value={pyramid ? `${formatNumber(pyramid.max_legs)} legs @ ${formatPct(pyramid.step_pct)}` : "off"} />
           <FieldRow label="Fees" value="OKX USDT swap taker default, 5 bps per fill" />
@@ -1775,10 +2205,13 @@ function Stage4Panel({
         </div>
       </TerminalPanel>
       {complete && stage4 ? (
-        <TerminalPanel className="scroll-panel" title="Candidate Results">
+        <TerminalPanel className="scroll-panel stage4-results-panel" title="Candidate Results">
           <DataTable
             columns={[
               { key: "id", header: "Candidate", render: (item) => item.candidate_id },
+              { key: "policy", header: "Policy", render: (item) => formatStage3Policy(item.setup) },
+              { key: "protect", header: "Protection", render: (item) => formatStage3Protection(item.setup) },
+              { key: "pyramid", header: "Pyramid", render: (item) => formatPyramidPolicy(item.setup) },
               { key: "net", header: "Net Exp", align: "right", render: (item) => formatPct(item.net_expectancy_pct) },
               { key: "trades", header: "Trades", align: "right", render: (item) => formatNumber(item.executed_trades) },
               { key: "win", header: "Win Rate", align: "right", render: (item) => formatPct(item.win_rate_pct) },
@@ -1791,7 +2224,7 @@ function Stage4Panel({
         </TerminalPanel>
       ) : null}
       {stage4?.stage4_runs?.length ? (
-        <TerminalPanel className="scroll-panel" title="Stage 4 Run History">
+        <TerminalPanel className="scroll-panel stage4-run-history-panel" title="Stage 4 Run History">
           <DataTable
             columns={[
               { key: "time", header: "Run", render: (item) => item.created_at?.replace("T", " ").replace("Z", " UTC") ?? item.run_id },
@@ -1806,6 +2239,25 @@ function Stage4Panel({
           />
         </TerminalPanel>
       ) : null}
+    </div>
+  );
+}
+
+function Stage4ExitPolicyPanel({ setup }: { setup: Stage4CandidateResult["setup"] }) {
+  const sides: ExitSide[] = ["LONG", "SHORT"];
+  return (
+    <div className="stage4-policy-split">
+      <div className="stage4-policy-split__header">
+        <strong>Selected Exit Policy</strong>
+        <span>{setup?.policy_mode === "side_specific" ? "Side-specific Stage 4 setup" : "Shared Stage 4 setup"}</span>
+      </div>
+      {sides.map((side) => (
+        <div className="stage4-policy-split__row" key={side}>
+          <span className={`stage4-policy-split__side stage4-policy-split__side--${side.toLowerCase()}`}>{side}</span>
+          <strong>{formatStage3SidePolicy(setup, side)}</strong>
+          <em>{formatStage3SideProtection(setup, side)}</em>
+        </div>
+      ))}
     </div>
   );
 }

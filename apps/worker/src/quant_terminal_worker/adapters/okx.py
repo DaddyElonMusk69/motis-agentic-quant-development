@@ -110,7 +110,11 @@ class OKXAdapter:
         args = [inst_id, "--bar", bar, "--limit", str(limit)]
         if after:
             args.extend(["--after", after])
-        parsed = self.run_json_command(
+        market_mode = str(self.config.get("market_mode") or "live")
+        market_adapter = self
+        if market_mode != self.config.get("mode", "demo"):
+            market_adapter = OKXAdapter(config={**self.config, "mode": market_mode})
+        parsed = market_adapter.run_json_command(
             "market",
             "candles",
             args,

@@ -340,6 +340,74 @@ def test_stage4_backtest_protected_candidate_moves_stop_after_trigger(tmp_path: 
     assert trade["leg_details"][0]["exit_status"] == "PROTECTED_SL"
 
 
+def test_stage4_backtest_uses_side_specific_candidate_policy_by_direction(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-long", "LONG"), _record("sig-short", "SHORT")],
+        setup={
+            "policy_mode": "side_specific",
+            "tp_pct": 1.0,
+            "sl_pct": 1.0,
+            "final_tp_pct": 1.0,
+            "initial_sl_pct": 1.0,
+            "protection_enabled": False,
+            "max_hold_hours": 1,
+            "side_policies": {
+                "LONG": {
+                    "protection_enabled": False,
+                    "final_tp_pct": 2.0,
+                    "lock_profit_pct": 2.0,
+                    "initial_sl_pct": 0.5,
+                    "protect_trigger_pct": None,
+                    "trail_sl_pct": None,
+                    "hard_exit_hours": 1,
+                },
+                "SHORT": {
+                    "protection_enabled": False,
+                    "final_tp_pct": 0.5,
+                    "lock_profit_pct": 0.5,
+                    "initial_sl_pct": 1.0,
+                    "protect_trigger_pct": None,
+                    "trail_sl_pct": None,
+                    "hard_exit_hours": 1,
+                },
+            },
+        },
+    )
+    session = _session(artifact_root)
+    signals = [
+        _signal("sig-long", "2026-05-01T00:00:00Z", 100),
+        _signal("sig-short", "2026-05-01T02:00:00Z", 200),
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 99.4, "close": 100.9},
+        {"timestamp": "2026-05-01T02:05:00Z", "open": 200, "high": 200.2, "low": 198.8, "close": 199.0},
+    ]
+
+    result = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    long_trade, short_trade = result["ledger"]["candidates"][0]["trades"]
+    assert long_trade["decision_direction"] == "LONG"
+    assert long_trade["initial_sl_pct"] == 0.5
+    assert long_trade["exit_status"] == "INITIAL_SL"
+    assert long_trade["exit_price"] == 99.5
+    assert short_trade["decision_direction"] == "SHORT"
+    assert short_trade["initial_sl_pct"] == 1.0
+    assert short_trade["exit_status"] == "TP"
+    assert short_trade["exit_price"] == 199.0
+    assert result["best_candidate"]["setup"]["policy_mode"] == "side_specific"
+
+
 def test_stage4_backtest_keeps_run_history_and_updates_latest_compatibility_files(tmp_path: Path):
     artifact_root = _write_stage4_fixture(
         tmp_path,

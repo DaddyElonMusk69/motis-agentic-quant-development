@@ -73,6 +73,104 @@ def test_runtime_repository_serializes_datetime_values_inside_wake_json_payloads
     assert stored["exchange_snapshot"]["positions"][0]["opened_at"] == "2026-06-06T04:12:21Z"
 
 
+def test_runtime_repository_enqueues_and_dedupes_active_jobs_by_scope():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+
+    first = repository.enqueue_job(
+        job_type="stage3_local_variants",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave"},
+    )
+    duplicate = repository.enqueue_job(
+        job_type="stage3_local_variants",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave"},
+    )
+
+    assert first["job_id"] == duplicate["job_id"]
+    assert first["status"] == "queued"
+    assert duplicate["payload"] == {"session_id": "stage1-aave"}
+
+    claimed = repository.claim_next_job(worker_id="worker-1")
+    assert claimed["job_id"] == first["job_id"]
+    assert claimed["status"] == "running"
+    assert claimed["locked_by"] == "worker-1"
+
+    repository.complete_job(claimed["job_id"], result={"ok": True})
+    next_job = repository.enqueue_job(
+        job_type="stage3_local_variants",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave", "rerun": True},
+    )
+
+    assert next_job["job_id"] != first["job_id"]
+    assert next_job["status"] == "queued"
+
+
+def test_runtime_repository_cancels_only_queued_jobs():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+
+    queued = repository.enqueue_job(
+        job_type="stage1_score",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave"},
+    )
+    cancelled = repository.cancel_job(queued["job_id"])
+    assert cancelled["status"] == "cancelled"
+
+    running = repository.enqueue_job(
+        job_type="stage1_score",
+        scope_key="stage1_session:stage1-eth",
+        payload={"session_id": "stage1-eth"},
+    )
+    repository.claim_next_job(worker_id="worker-1")
+
+    assert repository.cancel_job(running["job_id"]) is None
+
+
+def test_runtime_repository_reports_worker_runtime_status():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+
+    offline = repository.get_worker_runtime_status()
+    assert offline["status"] == "offline"
+    assert offline["active_worker_count"] == 0
+
+    repository.record_worker_heartbeat("worker-1", status="idle")
+    online = repository.get_worker_runtime_status()
+
+    assert online["status"] == "online"
+    assert online["online"] is True
+    assert online["active_worker_count"] == 1
+    assert online["workers"][0]["worker_id"] == "worker-1"
+
+
+def test_runtime_repository_job_heartbeat_refreshes_worker_runtime_status():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    job = repository.enqueue_job(
+        job_type="stage1_score",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave"},
+    )
+    claimed = repository.claim_next_job(worker_id="worker-1")
+
+    repository.heartbeat_job(claimed["job_id"], current_step="scoring")
+    runtime = repository.get_worker_runtime_status()
+
+    assert job["job_id"] == claimed["job_id"]
+    assert runtime["status"] == "online"
+    assert runtime["workers"][0]["status"] == "running"
+    assert runtime["workers"][0]["current_job_id"] == job["job_id"]
+    assert runtime["workers"][0]["current_step"] == "scoring"
+
+
 def test_runtime_repository_closes_all_open_owner_states_for_route_instrument():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     metadata.create_all(engine)

@@ -64,6 +64,37 @@ def test_market_data_reader_reads_partitioned_parquet_sorted_deduped_and_utc(tmp
     assert str(candles[1].close) == "110"
 
 
+def test_market_data_reader_preserves_extra_parquet_columns_for_engine_rows(tmp_path: Path):
+    storage_uri = tmp_path / ".data" / "market-data" / "origin=derived" / "source=okx" / "type=candles" / "asset=BTC" / "timeframe=2h"
+    month_path = storage_uri / "year=2026" / "month=06" / "data.parquet"
+    month_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {**_row("2026-06-01T00:00:00Z", close=100, confirm=1), "ema_676": "99.5"},
+                {**_row("2026-06-01T02:00:00Z", close=102, confirm=0), "ema_676": "100.0"},
+            ]
+        ),
+        month_path,
+    )
+    reader = MarketDataReader(
+        repository=FakeRepository(
+            {
+                "dataset_id": "btc-derived-2h",
+                "storage_backend": "parquet",
+                "storage_uri": str(storage_uri),
+            }
+        ),
+        workspace_root=tmp_path,
+    )
+
+    rows = reader.get_rows(asset="btc", timeframe="2h", origin="derived")
+
+    assert len(rows) == 1
+    assert rows[0]["timestamp"].tzinfo is UTC
+    assert rows[0]["ema_676"] == "99.5"
+
+
 def _row(timestamp: str, *, close: int, confirm: int) -> dict[str, object]:
     return {
         "timestamp": timestamp,

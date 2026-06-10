@@ -452,14 +452,19 @@ def _stage2_capture_state(artifact_root: Path) -> dict[str, Any]:
         "summary_path": str(summary_path) if summary_path.exists() else None,
         "metrics": capture.get("metrics", {}) if capture else {},
         "results": capture.get("results", {}) if capture else {},
+        "sl_results": capture.get("sl_results", {}) if capture else {},
+        "side_splits": capture.get("side_splits", {}) if capture else {},
         "cohorts": capture.get("cohorts", {}) if capture else {},
         "stage3_input": capture.get("stage3_input", {}) if capture else {},
         "tp_levels": capture.get("tp_levels", []) if capture else [],
+        "sl_levels": capture.get("sl_levels", []) if capture else [],
         "total_trade_decisions": (capture.get("metrics") or {}).get("total_trade_decisions", 0) if capture else 0,
         "match_count": (capture.get("metrics") or {}).get("match_count", 0) if capture else 0,
         "mismatch_count": (capture.get("metrics") or {}).get("mismatch_count", 0) if capture else 0,
         "recommended_tp_min_pct": (capture.get("stage3_input") or {}).get("recommended_tp_min_pct") if capture else None,
         "recommended_tp_max_pct": (capture.get("stage3_input") or {}).get("recommended_tp_max_pct") if capture else None,
+        "recommended_sl_min_pct": (capture.get("stage3_input") or {}).get("recommended_sl_min_pct") if capture else None,
+        "recommended_sl_max_pct": (capture.get("stage3_input") or {}).get("recommended_sl_max_pct") if capture else None,
     }
 
 
@@ -470,6 +475,8 @@ def _stage2_exit_policy_state(artifact_root: Path) -> dict[str, Any]:
         "exists": policy is not None,
         "policy_path": str(policy_path) if policy_path.exists() else None,
         "policy": policy.get("policy", {}) if policy else {},
+        "policy_mode": policy.get("policy_mode", "shared") if policy else None,
+        "side_policies": policy.get("side_policies", {}) if policy else {},
         "created_at": policy.get("created_at") if policy else None,
     }
 

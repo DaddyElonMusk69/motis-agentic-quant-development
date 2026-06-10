@@ -32,6 +32,7 @@ from quant_terminal_sdk.market_data_reader import MarketDataReader
 from quant_terminal_worker.adapters.exchange import ExchangeAdapterError, build_exchange_adapter
 from quant_terminal_worker.adapters.okx import OKXAdapter
 from quant_terminal_worker.backtests.stage1 import run_stage1_backtest
+from quant_terminal_worker.ingestion.ema_enrichment import enrich_derived_ema_datasets
 from quant_terminal_worker.ingestion.raw_candle_fill import fill_raw_candle_dataset
 from quant_terminal_worker.ingestion.legacy_signals import import_legacy_signal_sets
 from quant_terminal_worker.ingestion.signal_pool_extension import extend_signal_pool_from_local_candles
@@ -140,10 +141,19 @@ class Stage1CanonicalRequest(BaseModel):
     force: bool = False
 
 
-class Stage2ExitPolicyRequest(BaseModel):
+class Stage2ExitPolicyValues(BaseModel):
     lock_profit_pct: float = Field(ge=0)
+    initial_sl_pct: float = Field(ge=0)
     protect_trigger_pct: float = Field(gt=0)
-    trail_sl_pct: float = Field(ge=0)
+    trail_sl_pct: float = Field(gt=0)
+
+
+class Stage2ExitPolicyRequest(BaseModel):
+    lock_profit_pct: float | None = Field(default=None, ge=0)
+    initial_sl_pct: float | None = Field(default=None, ge=0)
+    protect_trigger_pct: float | None = Field(default=None, gt=0)
+    trail_sl_pct: float | None = Field(default=None, gt=0)
+    side_policies: dict[str, Stage2ExitPolicyValues] | None = None
 
 
 class Stage4RealizedExpectancyRequest(BaseModel):
@@ -283,6 +293,25 @@ def create_app(
                 raise HTTPException(status_code=503, detail="DATABASE_URL is not configured")
             runtime_repo = RuntimeRepository(database_url)
         return runtime_repo
+
+    def enqueue_runtime_job(
+        repository: Any,
+        *,
+        job_type: str,
+        scope_key: str,
+        payload: dict[str, Any],
+        current_step: str,
+    ) -> dict[str, Any] | None:
+        enqueuer = getattr(repository, "enqueue_job", None)
+        if not callable(enqueuer):
+            return None
+        job = enqueuer(
+            job_type=job_type,
+            scope_key=scope_key,
+            payload=payload,
+            current_step=current_step,
+        )
+        return {"accepted": True, "job": _relative_nested_paths(Path.cwd(), job)}
 
     def build_execution_adapter(route: dict[str, Any]) -> Any:
         try:
@@ -446,17 +475,75 @@ def create_app(
             )
         }
 
+    @app.get("/api/v1/jobs/runtime")
+    def get_job_runtime_status() -> dict[str, Any]:
+        repository = get_runtime_repository()
+        status_reader = getattr(repository, "get_worker_runtime_status", None)
+        if not callable(status_reader):
+            raise HTTPException(status_code=503, detail="job runtime is not configured")
+        return {"worker_runtime": _relative_nested_paths(Path.cwd(), status_reader())}
+
+    @app.get("/api/v1/jobs")
+    def list_jobs(scope_key: str | None = None, limit: int = 50) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        lister = getattr(repository, "list_jobs", None)
+        if not callable(lister):
+            raise HTTPException(status_code=503, detail="job runtime is not configured")
+        return {
+            "jobs": _relative_nested_paths(
+                Path.cwd(),
+                lister(scope_key=scope_key, limit=min(limit, 200)),
+            )
+        }
+
+    @app.get("/api/v1/jobs/{job_id}")
+    def get_job(job_id: str) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        getter = getattr(repository, "get_job", None)
+        if not callable(getter):
+            raise HTTPException(status_code=503, detail="job runtime is not configured")
+        job = getter(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"job": _relative_nested_paths(Path.cwd(), job)}
+
+    @app.post("/api/v1/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        canceller = getattr(repository, "cancel_job", None)
+        if not callable(canceller):
+            raise HTTPException(status_code=503, detail="job runtime is not configured")
+        job = canceller(job_id)
+        if job is None:
+            raise HTTPException(status_code=409, detail="job cannot be cancelled")
+        return {"job": _relative_nested_paths(Path.cwd(), job)}
+
     @app.post("/api/v1/signal-engines/{signal_engine_id}/signal-sets/{asset}/extend-local")
     def extend_signal_set_from_local_candles(
         signal_engine_id: str,
         asset: str,
         request: SignalPoolExtendRequest,
     ) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        if signal_pool_extender is None:
+            queued = enqueue_runtime_job(
+                repository,
+                job_type="signal_pool_extend",
+                scope_key=f"signal_set:{signal_engine_id}:{asset.upper()}",
+                payload={
+                    "signal_engine_id": signal_engine_id,
+                    "asset": asset,
+                    "target_end": request.target_end,
+                },
+                current_step="queued",
+            )
+            if queued:
+                return queued
         service = signal_pool_extender or extend_signal_pool_from_local_candles
         try:
             return service(
                 workspace_root=Path.cwd(),
-                repository=get_runtime_repository(),
+                repository=repository,
                 signal_engine_id=signal_engine_id,
                 asset=asset,
                 target_end=request.target_end,
@@ -765,7 +852,8 @@ def create_app(
 
     @app.post("/api/v1/research/stage1-sessions/{session_id}/canonical-stage1a")
     def run_stage1_canonical_readout(session_id: str, request: Stage1CanonicalRequest = Stage1CanonicalRequest()) -> dict[str, Any]:
-        session = get_runtime_repository().get_stage1_research_session(session_id)
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
@@ -777,6 +865,15 @@ def create_app(
                     "blockers": gate["blockers"],
                 },
             )
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage1_canonical",
+            scope_key=f"stage1_session:{session_id}",
+            payload={"session_id": session_id, "force": request.force},
+            current_step="queued",
+        )
+        if queued:
+            return queued
         try:
             result = run_stage1a_canonical_full_cycle(
                 workspace_root=Path.cwd(),
@@ -811,6 +908,15 @@ def create_app(
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
         if session.get("status") != "stage1a_frozen" or not (gate.get("canonical_readout") or {}).get("exists"):
             raise HTTPException(status_code=400, detail="Stage 2 requires a frozen canonical Stage 1A readout")
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage2_capture_curve",
+            scope_key=f"stage1_session:{session_id}",
+            payload={"session_id": session_id},
+            current_step="queued",
+        )
+        if queued:
+            return queued
         try:
             result = run_stage2_capture_curve(
                 workspace_root=Path.cwd(),
@@ -844,19 +950,20 @@ def create_app(
         promotion_root = artifact_root / "promotion"
         capture_path = promotion_root / "stage2_capture_curve.json"
         capture = json.loads(capture_path.read_text())
-        allowed = _stage2_policy_allowed_values(capture)
-        selected = {
-            "lock_profit_pct": float(request.lock_profit_pct),
-            "protect_trigger_pct": float(request.protect_trigger_pct),
-            "trail_sl_pct": float(request.trail_sl_pct),
-        }
-        invalid = [key for key, value in selected.items() if round(value, 10) not in allowed]
-        if invalid:
-            raise HTTPException(status_code=400, detail=f"Stage 2 policy values must be selected from the capture curve TP band: {', '.join(invalid)}")
-        if request.trail_sl_pct > request.protect_trigger_pct:
-            raise HTTPException(status_code=400, detail="trail_sl_pct cannot be greater than protect_trigger_pct")
-        if request.protect_trigger_pct > request.lock_profit_pct:
-            raise HTTPException(status_code=400, detail="protect_trigger_pct cannot be greater than lock_profit_pct")
+        allowed_tp = _stage2_policy_allowed_values(capture, key="tp_levels", fallback_key="results")
+        allowed_sl = _stage2_policy_allowed_values(capture, key="sl_levels", fallback_key="sl_results")
+        if not allowed_sl:
+            raise HTTPException(
+                status_code=400,
+                detail="Stage 2 exit policy requires a matched adverse SL band. Rerun Stage 2 capture to rebuild the SL curve.",
+            )
+        try:
+            policy_mode, side_policies = _normalize_stage2_side_policies(request)
+            for side, side_policy in side_policies.items():
+                _validate_stage2_policy_values(side_policy, allowed_tp=allowed_tp, allowed_sl=allowed_sl, label=side)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        selected = side_policies["LONG"]
 
         policy = {
             "schema_version": "0.1",
@@ -867,9 +974,11 @@ def create_app(
             "asset": session.get("asset"),
             "strategy_id": session.get("strategy_id"),
             "policy": selected,
+            "policy_mode": policy_mode,
+            "side_policies": side_policies,
             "source": {
                 "capture_curve_path": str(capture_path),
-                "selection_source": "stage2_capture_curve_tp_band",
+                "selection_source": "stage2_capture_curve_tp_and_sl_bands",
             },
         }
         policy_path = promotion_root / "stage2_exit_policy.json"
@@ -906,6 +1015,15 @@ def create_app(
             raise HTTPException(status_code=400, detail="Stage 3 requires completed Stage 2 travel capture")
         if not (gate.get("stage2_exit_policy") or {}).get("exists"):
             raise HTTPException(status_code=400, detail="Stage 3 requires promoted Stage 2 exit policy")
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage3_policy_step",
+            scope_key=f"stage1_session:{session_id}",
+            payload={"session_id": session_id, "step": step},
+            current_step="queued",
+        )
+        if queued:
+            return queued
         try:
             runner = {
                 "grid_search": run_stage3_grid_search,
@@ -937,6 +1055,15 @@ def create_app(
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
         if not (gate.get("stage3_grid") or {}).get("exists"):
             raise HTTPException(status_code=400, detail="Stage 3 pyramid requires completed Stage 3 policy test")
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage3_pyramid",
+            scope_key=f"stage1_session:{session_id}",
+            payload={"session_id": session_id},
+            current_step="queued",
+        )
+        if queued:
+            return queued
         try:
             result = run_stage3_pyramid(
                 workspace_root=Path.cwd(),
@@ -965,6 +1092,20 @@ def create_app(
         gate = build_stage1_gate_summary(workspace_root=Path.cwd(), session=session)
         if not (gate.get("stage3_pyramid") or {}).get("exists"):
             raise HTTPException(status_code=400, detail="Stage 4 requires completed Stage 3 pyramid")
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage4_realized_expectancy",
+            scope_key=f"stage1_session:{session_id}",
+            payload={
+                "session_id": session_id,
+                "initial_capital_usdt": request.initial_capital_usdt,
+                "margin_allocation_pct": request.margin_allocation_pct,
+                "leverage": request.leverage,
+            },
+            current_step="queued",
+        )
+        if queued:
+            return queued
         try:
             result = run_stage4_realized_expectancy(
                 workspace_root=Path.cwd(),
@@ -1264,7 +1405,8 @@ def create_app(
         return _score_stage1_iteration(session_id=session_id, iteration_id=iteration_id, sample_role="walk_forward_test")
 
     def _score_stage1_iteration(*, session_id: str, iteration_id: str, sample_role: str) -> dict[str, Any]:
-        session = get_runtime_repository().get_stage1_research_session(session_id)
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
         _ensure_stage1_session_mutable(session)
@@ -1274,6 +1416,19 @@ def create_app(
         iteration_root = artifact_root / "iterations" / iteration_id
         if not iteration_root.is_dir():
             raise HTTPException(status_code=404, detail="Stage 1 iteration not found")
+        enqueuer = getattr(repository, "enqueue_job", None)
+        if callable(enqueuer):
+            job = enqueuer(
+                job_type="stage1_score",
+                scope_key=f"stage1_session:{session_id}",
+                payload={
+                    "session_id": session_id,
+                    "iteration_id": iteration_id,
+                    "sample_role": sample_role,
+                },
+                current_step="queued",
+            )
+            return {"accepted": True, "job": _relative_nested_paths(Path.cwd(), job)}
         try:
             score = run_stage1a_score(iteration_root=iteration_root, sample_role=sample_role)
         except ValueError as exc:
@@ -1405,6 +1560,17 @@ def create_app(
         candidate = get_runtime_repository().get_stage0_universe_candidate(request.candidate_id)
         if candidate is None:
             raise HTTPException(status_code=404, detail="stage0 universe candidate not found")
+        queued = None
+        if injected_stage0_executor is None:
+            queued = enqueue_runtime_job(
+                get_runtime_repository(),
+                job_type="stage0_candidate",
+                scope_key=f"stage0:{universe_run_id}",
+                payload={"universe_run_id": universe_run_id, "candidate_id": request.candidate_id},
+                current_step="queued",
+            )
+        if queued:
+            return queued
 
         result = run_stage0_candidate(universe_run, candidate)
         get_runtime_repository().update_stage0_universe_candidate(result["candidate"])
@@ -1419,6 +1585,17 @@ def create_app(
         universe_run = get_runtime_repository().get_stage0_universe_run(universe_run_id)
         if universe_run is None:
             raise HTTPException(status_code=404, detail="stage0 universe run not found")
+        queued = None
+        if injected_stage0_executor is None:
+            queued = enqueue_runtime_job(
+                get_runtime_repository(),
+                job_type="stage0_candidate_batch",
+                scope_key=f"stage0:{universe_run_id}",
+                payload={"universe_run_id": universe_run_id, "limit": request.limit},
+                current_step="queued",
+            )
+        if queued:
+            return queued
 
         all_candidates = get_runtime_repository().list_stage0_universe_candidates(universe_run_id)
         pending_candidates = [
@@ -1569,15 +1746,43 @@ def create_app(
         plan = build_refresh_plan(registration)
         if plan["status"] == "blocked":
             return plan
+        if fill_service is None:
+            queued = enqueue_runtime_job(
+                get_runtime_repository(),
+                job_type="market_data_refresh",
+                scope_key=f"dataset:{dataset_id}",
+                payload={
+                    "dataset_id": dataset_id,
+                    "okx_mode": os.environ.get("OKX_MODE", "demo"),
+                    "market_mode": "live",
+                },
+                current_step="queued",
+            )
+            if queued:
+                return queued
         service = fill_service or fill_raw_candle_dataset
         try:
             return service(
                 registration=registration,
                 repository=get_market_data_repository(),
-                adapter=OKXAdapter({"backend": "okx_cli", "mode": os.environ.get("OKX_MODE", "demo")}),
+                adapter=OKXAdapter({"backend": "okx_cli", "mode": os.environ.get("OKX_MODE", "demo"), "market_mode": "live"}),
             )
         except ExchangeAdapterError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/v1/market-data/assets/{asset}/ema/refresh")
+    def refresh_asset_ema_data(asset: str) -> dict[str, Any]:
+        asset = asset.upper()
+        queued = enqueue_runtime_job(
+            get_runtime_repository(),
+            job_type="market_data_ema_refresh",
+            scope_key=f"asset:{asset}:ema",
+            payload={"asset": asset},
+            current_step="queued",
+        )
+        if queued:
+            return queued
+        return enrich_derived_ema_datasets(repository=get_market_data_repository(), asset=asset)
 
     return app
 
@@ -2316,10 +2521,10 @@ def _stage1_role_next_action(gate: dict[str, Any] | None) -> dict[str, Any]:
     return _next_action("create_training_bundle", "Create Training Bundle", target_stage="stage1")
 
 
-def _stage2_policy_allowed_values(capture: dict[str, Any]) -> set[float]:
-    values = capture.get("tp_levels")
+def _stage2_policy_allowed_values(capture: dict[str, Any], *, key: str, fallback_key: str) -> set[float]:
+    values = capture.get(key)
     if not isinstance(values, list) or not values:
-        values = list((capture.get("results") or {}).keys())
+        values = list((capture.get(fallback_key) or {}).keys())
     allowed: set[float] = set()
     for value in values:
         try:
@@ -2327,6 +2532,62 @@ def _stage2_policy_allowed_values(capture: dict[str, Any]) -> set[float]:
         except (TypeError, ValueError):
             continue
     return allowed
+
+
+def _normalize_stage2_side_policies(request: Stage2ExitPolicyRequest) -> tuple[str, dict[str, dict[str, float]]]:
+    if request.side_policies:
+        missing = [side for side in ("LONG", "SHORT") if side not in request.side_policies]
+        if missing:
+            raise ValueError(f"Stage 2 side-specific policy requires both LONG and SHORT: missing {', '.join(missing)}")
+        return (
+            "side_specific",
+            {
+                side: _stage2_policy_values_to_dict(request.side_policies[side])
+                for side in ("LONG", "SHORT")
+            },
+        )
+    required = ("lock_profit_pct", "initial_sl_pct", "protect_trigger_pct", "trail_sl_pct")
+    missing = [key for key in required if getattr(request, key) is None]
+    if missing:
+        raise ValueError(f"Stage 2 shared policy is missing values: {', '.join(missing)}")
+    shared = {
+        "lock_profit_pct": float(request.lock_profit_pct),
+        "initial_sl_pct": float(request.initial_sl_pct),
+        "protect_trigger_pct": float(request.protect_trigger_pct),
+        "trail_sl_pct": float(request.trail_sl_pct),
+    }
+    return "shared", {"LONG": dict(shared), "SHORT": dict(shared)}
+
+
+def _stage2_policy_values_to_dict(values: Stage2ExitPolicyValues) -> dict[str, float]:
+    return {
+        "lock_profit_pct": float(values.lock_profit_pct),
+        "initial_sl_pct": float(values.initial_sl_pct),
+        "protect_trigger_pct": float(values.protect_trigger_pct),
+        "trail_sl_pct": float(values.trail_sl_pct),
+    }
+
+
+def _validate_stage2_policy_values(
+    policy: dict[str, float],
+    *,
+    allowed_tp: set[float],
+    allowed_sl: set[float],
+    label: str,
+) -> None:
+    invalid_tp = [
+        key
+        for key in ("lock_profit_pct", "protect_trigger_pct", "trail_sl_pct")
+        if round(float(policy[key]), 10) not in allowed_tp
+    ]
+    if invalid_tp:
+        raise ValueError(f"{label} Stage 2 policy values must be selected from the capture curve TP band: {', '.join(invalid_tp)}")
+    if round(float(policy["initial_sl_pct"]), 10) not in allowed_sl:
+        raise ValueError(f"{label} initial_sl_pct must be selected from the Stage 2 matched adverse SL band")
+    if policy["trail_sl_pct"] > policy["protect_trigger_pct"]:
+        raise ValueError(f"{label} trail_sl_pct cannot be greater than protect_trigger_pct")
+    if policy["protect_trigger_pct"] > policy["lock_profit_pct"]:
+        raise ValueError(f"{label} protect_trigger_pct cannot be greater than lock_profit_pct")
 
 
 def _ensure_stage1_session_mutable(session: dict[str, Any]) -> None:

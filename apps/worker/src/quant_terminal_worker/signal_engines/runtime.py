@@ -36,6 +36,8 @@ class EngineTrainingContext:
     start: datetime
     end: datetime
     raw_candle_end: datetime
+    packet_sink: Callable[[list[dict[str, Any]]], None] | None = None
+    packet_chunk_size: int = 500
 
 
 @dataclass(frozen=True, slots=True)

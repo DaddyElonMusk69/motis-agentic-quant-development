@@ -159,6 +159,168 @@
       }
     }
   },
+  "vegas_ema_recursive": {
+    "signal_engine_id": "vegas_ema_recursive",
+    "version": "0.1",
+    "name": "Vegas EMA Recursive",
+    "description": "Vegas EMA tunnel signal engine that consumes precomputed completed-HTF EMA data and applies one active-candle recursive EMA update for live/backtest parity.",
+    "code_ref": {
+      "path": "apps/worker/src/quant_terminal_worker/signal_engines/vegas_ema_recursive.py",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py"
+    },
+    "required_data": [
+      {
+        "data_type": "candles",
+        "origin": "raw",
+        "timeframe": "5m",
+        "lookback_bars": 20000,
+        "freshness_tolerance_seconds": 300
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "2h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "4h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "8h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "12h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "1d",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      }
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_recursive:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_recursive:scan_live_signal",
+    "configuration_schema": {
+      "default_parameters": {
+        "timeframes": ["2h", "4h", "8h", "12h", "1d"],
+        "context_bars": 80,
+        "proximity_threshold": "0.002",
+        "vote_threshold": 2,
+        "dedupe_window_minutes": 120,
+        "ema_mode": "recursive_precomputed_completed_htf_plus_active_candle",
+        "ema_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      }
+    }
+  },
+  "vegas_ema_5m_cluster": {
+    "signal_engine_id": "vegas_ema_5m_cluster",
+    "version": "0.1",
+    "name": "Vegas 5m EMA Cluster",
+    "description": "5m-only Vegas EMA rail cluster proximity engine that emits when at least three EMA rails approach price within tolerance.",
+    "code_ref": {
+      "path": "apps/worker/src/quant_terminal_worker/signal_engines/vegas_ema_5m_cluster.py",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_5m_hft_base.py"
+    },
+    "required_data": [
+      {
+        "data_type": "candles",
+        "origin": "raw",
+        "timeframe": "5m",
+        "lookback_bars": 20000,
+        "freshness_tolerance_seconds": 300
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "5m",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "2h",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      },
+      {
+        "data_type": "candles",
+        "origin": "derived",
+        "timeframe": "1d",
+        "lookback_bars": 80,
+        "source": {
+          "data_type": "candles",
+          "origin": "raw",
+          "timeframe": "5m"
+        },
+        "required_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      }
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_5m_cluster:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.vegas_ema_5m_cluster:scan_live_signal",
+    "configuration_schema": {
+      "default_parameters": {
+        "context_bars": 80,
+        "proximity_threshold": "0.002",
+        "vote_threshold": 3,
+        "dedupe_window_minutes": 120,
+        "ema_mode": "precomputed_5m_ema_cluster",
+        "context_timeframes": ["2h", "1d"],
+        "ema_columns": ["ema_36", "ema_43", "ema_144", "ema_169", "ema_576", "ema_676"]
+      }
+    }
+  },
   "bollinger": {
     "signal_engine_id": "bollinger",
     "version": "0.1",

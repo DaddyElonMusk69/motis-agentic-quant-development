@@ -85,6 +85,73 @@ def test_stage3_pyramid_reads_each_non_pyramid_stage4_candidate(tmp_path: Path):
     assert {candidate["source_candidate_id"] for candidate in pyramid_candidates} == {"numeric_a", "numeric_b"}
 
 
+def test_stage3_pyramid_scores_side_specific_candidate_by_trade_direction(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "stage3_trade_inputs.json").write_text(
+        json.dumps(
+            [
+                {
+                    "signal_id": "sig-long",
+                    "sample_role": "training",
+                    "decision_direction": "LONG",
+                    "direction": "LONG",
+                    "agreement": "MATCH",
+                    "signal_ts": "2026-05-01T00:00:00Z",
+                    "reference_price": 100,
+                },
+                {
+                    "signal_id": "sig-short",
+                    "sample_role": "training",
+                    "decision_direction": "SHORT",
+                    "direction": "SHORT",
+                    "agreement": "MATCH",
+                    "signal_ts": "2026-05-01T02:00:00Z",
+                    "reference_price": 200,
+                },
+            ]
+        )
+    )
+    _write_stage2_capture(promotion_root, tp_levels=[0.5, 1.0, 1.5, 2.0])
+    _write_stage4_candidates(
+        promotion_root,
+        [
+            {
+                "candidate_id": "numeric_side_specific",
+                "setup": {
+                    "entry_model": "market",
+                    "policy_mode": "side_specific",
+                    "tp_pct": 1.0,
+                    "sl_pct": 1.0,
+                    "timeout_policy": "close_at_cutoff",
+                    "side_policies": {
+                        "LONG": {"final_tp_pct": 2.0, "initial_sl_pct": 0.5, "protection_enabled": False},
+                        "SHORT": {"final_tp_pct": 0.5, "initial_sl_pct": 1.0, "protection_enabled": False},
+                    },
+                },
+            }
+        ],
+    )
+    session = _session(artifact_root)
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.2, "low": 99.4, "close": 100.9},
+        {"timestamp": "2026-05-01T02:05:00Z", "open": 200, "high": 200.2, "low": 198.8, "close": 199.0},
+    ]
+
+    result = run_stage3_pyramid(workspace_root=tmp_path, session=session, candles=candles, steps=[0.5], shortlist_size=1, fees_bps_per_side=0)
+
+    assert result["baseline"]["pnl_pct"] == 0.0
+    pyramid_candidates = [
+        candidate
+        for candidate in result["stage4_candidates"]["candidates"]
+        if candidate["candidate_id"].startswith("pyramid_")
+    ]
+    assert pyramid_candidates
+    assert pyramid_candidates[0]["setup"]["policy_mode"] == "side_specific"
+    assert pyramid_candidates[0]["setup"]["side_policies"]["SHORT"]["final_tp_pct"] == 0.5
+
+
 def test_stage3_pyramid_refuses_missing_stage3_candidate_shortlist(tmp_path: Path):
     artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
     promotion_root = artifact_root / "promotion"

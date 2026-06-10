@@ -41,7 +41,7 @@ def scan_latest_live_signal(
         raise ValueError(result.reason or "live signal scan blocked")
     if result.signal is None:
         raise ValueError("fresh live signal scan result is missing signal")
-    payload = result.signal.to_mapping()
+    payload = _restore_packet_audit_fields(result.signal.to_mapping())
     timestamp = _parse_timestamp(str(payload["timestamp"]))
     return {
         "signal_id": _build_live_signal_id(route=route, timestamp=timestamp),
@@ -62,6 +62,15 @@ def _engine_parameters(route: dict[str, Any]) -> dict[str, Any]:
     setup = bundle.get("execution_setup") if isinstance(bundle.get("execution_setup"), dict) else {}
     engine_parameters = setup.get("engine_parameters") if isinstance(setup.get("engine_parameters"), dict) else {}
     return dict(engine_parameters)
+
+
+def _restore_packet_audit_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    restored = dict(payload)
+    for key in ("interactions", "charts"):
+        if key in evidence and key not in restored:
+            restored[key] = evidence[key]
+    return restored
 
 
 def _spec_default_parameters(spec: Any) -> dict[str, Any]:

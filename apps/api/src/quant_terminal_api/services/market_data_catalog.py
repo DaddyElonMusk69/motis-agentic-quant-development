@@ -95,6 +95,7 @@ def _serialize_dataset(row: dict[str, Any]) -> dict[str, Any]:
         "row_count": row["row_count"],
         "storage_backend": row["storage_backend"],
         "storage_uri": row["storage_uri"],
+        "schema_descriptor": row.get("schema_descriptor") if isinstance(row.get("schema_descriptor"), dict) else {},
         "quality_status": row["quality_status"],
         "ingestion_version": row["ingestion_version"],
     }

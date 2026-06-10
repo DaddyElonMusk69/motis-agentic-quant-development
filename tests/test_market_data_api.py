@@ -23,6 +23,7 @@ class FakeMarketDataRepository:
                 "row_count": 100,
                 "storage_backend": "parquet",
                 "storage_uri": ".data/market-data",
+                "schema_descriptor": {"columns": ["timestamp", "open", "high", "low", "close", "volume"]},
                 "quality_status": "ingested",
                 "ingestion_version": "legacy",
             }
@@ -58,6 +59,36 @@ def test_market_data_catalog_endpoint_uses_repository():
 
     assert response.status_code == 200
     assert response.json()["summary"] == {"assets": 1, "datasets": 1, "data_types": ["candles"]}
+    assert response.json()["assets"][0]["datasets"][0]["schema_descriptor"]["columns"] == ["timestamp", "open", "high", "low", "close", "volume"]
+
+
+def test_market_data_ema_refresh_endpoint_queues_worker_job():
+    class FakeRuntimeRepository:
+        def enqueue_job(self, *, job_type, scope_key, payload, current_step):
+            return {
+                "job_id": "job-ema-btc",
+                "job_type": job_type,
+                "scope_key": scope_key,
+                "status": "queued",
+                "payload": payload,
+                "result": {},
+                "error": {},
+                "current_step": current_step,
+            }
+
+    client = TestClient(
+        create_app(
+            market_data_repository=FakeMarketDataRepository(),
+            runtime_repository=FakeRuntimeRepository(),
+        )
+    )
+
+    response = client.post("/api/v1/market-data/assets/btc/ema/refresh")
+
+    assert response.status_code == 200
+    assert response.json()["accepted"] is True
+    assert response.json()["job"]["job_type"] == "market_data_ema_refresh"
+    assert response.json()["job"]["payload"] == {"asset": "BTC"}
 
 
 def test_market_data_refresh_endpoint_fills_dataset():

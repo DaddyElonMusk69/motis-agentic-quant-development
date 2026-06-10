@@ -170,7 +170,7 @@ def run_stage3_local_variants(
         raise ValueError("Stage 3C local variants requires completed Stage 3B exact protection.")
     local_configs = _local_variant_configs(
         stage2_policy=context["stage2_policy"],
-        stage0_initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        base_initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
         tp_levels=context["tp_levels"],
         hard_exit_hours=context["hard_exit_hours"],
     )
@@ -237,8 +237,10 @@ def _prepare_stage3_context(
     stage2_policy = _load_stage2_exit_policy(promotion_root / "stage2_exit_policy.json")
     stage0_risk = _load_stage0_risk_policy(workspace_root=workspace_root, session=session)
     hard_exit_hours = int(forward_hours or stage0_risk["hard_exit_hours"])
+    policy_values = stage2_policy["policy"]
     risk_policy = {
-        "initial_sl_pct": float(stage0_risk["initial_sl_pct"]),
+        "initial_sl_pct": float(policy_values["initial_sl_pct"]),
+        "stage0_meaningful_move_threshold_pct": float(stage0_risk["initial_sl_pct"]),
         "hard_exit_hours": hard_exit_hours,
     }
     tp_levels = tp_values or _load_stage2_tp_levels(promotion_root / "stage2_capture_curve.json")
@@ -264,30 +266,44 @@ def _prepare_stage3_context(
 
 
 def _fixed_sl_config(context: dict[str, Any]) -> dict[str, Any]:
+    side_policies = _stage2_config_side_policies(
+        context["stage2_policy"],
+        protection_enabled=False,
+        hard_exit_hours=context["hard_exit_hours"],
+    )
     return _policy_config(
         config_id="fixed_sl_baseline",
         stage3_step="fixed_sl_baseline",
         protection_enabled=False,
-        final_tp_pct=float(context["stage2_policy"]["policy"]["lock_profit_pct"]),
+        final_tp_pct=side_policies["LONG"]["final_tp_pct"],
         protect_trigger_pct=None,
         trail_sl_pct=None,
-        initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        initial_sl_pct=side_policies["LONG"]["initial_sl_pct"],
         initial_sl_multiplier=1.0,
         hard_exit_hours=context["hard_exit_hours"],
+        policy_mode=context["stage2_policy"].get("policy_mode", "shared"),
+        side_policies=side_policies,
     )
 
 
 def _exact_protection_config(context: dict[str, Any]) -> dict[str, Any]:
+    side_policies = _stage2_config_side_policies(
+        context["stage2_policy"],
+        protection_enabled=True,
+        hard_exit_hours=context["hard_exit_hours"],
+    )
     return _policy_config(
         config_id="exact_protection_policy",
         stage3_step="exact_protection_policy",
         protection_enabled=True,
-        final_tp_pct=float(context["stage2_policy"]["policy"]["lock_profit_pct"]),
-        protect_trigger_pct=float(context["stage2_policy"]["policy"]["protect_trigger_pct"]),
-        trail_sl_pct=float(context["stage2_policy"]["policy"]["trail_sl_pct"]),
-        initial_sl_pct=context["risk_policy"]["initial_sl_pct"],
+        final_tp_pct=side_policies["LONG"]["final_tp_pct"],
+        protect_trigger_pct=side_policies["LONG"]["protect_trigger_pct"],
+        trail_sl_pct=side_policies["LONG"]["trail_sl_pct"],
+        initial_sl_pct=side_policies["LONG"]["initial_sl_pct"],
         initial_sl_multiplier=1.0,
         hard_exit_hours=context["hard_exit_hours"],
+        policy_mode=context["stage2_policy"].get("policy_mode", "shared"),
+        side_policies=side_policies,
     )
 
 
@@ -299,6 +315,7 @@ def _base_stage3_artifact(context: dict[str, Any]) -> dict[str, Any]:
         "stage": "stage3_conditional_execution_setup",
         "artifact_role": "stage3_grid_results",
         "stage3_mode": "numerical_exit_policy",
+        "policy_mode": context["stage2_policy"].get("policy_mode", "shared"),
         "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "session_id": session["session_id"],
         "asset": session.get("asset"),
@@ -368,25 +385,29 @@ def _score_policy_config(
     leverage: int,
     fees_bps_per_side: float,
 ) -> dict[str, Any]:
-    outcomes = [
-        _simulate_policy_trade(
-            trade=trade,
-            candles=candles,
-            protection_enabled=bool(config["protection_enabled"]),
-            final_tp_pct=config["final_tp_pct"],
-            initial_sl_pct=config["initial_sl_pct"],
-            protect_trigger_pct=config["protect_trigger_pct"],
-            trail_sl_pct=config["trail_sl_pct"],
-            hard_exit_hours=config["hard_exit_hours"],
-            fees_bps_per_side=fees_bps_per_side,
+    outcomes = []
+    for trade in trades:
+        trade_policy = _policy_for_trade(config, trade)
+        outcomes.append(
+            _simulate_policy_trade(
+                trade=trade,
+                candles=candles,
+                protection_enabled=bool(trade_policy["protection_enabled"]),
+                final_tp_pct=trade_policy["final_tp_pct"],
+                initial_sl_pct=trade_policy["initial_sl_pct"],
+                protect_trigger_pct=trade_policy["protect_trigger_pct"],
+                trail_sl_pct=trade_policy["trail_sl_pct"],
+                hard_exit_hours=trade_policy["hard_exit_hours"],
+                fees_bps_per_side=fees_bps_per_side,
+            )
         )
-        for trade in trades
-    ]
     metrics = _aggregate_outcomes(outcomes)
     return {
         **config,
         **metrics,
         "stage3_mode": "numerical_exit_policy",
+        "policy_mode": config.get("policy_mode", "shared"),
+        "side_policies": config.get("side_policies", {}),
         "protection_enabled": bool(config["protection_enabled"]),
         "tp": config["final_tp_pct"],
         "sl": config["initial_sl_pct"],
@@ -396,6 +417,13 @@ def _score_policy_config(
         "fees_bps_per_side": fees_bps_per_side,
         "outcomes": outcomes,
     }
+
+
+def _policy_for_trade(config: dict[str, Any], trade: dict[str, Any]) -> dict[str, Any]:
+    if config.get("policy_mode") == "side_specific":
+        direction = str(trade["direction"]).upper()
+        return config["side_policies"][direction]
+    return config
 
 
 def _simulate_policy_trade(
@@ -567,10 +595,16 @@ def _finalize_split(split: dict[str, Any]) -> dict[str, Any]:
 def _local_variant_configs(
     *,
     stage2_policy: dict[str, Any],
-    stage0_initial_sl_pct: float,
+    base_initial_sl_pct: float,
     tp_levels: list[float],
     hard_exit_hours: int,
 ) -> list[dict[str, Any]]:
+    if stage2_policy.get("policy_mode") == "side_specific":
+        return _paired_side_specific_variant_configs(
+            stage2_policy=stage2_policy,
+            tp_levels=tp_levels,
+            hard_exit_hours=hard_exit_hours,
+        )
     policy = stage2_policy["policy"]
     lock_values = _adjacent_values(tp_levels, float(policy["lock_profit_pct"]))
     protect_values = _adjacent_values(tp_levels, float(policy["protect_trigger_pct"]))
@@ -589,7 +623,7 @@ def _local_variant_configs(
         if (round(final_tp, 10), multiplier) == exact_fixed_key or key in seen:
             continue
         seen.add(key)
-        initial_sl = round(stage0_initial_sl_pct * multiplier, 4)
+        initial_sl = round(base_initial_sl_pct * multiplier, 4)
         configs.append(
             _policy_config(
                 config_id=f"fixed_variant_tp_{_id_pct(final_tp)}_sl_{_id_pct(initial_sl)}",
@@ -610,7 +644,7 @@ def _local_variant_configs(
         if key[1:] == exact_protected_key or key in seen:
             continue
         seen.add(key)
-        initial_sl = round(stage0_initial_sl_pct * multiplier, 4)
+        initial_sl = round(base_initial_sl_pct * multiplier, 4)
         configs.append(
             _policy_config(
                 config_id=f"variant_tp_{_id_pct(final_tp)}_sl_{_id_pct(initial_sl)}_protect_{_id_pct(protect)}_trail_{_id_pct(trail)}",
@@ -627,6 +661,228 @@ def _local_variant_configs(
     return configs
 
 
+def _paired_side_specific_variant_configs(
+    *,
+    stage2_policy: dict[str, Any],
+    tp_levels: list[float],
+    hard_exit_hours: int,
+) -> list[dict[str, Any]]:
+    base = _stage2_config_side_policies(stage2_policy, protection_enabled=True, hard_exit_hours=hard_exit_hours)
+    offsets = [-1, 0, 1]
+    protected_offset_profiles = [
+        (-1, 0, 0),
+        (0, -1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+        (0, 1, 0),
+        (1, 0, 0),
+        (-1, -1, -1),
+        (1, 1, 1),
+        (-1, 1, 0),
+        (1, -1, 0),
+    ]
+    configs = []
+    seen = set()
+    for tp_offset, multiplier in itertools.product(offsets, DEFAULT_SL_MULTIPLIERS):
+        side_policies = {
+            side: _side_variant_policy(
+                policy=base[side],
+                tp_levels=tp_levels,
+                hard_exit_hours=hard_exit_hours,
+                protection_enabled=False,
+                tp_offset=tp_offset,
+                protect_offset=0,
+                trail_offset=0,
+                sl_multiplier=multiplier,
+            )
+            for side in ("LONG", "SHORT")
+        }
+        key = _side_policy_key("fixed", side_policies)
+        exact = tp_offset == 0 and multiplier == 1.0
+        if exact or key in seen:
+            continue
+        seen.add(key)
+        configs.append(_side_specific_config(config_id=f"fixed_side_variant_tp_offset_{tp_offset}_slx_{_id_pct(multiplier)}", stage3_step="fixed_sl_variant", side_policies=side_policies, hard_exit_hours=hard_exit_hours))
+    for tp_offset, protect_offset, trail_offset in protected_offset_profiles:
+        for multiplier in DEFAULT_SL_MULTIPLIERS:
+            side_policies = {
+                side: _side_variant_policy(
+                    policy=base[side],
+                    tp_levels=tp_levels,
+                    hard_exit_hours=hard_exit_hours,
+                    protection_enabled=True,
+                    tp_offset=tp_offset,
+                    protect_offset=protect_offset,
+                    trail_offset=trail_offset,
+                    sl_multiplier=multiplier,
+                )
+                for side in ("LONG", "SHORT")
+            }
+            if any(policy["trail_sl_pct"] > policy["protect_trigger_pct"] for policy in side_policies.values()):
+                continue
+            key = _side_policy_key("protected", side_policies)
+            exact = tp_offset == 0 and protect_offset == 0 and trail_offset == 0 and multiplier == 1.0
+            if exact or key in seen:
+                continue
+            seen.add(key)
+            configs.append(
+                _side_specific_config(
+                    config_id=f"side_variant_tp_{tp_offset}_protect_{protect_offset}_trail_{trail_offset}_slx_{_id_pct(multiplier)}",
+                    stage3_step="local_variant",
+                    side_policies=side_policies,
+                    hard_exit_hours=hard_exit_hours,
+                )
+            )
+    return configs
+
+
+def _stage2_config_side_policies(
+    stage2_policy: dict[str, Any],
+    *,
+    protection_enabled: bool,
+    hard_exit_hours: int,
+) -> dict[str, dict[str, Any]]:
+    policy_mode = stage2_policy.get("policy_mode", "shared")
+    if policy_mode == "side_specific":
+        source = stage2_policy.get("side_policies")
+        if not isinstance(source, dict):
+            raise ValueError("Stage 2 side-specific exit policy is missing side_policies.")
+    else:
+        policy = stage2_policy.get("policy")
+        if not isinstance(policy, dict):
+            raise ValueError("Stage 2 exit policy artifact is missing policy values.")
+        source = {"LONG": policy, "SHORT": policy}
+
+    side_policies: dict[str, dict[str, Any]] = {}
+    for side in ("LONG", "SHORT"):
+        policy = source.get(side)
+        if not isinstance(policy, dict):
+            raise ValueError(f"Stage 2 exit policy is missing {side} side policy.")
+        side_policies[side] = _stage2_config_side_policy(
+            side=side,
+            policy=policy,
+            protection_enabled=protection_enabled,
+            hard_exit_hours=hard_exit_hours,
+        )
+    return side_policies
+
+
+def _stage2_config_side_policy(
+    *,
+    side: str,
+    policy: dict[str, Any],
+    protection_enabled: bool,
+    hard_exit_hours: int,
+) -> dict[str, Any]:
+    for key in ("lock_profit_pct", "initial_sl_pct"):
+        if policy.get(key) is None:
+            raise ValueError(f"Stage 2 {side} exit policy is missing {key}.")
+    if protection_enabled:
+        for key in ("protect_trigger_pct", "trail_sl_pct"):
+            if policy.get(key) is None:
+                raise ValueError(f"Stage 2 {side} exit policy is missing {key}.")
+    final_tp = float(policy["lock_profit_pct"])
+    return {
+        "protection_enabled": bool(protection_enabled),
+        "final_tp_pct": final_tp,
+        "lock_profit_pct": final_tp,
+        "protect_trigger_pct": float(policy["protect_trigger_pct"]) if protection_enabled else None,
+        "trail_sl_pct": float(policy["trail_sl_pct"]) if protection_enabled else None,
+        "initial_sl_pct": float(policy["initial_sl_pct"]),
+        "initial_sl_multiplier": 1.0,
+        "hard_exit_hours": hard_exit_hours,
+    }
+
+
+def _round_side_policies(side_policies: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    rounded: dict[str, dict[str, Any]] = {}
+    for side in ("LONG", "SHORT"):
+        policy = side_policies[side]
+        rounded[side] = {
+            "protection_enabled": bool(policy["protection_enabled"]),
+            "final_tp_pct": round(float(policy["final_tp_pct"]), 4),
+            "lock_profit_pct": round(float(policy["lock_profit_pct"]), 4),
+            "protect_trigger_pct": round(float(policy["protect_trigger_pct"]), 4) if policy.get("protect_trigger_pct") is not None else None,
+            "trail_sl_pct": round(float(policy["trail_sl_pct"]), 4) if policy.get("trail_sl_pct") is not None else None,
+            "initial_sl_pct": round(float(policy["initial_sl_pct"]), 4),
+            "initial_sl_multiplier": float(policy.get("initial_sl_multiplier", 1.0)),
+            "hard_exit_hours": int(policy["hard_exit_hours"]),
+        }
+    return rounded
+
+
+def _side_variant_policy(
+    *,
+    policy: dict[str, Any],
+    tp_levels: list[float],
+    hard_exit_hours: int,
+    protection_enabled: bool,
+    tp_offset: int,
+    protect_offset: int,
+    trail_offset: int,
+    sl_multiplier: float,
+) -> dict[str, Any]:
+    final_tp = _offset_value(tp_levels, float(policy["final_tp_pct"]), tp_offset)
+    protect = _offset_value(tp_levels, float(policy["protect_trigger_pct"] or final_tp), protect_offset) if protection_enabled else None
+    trail = _offset_value(tp_levels, float(policy["trail_sl_pct"] or protect or final_tp), trail_offset) if protection_enabled else None
+    initial_sl = round(float(policy["initial_sl_pct"]) * sl_multiplier, 4)
+    return {
+        "protection_enabled": protection_enabled,
+        "final_tp_pct": final_tp,
+        "lock_profit_pct": final_tp,
+        "protect_trigger_pct": protect,
+        "trail_sl_pct": trail,
+        "initial_sl_pct": initial_sl,
+        "initial_sl_multiplier": sl_multiplier,
+        "hard_exit_hours": hard_exit_hours,
+    }
+
+
+def _side_specific_config(*, config_id: str, stage3_step: str, side_policies: dict[str, dict[str, Any]], hard_exit_hours: int) -> dict[str, Any]:
+    long_policy = side_policies["LONG"]
+    protection_enabled = any(bool(policy["protection_enabled"]) for policy in side_policies.values())
+    return _policy_config(
+        config_id=config_id,
+        stage3_step=stage3_step,
+        protection_enabled=protection_enabled,
+        final_tp_pct=long_policy["final_tp_pct"],
+        protect_trigger_pct=long_policy["protect_trigger_pct"],
+        trail_sl_pct=long_policy["trail_sl_pct"],
+        initial_sl_pct=long_policy["initial_sl_pct"],
+        initial_sl_multiplier=long_policy["initial_sl_multiplier"],
+        hard_exit_hours=hard_exit_hours,
+        policy_mode="side_specific",
+        side_policies=side_policies,
+    )
+
+
+def _offset_value(levels: list[float], selected: float, offset: int) -> float:
+    ordered = sorted({round(float(level), 4) for level in levels})
+    selected = round(float(selected), 4)
+    if selected not in ordered:
+        ordered.append(selected)
+        ordered.sort()
+    index = max(0, min(len(ordered) - 1, ordered.index(selected) + offset))
+    return ordered[index]
+
+
+def _side_policy_key(mode: str, side_policies: dict[str, dict[str, Any]]) -> tuple[Any, ...]:
+    return (
+        mode,
+        *(
+            (
+                side,
+                round(float(side_policies[side]["final_tp_pct"]), 10),
+                round(float(side_policies[side]["initial_sl_pct"]), 10),
+                side_policies[side]["protect_trigger_pct"],
+                side_policies[side]["trail_sl_pct"],
+                side_policies[side]["initial_sl_multiplier"],
+            )
+            for side in ("LONG", "SHORT")
+        ),
+    )
+
+
 def _policy_config(
     *,
     config_id: str,
@@ -638,10 +894,13 @@ def _policy_config(
     initial_sl_pct: float,
     initial_sl_multiplier: float,
     hard_exit_hours: int,
+    policy_mode: str = "shared",
+    side_policies: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    config = {
         "config_id": config_id,
         "stage3_step": stage3_step,
+        "policy_mode": policy_mode,
         "protection_enabled": protection_enabled,
         "final_tp_pct": round(final_tp_pct, 4),
         "lock_profit_pct": round(final_tp_pct, 4),
@@ -651,6 +910,9 @@ def _policy_config(
         "initial_sl_multiplier": initial_sl_multiplier,
         "hard_exit_hours": hard_exit_hours,
     }
+    if side_policies is not None:
+        config["side_policies"] = _round_side_policies(side_policies)
+    return config
 
 
 def _load_trade_inputs(path: Path) -> list[dict[str, Any]]:
@@ -686,7 +948,7 @@ def _load_stage2_exit_policy(path: Path) -> dict[str, Any]:
     policy = payload.get("policy") if isinstance(payload, dict) else None
     if not isinstance(policy, dict):
         raise ValueError("Stage 2 exit policy artifact is missing policy values.")
-    for key in ("lock_profit_pct", "protect_trigger_pct", "trail_sl_pct"):
+    for key in ("lock_profit_pct", "initial_sl_pct", "protect_trigger_pct", "trail_sl_pct"):
         if policy.get(key) is None:
             raise ValueError(f"Stage 2 exit policy is missing {key}.")
     return payload
@@ -777,6 +1039,9 @@ def _build_stage4_candidates(
         if row["protection_enabled"]:
             setup["protect_trigger_pct"] = row["protect_trigger_pct"]
             setup["trail_sl_pct"] = row["trail_sl_pct"]
+        if row.get("policy_mode") == "side_specific":
+            setup["policy_mode"] = "side_specific"
+            setup["side_policies"] = row.get("side_policies", {})
         candidates.append(
             {
                 "candidate_id": candidate_id,
@@ -852,7 +1117,8 @@ def _render_summary(artifact: dict[str, Any]) -> str:
         "",
         f"Session: `{artifact['session_id']}`",
         f"Executable decisions: {artifact['total_executable_decisions']}",
-        f"Initial SL from Stage 0: {artifact['stage0_risk_policy']['initial_sl_pct']:.2f}%",
+        f"Initial SL from Stage 2: {artifact['stage0_risk_policy']['initial_sl_pct']:.2f}%",
+        f"Stage 0 meaningful move: {artifact['stage0_risk_policy'].get('stage0_meaningful_move_threshold_pct', artifact['stage0_risk_policy']['initial_sl_pct']):.2f}%",
         f"Hard exit: {artifact['stage0_risk_policy']['hard_exit_hours']}h",
         "",
         "## 3A Fixed SL Baseline",
@@ -934,6 +1200,8 @@ def _id_pct(value: float) -> str:
 
 
 def _candidate_id(row: dict[str, Any]) -> str:
+    if row.get("policy_mode") == "side_specific":
+        return f"numeric_{row['config_id']}"
     base = f"numeric_{row['stage3_step']}_tp_{_id_pct(row['final_tp_pct'])}_sl_{_id_pct(row['initial_sl_pct'])}"
     if not row.get("protection_enabled"):
         return f"{base}_fixed"

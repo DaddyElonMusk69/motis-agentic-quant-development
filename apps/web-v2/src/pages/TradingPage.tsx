@@ -125,8 +125,11 @@ function readRecordValue(value: unknown, key: string): unknown {
 
 function routeSetup(route: DeploymentRoute): Record<string, unknown> {
   const setup = route.active_bundle?.execution_setup;
+  if (!setup || typeof setup !== "object") {
+    return {};
+  }
   const nested = readRecordValue(setup, "setup");
-  return nested && typeof nested === "object" ? nested as Record<string, unknown> : {};
+  return nested && typeof nested === "object" ? nested as Record<string, unknown> : setup as Record<string, unknown>;
 }
 
 function routeExecutionSetup(route: DeploymentRoute): Record<string, unknown> {
@@ -194,6 +197,36 @@ function formatPercent(value: unknown): string {
     return "n/a";
   }
   return `${number.toFixed(number % 1 === 0 ? 0 : 1)}%`;
+}
+
+type TradeSide = "LONG" | "SHORT";
+
+function sidePolicy(setup: Record<string, unknown>, side: TradeSide): Record<string, unknown> | null {
+  const sidePolicies = readRecordValue(setup, "side_policies");
+  if (!sidePolicies || typeof sidePolicies !== "object") {
+    return null;
+  }
+  const policy = readRecordValue(sidePolicies, side);
+  return policy && typeof policy === "object" ? policy as Record<string, unknown> : null;
+}
+
+function formatTpSlPolicy(policy: Record<string, unknown>): string {
+  const tp = readRecordValue(policy, "final_tp_pct") ?? readRecordValue(policy, "lock_profit_pct") ?? readRecordValue(policy, "tp_pct") ?? readRecordValue(policy, "tp");
+  const sl = readRecordValue(policy, "initial_sl_pct") ?? readRecordValue(policy, "sl_pct") ?? readRecordValue(policy, "sl");
+  return `${formatSetupValue(tp, "%")} / ${formatSetupValue(sl, "%")}`;
+}
+
+function routeTpSlRows(route: DeploymentRoute): Array<{ label: string; value: string }> {
+  const setup = routeSetup(route);
+  const long = sidePolicy(setup, "LONG");
+  const short = sidePolicy(setup, "SHORT");
+  if (long && short) {
+    return [
+      { label: "Long TP / SL", value: formatTpSlPolicy(long) },
+      { label: "Short TP / SL", value: formatTpSlPolicy(short) }
+    ];
+  }
+  return [{ label: "TP / SL", value: formatTpSlPolicy(setup) }];
 }
 
 function executionInterval(route: DeploymentRoute): string {
@@ -625,6 +658,9 @@ export function TradingPage() {
                     <div className="field-stack">
                       <FieldRow label="Instrument" value={route.instrument} />
                       <FieldRow label="Active bundle" value={route.active_bundle_id ?? route.bundle_id ?? "n/a"} />
+                      {routeTpSlRows(route).map((row) => (
+                        <FieldRow key={row.label} label={row.label} value={row.value} />
+                      ))}
                       <FieldRow label="Next wake" value={formatTimestamp(route.next_wake_at)} />
                       <FieldRow label="Last wake" value={formatTimestamp(route.last_wake_at)} />
                     </div>
@@ -1006,17 +1042,19 @@ function ExecutionSettings({ compact = false, onSave, route, saving }: {
 }
 
 function BundleSetupMini({ latestWake, route }: { latestWake: WakeRun | null; route: DeploymentRoute }) {
-  const setup = routeSetup(route);
   const legs = pyramidMaxLegs(route);
   const sizing = effectiveRouteSizing(route);
   const margin = Number(sizing.margin_allocation_pct ?? 0);
   const perLegMarginPct = legs > 0 ? margin / legs : margin;
+  const tpSlRows = routeTpSlRows(route);
   return (
     <div className="bundle-setup-mini">
-      <div>
-        <span>TP / SL</span>
-        <strong>{formatSetupValue(setup.tp_pct, "%")} / {formatSetupValue(setup.sl_pct, "%")}</strong>
-      </div>
+      {tpSlRows.map((row) => (
+        <div key={row.label}>
+          <span>{row.label}</span>
+          <strong>{row.value}</strong>
+        </div>
+      ))}
       <div>
         <span>Pyramid</span>
         <strong>{formatNumber(legs)} legs</strong>
@@ -1039,9 +1077,12 @@ function BundleReadout({ latestWake, route }: { latestWake: WakeRun | null; rout
   const sizing = effectiveRouteSizing(route);
   const margin = Number(sizing.margin_allocation_pct ?? 0);
   const perLegMarginPct = legs > 0 ? margin / legs : margin;
+  const tpSlRows = routeTpSlRows(route);
   return (
     <div className="field-stack">
-      <FieldRow label="TP / SL" value={`${formatSetupValue(setup.tp_pct, "%")} / ${formatSetupValue(setup.sl_pct, "%")}`} />
+      {tpSlRows.map((row) => (
+        <FieldRow key={row.label} label={row.label} value={row.value} />
+      ))}
       <FieldRow label="Pyramid legs" value={formatNumber(legs)} />
       <FieldRow label="Step" value={formatSetupValue(readRecordValue(readRecordValue(setup, "pyramid"), "step_pct") ?? readRecordValue(setup, "step_pct"), "%")} />
       <FieldRow label="Hard hold gate" value={formatSetupValue(setup.max_hold_hours ?? readRecordValue(route.active_bundle?.execution_setup, "hard_exit_after_hours"), "h")} />

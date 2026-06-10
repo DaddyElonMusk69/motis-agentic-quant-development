@@ -8,6 +8,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Index,
     JSON,
     MetaData,
     String,
@@ -30,6 +31,42 @@ data_sources = Table(
     Column("config", JSON_DOCUMENT, nullable=False, default=dict),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
+
+jobs = Table(
+    "jobs",
+    metadata,
+    Column("job_id", String, primary_key=True),
+    Column("job_type", String, nullable=False),
+    Column("scope_key", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("payload", JSON_DOCUMENT, nullable=False, default=dict),
+    Column("result", JSON_DOCUMENT, nullable=False, default=dict),
+    Column("error", JSON_DOCUMENT, nullable=False, default=dict),
+    Column("current_step", String, nullable=True),
+    Column("priority", Integer, nullable=False, default=0),
+    Column("locked_by", String, nullable=True),
+    Column("lock_expires_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("started_at", DateTime(timezone=True), nullable=True),
+    Column("finished_at", DateTime(timezone=True), nullable=True),
+    Column("heartbeat_at", DateTime(timezone=True), nullable=True),
+)
+
+Index("ix_jobs_status_priority_created", jobs.c.status, jobs.c.priority, jobs.c.created_at)
+Index("ix_jobs_scope_key", jobs.c.scope_key)
+
+worker_heartbeats = Table(
+    "worker_heartbeats",
+    metadata,
+    Column("worker_id", String, primary_key=True),
+    Column("status", String, nullable=False),
+    Column("current_job_id", String, nullable=True),
+    Column("current_step", String, nullable=True),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("last_seen_at", DateTime(timezone=True), nullable=False),
+)
+
+Index("ix_worker_heartbeats_last_seen", worker_heartbeats.c.last_seen_at)
 
 market_data_refs = Table(
     "market_data_refs",

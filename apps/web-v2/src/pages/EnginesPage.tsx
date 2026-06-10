@@ -1,13 +1,15 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ArrowLeft, FileJson, MoreVertical, Plus, RefreshCw, SlidersHorizontal, X } from "lucide-react";
 import {
   createSignalSet,
   extendSignalPoolFromLocalCandles,
+  fetchJob,
   fetchMarketDataCatalog,
   fetchSignalEngines,
   fetchSignals,
   fetchSignalSets,
+  isJobResponse,
   updateSignalEngine,
   type CatalogAsset,
   type SignalEngine,
@@ -23,6 +25,7 @@ import { FieldRow } from "../components/FieldRow";
 import { SplitPane } from "../components/SplitPane";
 import { StatusBadge } from "../components/StatusBadge";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorkerRuntimeNotice } from "../components/WorkerRuntimeNotice";
 
 function updateEngineUrl(next: { engine?: string; signalSetKey?: string; asset?: string }) {
   const params = new URLSearchParams(window.location.search);
@@ -162,6 +165,7 @@ export function EnginesPage() {
   const [renameValue, setRenameValue] = useState("");
   const [addTickerOpen, setAddTickerOpen] = useState(false);
   const [selectedTickerAssets, setSelectedTickerAssets] = useState<string[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const enginesQuery = useQuery({ queryKey: ["signal-engines"], queryFn: fetchSignalEngines });
   const catalogQuery = useQuery({ queryKey: ["market-data-catalog"], queryFn: fetchMarketDataCatalog });
   const selectedEngine = selectEngine(enginesQuery.data?.engines, searchParams);
@@ -181,16 +185,45 @@ export function EnginesPage() {
     queryKey: ["signals", selectedSignalSet?.signal_set_key],
     queryFn: () => fetchSignals(selectedSignalSet!.signal_set_key, 5)
   });
+  const activeJobQuery = useQuery({
+    enabled: Boolean(activeJobId),
+    queryKey: ["runtime-job", activeJobId],
+    queryFn: () => fetchJob(activeJobId!),
+    refetchInterval: (query) => {
+      const job = query.state.data?.job;
+      return !job || ["queued", "running"].includes(job.status) ? 1500 : false;
+    }
+  });
 
   const signalUpdateMutation = useMutation({
     mutationFn: extendSignalPoolFromLocalCandles,
     onSuccess: (result) => {
+      if (isJobResponse(result)) {
+        setActiveJobId(result.job.job_id);
+        return;
+      }
       updateEngineUrl({ engine: result.signal_engine_id, asset: result.asset, signalSetKey: result.signal_set_key });
       void queryClient.invalidateQueries({ queryKey: ["signal-engines"] });
       void queryClient.invalidateQueries({ queryKey: ["signal-sets", result.signal_engine_id] });
       void queryClient.invalidateQueries({ queryKey: ["signals", result.signal_set_key] });
     }
   });
+
+  useEffect(() => {
+    const job = activeJobQuery.data?.job;
+    if (!job || ["queued", "running"].includes(job.status)) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: ["signal-engines"] });
+    if (engineId) {
+      void queryClient.invalidateQueries({ queryKey: ["signal-sets", engineId] });
+    }
+    if (selectedSignalSet?.signal_set_key) {
+      void queryClient.invalidateQueries({ queryKey: ["signals", selectedSignalSet.signal_set_key] });
+    }
+    const timeout = window.setTimeout(() => setActiveJobId(null), job.status === "completed" ? 2500 : 5000);
+    return () => window.clearTimeout(timeout);
+  }, [activeJobQuery.data?.job?.status, engineId, selectedSignalSet?.signal_set_key]);
 
   const renameMutation = useMutation({
     mutationFn: ({ engineId, name }: { engineId: string; name: string }) => updateSignalEngine(engineId, { name }),
@@ -222,9 +255,12 @@ export function EnginesPage() {
     }
   });
 
-  const selectedUpdateResult = signalUpdateMutation.data?.signal_set_key === selectedSignalSet?.signal_set_key ? signalUpdateMutation.data : undefined;
+  const signalUpdateResult = isJobResponse(signalUpdateMutation.data) ? undefined : signalUpdateMutation.data;
+  const activeSignalJob = activeJobQuery.data?.job ?? null;
+  const activeSignalJobRunning = Boolean(activeSignalJob && ["queued", "running"].includes(activeSignalJob.status));
+  const selectedUpdateResult = signalUpdateResult?.signal_set_key === selectedSignalSet?.signal_set_key ? signalUpdateResult : undefined;
   const selectedUpdateError = signalUpdateMutation.variables?.asset === selectedSignalSet?.asset ? signalUpdateMutation.error : undefined;
-  const isUpdatingSelected = signalUpdateMutation.isPending && signalUpdateMutation.variables?.asset === selectedSignalSet?.asset;
+  const isUpdatingSelected = (signalUpdateMutation.isPending && signalUpdateMutation.variables?.asset === selectedSignalSet?.asset) || activeSignalJobRunning;
   const renameError = renameMutation.error;
   const createSignalSetError = createSignalSetMutation.error;
   const selectedTickerSet = useMemo(() => new Set(selectedTickerAssets), [selectedTickerAssets]);
@@ -415,7 +451,7 @@ export function EnginesPage() {
                 </button>
                 <button
                   className="button button--secondary"
-                  disabled={!selectedSignalSet || signalUpdateMutation.isPending}
+                  disabled={!selectedSignalSet || isUpdatingSelected}
                   onClick={() => selectedSignalSet && signalUpdateMutation.mutate({ signal_engine_id: selectedSignalSet.signal_engine_id, asset: selectedSignalSet.asset })}
                   type="button"
                 >
@@ -429,7 +465,7 @@ export function EnginesPage() {
               <div className="progress-card">
                 <div className="progress-card__header">
                   <strong>Updating {selectedSignalSet?.asset} signal pool</strong>
-                  <span>Scan canonical Parquet candles, emit packets, import DB rows</span>
+                  <span>{activeSignalJob ? `${activeSignalJob.status} · ${activeSignalJob.current_step ?? "waiting"}` : "Scan canonical Parquet candles, emit packets, import DB rows"}</span>
                 </div>
                 <div className="progress-rail" aria-label="Signal update in progress">
                   <span />
@@ -439,6 +475,7 @@ export function EnginesPage() {
                   <span>Run engine</span>
                   <span>Persist signal rows</span>
                 </div>
+                <WorkerRuntimeNotice active={isUpdatingSelected} job={activeSignalJob} />
               </div>
             ) : null}
 

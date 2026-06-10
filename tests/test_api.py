@@ -5,6 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 import quant_terminal_api.main as api_main
 from quant_terminal_api.db.models import metadata
@@ -350,6 +351,22 @@ def test_health_endpoint_reports_local_services():
             "worker": "configured",
         },
     }
+
+
+def test_job_runtime_endpoint_reports_worker_status(tmp_path):
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'jobs-runtime.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    repository.record_worker_heartbeat("worker-api-test", status="idle")
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get("/api/v1/jobs/runtime")
+
+    assert response.status_code == 200
+    payload = response.json()["worker_runtime"]
+    assert payload["status"] == "online"
+    assert payload["active_worker_count"] == 1
+    assert payload["workers"][0]["worker_id"] == "worker-api-test"
 
 
 def test_api_allows_local_vite_origin_for_browser_fetches():
@@ -1916,6 +1933,53 @@ def decide(context):
     assert (tmp_path / result["decisions_path"]).exists()
 
 
+def test_stage1_training_score_endpoint_enqueues_job_with_real_repository(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    iteration_root = artifact_root / "iterations" / "iter_001_v0.1"
+    iteration_root.mkdir(parents=True)
+    repository.create_stage1_research_session(
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "source_universe_run_id": "universe-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-25",
+            "walk_forward_end": "2026-05-31",
+            "status": "draft",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    )
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post("/api/v1/research/stage1-sessions/stage1-aave/iterations/iter_001_v0.1/score-training")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accepted"] is True
+    assert payload["job"]["status"] == "queued"
+    assert payload["job"]["job_type"] == "stage1_score"
+    assert payload["job"]["scope_key"] == "stage1_session:stage1-aave"
+    assert payload["job"]["payload"]["iteration_id"] == "iter_001_v0.1"
+    assert not (iteration_root / "scores" / "stage1a_directional_scores.json").exists()
+
+
 def test_stage1_walk_forward_score_endpoint_scores_iteration(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
@@ -2506,6 +2570,132 @@ def test_stage2_exit_policy_endpoint_writes_policy_and_updates_gate(tmp_path, mo
         json.dumps(
             {
                 "tp_levels": [0.5, 1.0, 1.5],
+                "sl_levels": [0.3, 0.5, 0.8],
+                "metrics": {"total_match_signals": 1},
+                "results": {"0.5": {}, "1.0": {}, "1.5": {}},
+                "sl_results": {"0.3": {}, "0.5": {}, "0.8": {}},
+            }
+        )
+    )
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
+    (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/stage2/exit-policy",
+        json={"lock_profit_pct": 1.0, "initial_sl_pct": 0.5, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+    )
+
+    assert response.status_code == 200
+    policy = response.json()["stage2_exit_policy"]
+    assert policy["exists"] is True
+    assert policy["policy"]["lock_profit_pct"] == 1.0
+    assert policy["policy"]["initial_sl_pct"] == 0.5
+    assert policy["policy"]["protect_trigger_pct"] == 0.5
+    assert policy["policy"]["trail_sl_pct"] == 0.5
+    assert (promotion_root / "stage2_exit_policy.json").exists()
+    assert response.json()["gate"]["stage2_exit_policy"]["exists"] is True
+
+
+def test_stage2_exit_policy_endpoint_writes_side_specific_handoff(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {}\n")
+    (promotion_root / "stage1a_canonical_full_cycle_decisions.json").write_text("{}")
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
+    )
+    (promotion_root / "stage2_capture_curve.json").write_text(
+        json.dumps(
+            {
+                "tp_levels": [0.5, 1.0, 1.5],
+                "sl_levels": [0.3, 0.5, 0.8],
+                "metrics": {"total_match_signals": 1},
+                "results": {"0.5": {}, "1.0": {}, "1.5": {}},
+                "sl_results": {"0.3": {}, "0.5": {}, "0.8": {}},
+            }
+        )
+    )
+    (promotion_root / "stage2_capture_per_signal.json").write_text("[]")
+    (promotion_root / "stage3_trade_inputs.json").write_text("[]")
+    (promotion_root / "stage2_summary.md").write_text("# Stage 2 Travel Capture\n")
+    repository.stage1_sessions = [
+        {
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "source_candidate_id": "candidate-aave",
+            "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+            "signal_engine_id": "vegas_ema",
+            "signal_engine_version": "0.1",
+            "asset": "AAVE",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "status": "stage1a_frozen",
+            "manifest": {"session_id": "stage1-aave"},
+        }
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(
+        "/api/v1/research/stage1-sessions/stage1-aave/stage2/exit-policy",
+        json={
+            "side_policies": {
+                "LONG": {"lock_profit_pct": 1.5, "initial_sl_pct": 0.5, "protect_trigger_pct": 1.0, "trail_sl_pct": 0.5},
+                "SHORT": {"lock_profit_pct": 1.0, "initial_sl_pct": 0.8, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    policy = response.json()["stage2_exit_policy"]
+    assert policy["policy_mode"] == "side_specific"
+    assert policy["side_policies"]["LONG"]["lock_profit_pct"] == 1.5
+    assert policy["side_policies"]["SHORT"]["initial_sl_pct"] == 0.8
+    persisted = json.loads((promotion_root / "stage2_exit_policy.json").read_text())
+    assert persisted["policy_mode"] == "side_specific"
+    assert persisted["side_policies"]["LONG"]["protect_trigger_pct"] == 1.0
+    assert persisted["side_policies"]["SHORT"]["lock_profit_pct"] == 1.0
+    assert persisted["policy"] == persisted["side_policies"]["LONG"]
+
+
+def test_stage2_exit_policy_endpoint_rejects_legacy_capture_without_sl_band(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True)
+    (frozen_root / "strategy.py").write_text("def decide(context):\n    return {}\n")
+    (promotion_root / "stage1a_canonical_full_cycle_decisions.json").write_text("{}")
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps({"metrics": {"matches": 1}, "match_set": [{"signal_id": "sig-1"}]})
+    )
+    (promotion_root / "stage2_capture_curve.json").write_text(
+        json.dumps(
+            {
+                "tp_levels": [0.5, 1.0, 1.5],
                 "metrics": {"total_match_signals": 1},
                 "results": {"0.5": {}, "1.0": {}, "1.5": {}},
             }
@@ -2534,17 +2724,16 @@ def test_stage2_exit_policy_endpoint_writes_policy_and_updates_gate(tmp_path, mo
 
     response = client.post(
         "/api/v1/research/stage1-sessions/stage1-aave/stage2/exit-policy",
-        json={"lock_profit_pct": 1.0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+        json={
+            "side_policies": {
+                "LONG": {"lock_profit_pct": 1.5, "initial_sl_pct": 0, "protect_trigger_pct": 1.0, "trail_sl_pct": 0.5},
+                "SHORT": {"lock_profit_pct": 1.0, "initial_sl_pct": 0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+            }
+        },
     )
 
-    assert response.status_code == 200
-    policy = response.json()["stage2_exit_policy"]
-    assert policy["exists"] is True
-    assert policy["policy"]["lock_profit_pct"] == 1.0
-    assert policy["policy"]["protect_trigger_pct"] == 0.5
-    assert policy["policy"]["trail_sl_pct"] == 0.5
-    assert (promotion_root / "stage2_exit_policy.json").exists()
-    assert response.json()["gate"]["stage2_exit_policy"]["exists"] is True
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Stage 2 exit policy requires a matched adverse SL band. Rerun Stage 2 capture to rebuild the SL curve."
 
 
 def test_stage3_grid_endpoint_rejects_until_stage2_complete(tmp_path, monkeypatch):
@@ -2648,12 +2837,17 @@ def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkey
         json.dumps(
                 {
                     "tp_levels": [0.5, 1.0],
+                    "sl_levels": [0.5, 1.0],
                     "metrics": {"total_match_signals": 1, "total_trade_decisions": 1, "match_count": 1, "mismatch_count": 0},
                     "results": {},
+                    "sl_results": {},
                 "stage3_input": {
                     "tp_range_source": "stage2_trade_profile",
                     "recommended_tp_min_pct": 0.1,
                     "recommended_tp_max_pct": 1.0,
+                    "sl_range_source": "stage2_matched_adverse_profile",
+                    "recommended_sl_min_pct": 0.5,
+                    "recommended_sl_max_pct": 1.0,
                 },
             }
         )
@@ -2679,7 +2873,7 @@ def test_stage3_grid_endpoint_writes_grid_and_stage4_candidates(tmp_path, monkey
                 {
                     "schema_version": "0.1",
                     "artifact_role": "stage2_exit_policy",
-                    "policy": {"lock_profit_pct": 1.0, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
+                    "policy": {"lock_profit_pct": 1.0, "initial_sl_pct": 0.5, "protect_trigger_pct": 0.5, "trail_sl_pct": 0.5},
                 }
             )
         )

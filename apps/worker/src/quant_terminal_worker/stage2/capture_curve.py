@@ -67,6 +67,7 @@ def run_stage2_capture_curve(
         per_signal.append(capture)
 
     result = _build_result(
+        workspace_root=workspace_root,
         session=session,
         canonical_scores_path=canonical_scores_path,
         per_signal=per_signal,
@@ -189,6 +190,7 @@ def _walk_signal_capture(
 
 def _build_result(
     *,
+    workspace_root: Path,
     session: dict[str, Any],
     canonical_scores_path: Path,
     per_signal: list[dict[str, Any]],
@@ -218,6 +220,10 @@ def _build_result(
         for cohort in ("MATCH", "MISMATCH", "full_cycle")
     }
     recommended_tp_max = _recommended_tp_max(tp_levels=tp_levels, cohorts=cohorts)
+    stage0_threshold = _load_stage0_meaningful_move_threshold(workspace_root=workspace_root, session=session)
+    sl_levels = _sl_levels_from_threshold(stage0_threshold)
+    sl_results = _sl_hit_rates(per_signal=per_signal, sl_levels=sl_levels)
+    side_splits = _side_splits(per_signal=per_signal, tp_levels=tp_levels, sl_levels=sl_levels)
 
     return {
         "schema_version": "0.1",
@@ -233,6 +239,7 @@ def _build_result(
         "canonical_stage1_scores_path": str(canonical_scores_path),
         "forward_hours": forward_hours,
         "tp_levels": tp_levels,
+        "sl_levels": sl_levels,
         "metrics": {
             "total_match_signals": len(per_signal),
             "total_trade_decisions": len(trade_decisions),
@@ -242,6 +249,8 @@ def _build_result(
             "slice_counts": {role: sum(1 for item in per_signal if item["sample_role"] == role) for role in roles},
         },
         "results": results,
+        "sl_results": sl_results,
+        "side_splits": side_splits,
         "cohorts": cohorts,
         "per_signal": per_signal,
         "stage3_input": {
@@ -250,6 +259,9 @@ def _build_result(
             "tp_range_source": "stage2_trade_profile",
             "recommended_tp_min_pct": 0.1,
             "recommended_tp_max_pct": recommended_tp_max,
+            "sl_range_source": "stage2_matched_adverse_profile",
+            "recommended_sl_min_pct": min(sl_levels) if sl_levels else None,
+            "recommended_sl_max_pct": max(sl_levels) if sl_levels else None,
             "min_match_capture_pct": DEFAULT_STAGE3_MIN_MATCH_CAPTURE_PCT,
         },
     }
@@ -273,12 +285,52 @@ def _render_summary(result: dict[str, Any]) -> str:
             f"| {key}% | {_rate(rows, 'training')} | {_rate(rows, 'walk_forward_test')} | {_rate(rows, 'full_cycle')} |"
         )
     lines.append("")
+    if result.get("sl_levels"):
+        lines.extend(
+            [
+                "## Matched Adverse Profile",
+                "",
+                "| SL | Training hit | Walk-forward hit | Full cycle hit |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
+        for level in result["sl_levels"]:
+            key = f"{level:.1f}"
+            rows = result["sl_results"][key]
+            lines.append(
+                f"| {key}% | {_sl_rate(rows, 'training')} | {_sl_rate(rows, 'walk_forward_test')} | {_sl_rate(rows, 'full_cycle')} |"
+            )
+        lines.append("")
+    if result.get("side_splits"):
+        lines.extend(
+            [
+                "## Direction Split",
+                "",
+                "| Side | Count | TP full cycle @ recommended max | SL full cycle @ max band |",
+                "| --- | ---: | ---: | ---: |",
+            ]
+        )
+        tp_key = f"{result['stage3_input']['recommended_tp_max_pct']:.1f}"
+        sl_key = f"{result['stage3_input']['recommended_sl_max_pct']:.1f}" if result["stage3_input"].get("recommended_sl_max_pct") else None
+        for side in ("LONG", "SHORT"):
+            split = result["side_splits"].get(side, {})
+            tp_rows = (split.get("results") or {}).get(tp_key, {})
+            sl_rows = (split.get("sl_results") or {}).get(sl_key, {}) if sl_key else {}
+            lines.append(
+                f"| {side} | {split.get('count', 0)} | {_rate(tp_rows, 'full_cycle')} | {_sl_rate(sl_rows, 'full_cycle')} |"
+            )
+        lines.append("")
     return "\n".join(lines)
 
 
 def _rate(rows: dict[str, dict[str, Any]], role: str) -> str:
     row = rows.get(role, {"rate": 0.0, "reached": 0, "total": 0})
     return f"{row['rate']:.1f}% ({row['reached']}/{row['total']})"
+
+
+def _sl_rate(rows: dict[str, dict[str, Any]], role: str) -> str:
+    row = rows.get(role, {"rate": 0.0, "hit": 0, "total": 0})
+    return f"{row['rate']:.1f}% ({row['hit']}/{row['total']})"
 
 
 def _clear_stage2_downstream_artifacts(promotion_root: Path) -> None:
@@ -372,6 +424,81 @@ def _recommended_tp_max(*, tp_levels: list[float], cohorts: dict[str, dict[str, 
         ):
             recommended = level
     return round(recommended if recommended is not None else DEFAULT_STAGE3_FALLBACK_TP_MAX_PCT, 1)
+
+
+def _sl_levels_from_threshold(threshold_pct: float) -> list[float]:
+    ceiling = max(0.1, round(float(threshold_pct), 1))
+    count = int(round(ceiling * 10))
+    return [round(index / 10, 1) for index in range(1, count + 1)]
+
+
+def _sl_hit_rates(*, per_signal: list[dict[str, Any]], sl_levels: list[float]) -> dict[str, dict[str, dict[str, float | int]]]:
+    roles = sorted({str(item["sample_role"]) for item in per_signal})
+    results: dict[str, dict[str, dict[str, float | int]]] = {}
+    for level in sl_levels:
+        level_key = f"{level:.1f}"
+        results[level_key] = {}
+        for role in [*roles, "full_cycle"]:
+            cohort = per_signal if role == "full_cycle" else [item for item in per_signal if item["sample_role"] == role]
+            hit = sum(1 for item in cohort if float(item.get("max_adverse_excursion_pct", 0.0)) >= level)
+            total = len(cohort)
+            results[level_key][role] = {
+                "hit": hit,
+                "total": total,
+                "rate": round(hit / total * 100, 1) if total else 0.0,
+            }
+    return results
+
+
+def _side_splits(
+    *,
+    per_signal: list[dict[str, Any]],
+    tp_levels: list[float],
+    sl_levels: list[float],
+) -> dict[str, dict[str, Any]]:
+    splits: dict[str, dict[str, Any]] = {}
+    for direction in ("LONG", "SHORT"):
+        rows = [item for item in per_signal if str(item.get("direction") or item.get("decision_direction")).upper() == direction]
+        splits[direction] = {
+            "count": len(rows),
+            "results": _tp_hit_rates(per_signal=rows, tp_levels=tp_levels),
+            "sl_results": _sl_hit_rates(per_signal=rows, sl_levels=sl_levels),
+        }
+    return splits
+
+
+def _tp_hit_rates(*, per_signal: list[dict[str, Any]], tp_levels: list[float]) -> dict[str, dict[str, dict[str, float | int]]]:
+    roles = sorted({str(item["sample_role"]) for item in per_signal})
+    results: dict[str, dict[str, dict[str, float | int]]] = {}
+    for level in tp_levels:
+        level_key = f"{level:.1f}"
+        results[level_key] = {}
+        for role in [*roles, "full_cycle"]:
+            cohort = per_signal if role == "full_cycle" else [item for item in per_signal if item["sample_role"] == role]
+            reached = sum(1 for item in cohort if item["tp_reached"][level_key])
+            total = len(cohort)
+            results[level_key][role] = {
+                "reached": reached,
+                "total": total,
+                "rate": round(reached / total * 100, 1) if total else 0.0,
+            }
+    return results
+
+
+def _load_stage0_meaningful_move_threshold(*, workspace_root: Path, session: dict[str, Any]) -> float:
+    root_value = session.get("stage0_artifact_root") or (session.get("manifest") or {}).get("stage0_artifact_root")
+    if not root_value:
+        return 1.0
+    stage0_root = Path(str(root_value))
+    if not stage0_root.is_absolute():
+        stage0_root = workspace_root / stage0_root
+    summary_path = stage0_root / "scores" / "ground_truth_summary.json"
+    if not summary_path.is_file():
+        return 1.0
+    summary = json.loads(summary_path.read_text())
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else summary
+    value = metrics.get("meaningful_move_threshold_pct", metrics.get("significance_threshold_pct"))
+    return round(float(value), 1) if value is not None else 1.0
 
 
 def _excursions(candle: dict[str, Any], *, reference_price: float, direction: str) -> tuple[float, float]:

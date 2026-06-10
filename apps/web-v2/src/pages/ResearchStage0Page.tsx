@@ -6,10 +6,12 @@ import {
   deleteStage0UniverseRun,
   executeStage0CandidateBatch,
   fetchDevelopmentQueue,
+  fetchJob,
   fetchSignalEngines,
   fetchSignalSets,
   fetchStage0UniverseCandidates,
   fetchStage0UniverseRuns,
+  isJobResponse,
   type DevelopmentQueueRow,
   type Stage0UniverseCandidate,
   type Stage0UniverseRun
@@ -22,6 +24,7 @@ import { FieldRow } from "../components/FieldRow";
 import { SplitPane } from "../components/SplitPane";
 import { StatusBadge } from "../components/StatusBadge";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorkerRuntimeNotice } from "../components/WorkerRuntimeNotice";
 
 type TrainingPoolProgress = {
   total: number;
@@ -84,6 +87,14 @@ function evaluatedSignalCount(candidate: Stage0UniverseCandidate | undefined, ro
     return statusCounts.triggered + statusCounts.no_trigger;
   }
   return candidate?.packet_count ?? row.packet_count ?? null;
+}
+
+function significanceThresholdLabel(candidate: Stage0UniverseCandidate | undefined): string {
+  const value = candidate?.metrics?.significance_threshold_pct;
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "n/a";
+  }
+  return `${value}%`;
 }
 
 function statusTone(status: string): "pass" | "warn" | "idle" | "risk" {
@@ -149,6 +160,7 @@ export function ResearchStage0Page() {
   const [triggerRateThresholdPct, setTriggerRateThresholdPct] = useState(85);
   const [autoRunPoolId, setAutoRunPoolId] = useState<string | null>(null);
   const [createModalOpen, setCreateModalOpen] = useState(false);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
 
   const enginesQuery = useQuery({ queryKey: ["signal-engines"], queryFn: fetchSignalEngines });
   const effectiveEngineId = selectedEngineId || enginesQuery.data?.engines[0]?.signal_engine_id || "";
@@ -164,6 +176,15 @@ export function ResearchStage0Page() {
     enabled: Boolean(selectedRun?.universe_run_id),
     queryKey: ["stage0-universe-candidates", selectedRun?.universe_run_id],
     queryFn: () => fetchStage0UniverseCandidates(selectedRun!.universe_run_id)
+  });
+  const activeJobQuery = useQuery({
+    enabled: Boolean(activeJobId),
+    queryKey: ["runtime-job", activeJobId],
+    queryFn: () => fetchJob(activeJobId!),
+    refetchInterval: (query) => {
+      const job = query.state.data?.job;
+      return !job || ["queued", "running"].includes(job.status) ? 1500 : false;
+    }
   });
 
   const queueRows = queueQuery.data?.queue ?? [];
@@ -190,6 +211,10 @@ export function ResearchStage0Page() {
   const executePoolMutation = useMutation({
     mutationFn: executeStage0CandidateBatch,
     onSuccess: (result) => {
+      if (isJobResponse(result)) {
+        setActiveJobId(result.job.job_id);
+        return;
+      }
       void queryClient.invalidateQueries({ queryKey: ["stage0-universe-runs"] });
       void queryClient.invalidateQueries({ queryKey: ["development-queue", result.run.universe_run_id] });
       void queryClient.invalidateQueries({ queryKey: ["stage0-universe-candidates", result.run.universe_run_id] });
@@ -211,6 +236,20 @@ export function ResearchStage0Page() {
       setSelectedEngineId(enginesQuery.data.engines[0].signal_engine_id);
     }
   }, [enginesQuery.data?.engines, selectedEngineId]);
+
+  useEffect(() => {
+    const job = activeJobQuery.data?.job;
+    if (!job || ["queued", "running"].includes(job.status)) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: ["stage0-universe-runs"] });
+    if (selectedRun?.universe_run_id) {
+      void queryClient.invalidateQueries({ queryKey: ["development-queue", selectedRun.universe_run_id] });
+      void queryClient.invalidateQueries({ queryKey: ["stage0-universe-candidates", selectedRun.universe_run_id] });
+    }
+    const timeout = window.setTimeout(() => setActiveJobId(null), job.status === "completed" ? 2500 : 5000);
+    return () => window.clearTimeout(timeout);
+  }, [activeJobQuery.data?.job?.status, selectedRun?.universe_run_id]);
 
   useEffect(() => {
     if (
@@ -236,7 +275,9 @@ export function ResearchStage0Page() {
   };
 
   const canCreate = Boolean(effectiveEngineId) && selectedTickers.length > 0 && !createPoolMutation.isPending;
-  const isScoring = executePoolMutation.isPending;
+  const activeJob = activeJobQuery.data?.job ?? null;
+  const activeJobRunning = Boolean(activeJob && ["queued", "running"].includes(activeJob.status));
+  const isScoring = executePoolMutation.isPending || activeJobRunning;
 
   return (
     <div className="page page--workspace">
@@ -304,7 +345,7 @@ export function ResearchStage0Page() {
                 <StatusBadge tone={progress.pending > 0 ? "warn" : "pass"}>{progress.pending > 0 ? "Pending" : "Complete"}</StatusBadge>
                 <button
                   className="button button--secondary"
-                  disabled={!selectedRun || progress.pending <= 0 || executePoolMutation.isPending}
+                  disabled={!selectedRun || progress.pending <= 0 || isScoring}
                   onClick={() => selectedRun && executePoolMutation.mutate({ universe_run_id: selectedRun.universe_run_id, limit: progress.pending })}
                   type="button"
                 >
@@ -322,7 +363,7 @@ export function ResearchStage0Page() {
               <div className="progress-card">
                 <div className="progress-card__header">
                   <strong>Scoring training pool candidates</strong>
-                  <span>Reading signal packets, scoring travel, classifying accepted/watchlist/failed</span>
+                  <span>{activeJob ? `${activeJob.status} · ${activeJob.current_step ?? "waiting"}` : "Reading signal packets, scoring travel, classifying accepted/watchlist/failed"}</span>
                 </div>
                 <div className="progress-rail" aria-label="Training pool scoring in progress">
                   <span />
@@ -332,6 +373,7 @@ export function ResearchStage0Page() {
                   <span>Evaluate forward travel</span>
                   <span>Persist pool evidence</span>
                 </div>
+                <WorkerRuntimeNotice active={isScoring} job={activeJob} />
               </div>
             ) : null}
 
@@ -391,6 +433,7 @@ export function ResearchStage0Page() {
                     <FieldRow label="Signal engine" value={selectedRow.signal_engine_id} />
                     <FieldRow label="Evaluated signals" value={formatNumber(evaluatedSignalCount(selectedCandidate, selectedRow))} />
                     <FieldRow label="Trigger rate" value={selectedRow.trigger_rate_pct === null ? "pending" : `${selectedRow.trigger_rate_pct}%`} />
+                    <FieldRow label="Significant travel threshold" value={significanceThresholdLabel(selectedCandidate)} />
                     <FieldRow label="Source packets" value={formatNumber(selectedCandidate?.packet_count ?? selectedRow.packet_count)} />
                     <FieldRow label="Development" value={selectedRow.development_status.replaceAll("_", " ")} />
                     <FieldRow label="Next action" value={selectedRow.next_action.label} />
@@ -410,7 +453,7 @@ export function ResearchStage0Page() {
               </TerminalPanel>
             </div>
 
-            {executePoolMutation.data?.summary ? (
+            {executePoolMutation.data && !isJobResponse(executePoolMutation.data) && executePoolMutation.data.summary ? (
               <div className="state-line">
                 Last scoring: {formatNumber(executePoolMutation.data.summary.succeeded)} succeeded · {formatNumber(executePoolMutation.data.summary.failed)} failed · {formatNumber(executePoolMutation.data.summary.remaining_pending)} remaining
               </div>

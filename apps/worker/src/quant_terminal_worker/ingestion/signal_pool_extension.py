@@ -76,6 +76,36 @@ def extend_signal_pool_from_local_candles(
         workspace_root=root,
     )
     parameters = _engine_parameters(signal_set, defaults=_spec_default_parameters(resolved.spec))
+    stream_state = {
+        "generated_packet_count": 0,
+        "appended_packet_count": 0,
+        "final_signal_end": previous_signal_end,
+    }
+
+    def packet_sink(packets: list[dict[str, Any]]) -> None:
+        if not packets:
+            return
+        stream_state["generated_packet_count"] += len(packets)
+        new_packets = [
+            packet
+            for packet in packets
+            if _parse_timestamp(str(packet["timestamp"])) not in existing_timestamps
+        ]
+        if not new_packets:
+            return
+        _append_packets_to_signal_set(
+            repository=repository,
+            signal_set=signal_set,
+            signal_set_key=signal_set_key,
+            packets=new_packets,
+        )
+        for packet in new_packets:
+            timestamp = _parse_timestamp(str(packet["timestamp"]))
+            existing_timestamps.add(timestamp)
+            if stream_state["final_signal_end"] is None or timestamp > stream_state["final_signal_end"]:
+                stream_state["final_signal_end"] = timestamp
+        stream_state["appended_packet_count"] += len(new_packets)
+
     training_output = resolved.generate_training_signals(
         EngineTrainingContext(
             asset=asset,
@@ -90,26 +120,25 @@ def extend_signal_pool_from_local_candles(
             start=scan_start,
             end=requested_target,
             raw_candle_end=raw_candle_end,
+            packet_sink=packet_sink,
         )
     )
     generated_packets = list(training_output.packets)
 
-    new_packets = [
-        packet
-        for packet in generated_packets
-        if _parse_timestamp(str(packet["timestamp"])) not in existing_timestamps
-    ]
-    import_result = _append_packets_to_signal_set(
-        repository=repository,
-        signal_set=signal_set,
-        signal_set_key=signal_set_key,
-        packets=new_packets,
-    )
-    final_packet_count = len(existing_signals) + import_result["signals"]
-    final_signal_end = _final_signal_end(
-        previous_signal_end=previous_signal_end,
-        packets=new_packets,
-    )
+    if generated_packets:
+        packet_sink(generated_packets)
+    import_result = {
+        "status": "imported",
+        "signal_engine_id": signal_engine_id,
+        "signal_set_key": signal_set_key,
+        "signal_sets": 1,
+        "signals": stream_state["appended_packet_count"],
+        "replace_existing": False,
+        "source": "parquet_market_data",
+        "mode": "chunked",
+    }
+    final_packet_count = len(existing_signals) + stream_state["appended_packet_count"]
+    final_signal_end = stream_state["final_signal_end"]
     updated_manifest = _updated_manifest(
         signal_set=signal_set,
         target_end=requested_target,
@@ -133,7 +162,7 @@ def extend_signal_pool_from_local_candles(
     )
     repository.refresh_signal_set_coverage(signal_set_key)
     refreshed = repository.get_signal_set(signal_set_key)
-    status = "extended" if new_packets else "no_new_signals"
+    status = "extended" if stream_state["appended_packet_count"] else "no_new_signals"
 
     return _build_response(
         status=status,
@@ -145,8 +174,8 @@ def extend_signal_pool_from_local_candles(
         scan_coverage_end=requested_target,
         final_signal_end=final_signal_end,
         existing_packet_count=len(existing_signals),
-        generated_packet_count=len(generated_packets),
-        appended_packet_count=len(new_packets),
+        generated_packet_count=stream_state["generated_packet_count"] or len(generated_packets),
+        appended_packet_count=stream_state["appended_packet_count"],
         final_packet_count=(refreshed or {}).get("packet_count", final_packet_count),
         generated_artifact_root=None,
         import_result=import_result,

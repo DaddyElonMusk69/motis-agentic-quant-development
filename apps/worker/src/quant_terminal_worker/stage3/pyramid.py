@@ -54,6 +54,7 @@ def run_stage3_pyramid(
             candles=candle_rows,
             tp_pct=setup["tp_pct"],
             sl_pct=setup["sl_pct"],
+            side_policies=setup.get("side_policies"),
             step_pct=999,
             max_legs=1,
             sl_breakeven=False,
@@ -83,6 +84,7 @@ def run_stage3_pyramid(
                     candles=candle_rows,
                     tp_pct=setup["tp_pct"],
                     sl_pct=setup["sl_pct"],
+                    side_policies=setup.get("side_policies"),
                     step_pct=step,
                     max_legs=leg_count,
                     sl_breakeven=sl_breakeven,
@@ -253,6 +255,7 @@ def _score_pyramid_setup(
     candles: list[dict[str, Any]],
     tp_pct: float,
     sl_pct: float,
+    side_policies: dict[str, Any] | None = None,
     step_pct: float,
     max_legs: int,
     sl_breakeven: bool,
@@ -265,11 +268,17 @@ def _score_pyramid_setup(
     wins = 0
     losses = 0
     for trade in trades:
+        trade_tp_pct, trade_sl_pct = _pyramid_trade_policy(
+            trade=trade,
+            default_tp_pct=tp_pct,
+            default_sl_pct=sl_pct,
+            side_policies=side_policies,
+        )
         outcome = simulate_pyramid_trade(
             trade=trade,
             candles=candles,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
+            tp_pct=trade_tp_pct,
+            sl_pct=trade_sl_pct,
             step_pct=step_pct,
             max_legs=max_legs,
             sl_breakeven=sl_breakeven,
@@ -289,6 +298,24 @@ def _score_pyramid_setup(
         "wins": wins,
         "losses": losses,
     }
+
+
+def _pyramid_trade_policy(
+    *,
+    trade: dict[str, Any],
+    default_tp_pct: float,
+    default_sl_pct: float,
+    side_policies: dict[str, Any] | None,
+) -> tuple[float, float]:
+    if not isinstance(side_policies, dict):
+        return default_tp_pct, default_sl_pct
+    side = str(trade["direction"]).upper()
+    policy = side_policies.get(side)
+    if not isinstance(policy, dict):
+        return default_tp_pct, default_sl_pct
+    tp = policy.get("final_tp_pct", policy.get("lock_profit_pct", policy.get("tp_pct", default_tp_pct)))
+    sl = policy.get("initial_sl_pct", policy.get("sl_pct", default_sl_pct))
+    return float(tp), float(sl)
 
 
 def _resolve_stage4_setups(promotion_root: Path, *, tp_pct: float | None, sl_pct: float | None) -> list[dict[str, Any]]:
@@ -321,6 +348,7 @@ def _resolve_stage4_setups(promotion_root: Path, *, tp_pct: float | None, sl_pct
                 "tp_pct": float(setup["tp_pct"]),
                 "sl_pct": float(setup["sl_pct"]),
                 "protect_trigger_pct": float(setup["protect_trigger_pct"]) if setup.get("protect_trigger_pct") is not None else None,
+                "side_policies": setup.get("side_policies") if setup.get("policy_mode") == "side_specific" else None,
             }
         )
     if setups:

@@ -237,6 +237,103 @@ def test_wake_position_management_defaults_to_bundle_tp_sl_when_strategy_has_no_
     assert wake["order_intents"][0]["sl"] == "59.9637"
 
 
+def test_wake_position_management_uses_short_side_split_policy_for_bundle_protection(tmp_path):
+    bundle = _bundle(
+        tmp_path,
+        setup={
+            "setup": {
+                "policy_mode": "side_specific",
+                "entry_model": "market",
+                "final_tp_pct": 1.0,
+                "initial_sl_pct": 0.5,
+                "protection_enabled": False,
+                "side_policies": {
+                    "LONG": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 1.0,
+                        "lock_profit_pct": 1.0,
+                        "initial_sl_pct": 0.5,
+                    },
+                    "SHORT": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 3.0,
+                        "lock_profit_pct": 3.0,
+                        "initial_sl_pct": 1.25,
+                    },
+                },
+            }
+        },
+    )
+    repository = FakeRepository(route=_route(bundle), bundle=bundle)
+    adapter = FakeAdapter(
+        positions=[{"instId": "AAVE-USDT-SWAP", "pos": "-2", "posSide": "short", "avgPx": "100", "markPx": "99"}],
+        protection_orders=[],
+    )
+
+    wake = run_route_wake(route_id="aave-live", repository=repository, adapter=adapter)
+
+    assert wake["strategy_decision"]["action"] == "UPDATE_PROTECTION"
+    assert wake["strategy_decision"]["direction"] == "SHORT"
+    assert wake["strategy_decision"]["tp"] == "97"
+    assert wake["strategy_decision"]["sl"] == "101.25"
+    protection = wake["strategy_decision"]["diagnostics"]["protection"]
+    assert protection["policy_mode"] == "side_specific"
+    assert protection["selected_side"] == "SHORT"
+    assert protection["final_tp_pct"] == 3.0
+    assert protection["initial_sl_pct"] == 1.25
+    assert wake["order_intents"][0]["tp_pct"] == 3.0
+    assert wake["order_intents"][0]["sl_pct"] == 1.25
+
+
+def test_wake_position_management_uses_short_side_split_policy_for_protected_sl(tmp_path):
+    bundle = _bundle(
+        tmp_path,
+        setup={
+            "setup": {
+                "policy_mode": "side_specific",
+                "entry_model": "market",
+                "final_tp_pct": 1.0,
+                "initial_sl_pct": 0.5,
+                "protection_enabled": False,
+                "side_policies": {
+                    "LONG": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 1.0,
+                        "lock_profit_pct": 1.0,
+                        "initial_sl_pct": 0.5,
+                    },
+                    "SHORT": {
+                        "protection_enabled": True,
+                        "final_tp_pct": 3.0,
+                        "lock_profit_pct": 3.0,
+                        "initial_sl_pct": 1.25,
+                        "protect_trigger_pct": 1.0,
+                        "trail_sl_pct": 0.4,
+                    },
+                },
+            }
+        },
+    )
+    repository = FakeRepository(route=_route(bundle), bundle=bundle)
+    adapter = FakeAdapter(
+        positions=[{"instId": "AAVE-USDT-SWAP", "pos": "-2", "posSide": "short", "avgPx": "100", "markPx": "99"}],
+        protection_orders=[],
+    )
+
+    wake = run_route_wake(route_id="aave-live", repository=repository, adapter=adapter)
+
+    protection = wake["strategy_decision"]["diagnostics"]["protection"]
+    assert wake["strategy_decision"]["action"] == "UPDATE_PROTECTION"
+    assert wake["strategy_decision"]["direction"] == "SHORT"
+    assert protection["selected_side"] == "SHORT"
+    assert protection["phase"] == "protected"
+    assert protection["favorable_move_pct"] == 1
+    assert wake["strategy_decision"]["tp"] == "97"
+    assert wake["strategy_decision"]["sl"] == "99.6"
+    assert wake["order_intents"][0]["tp_pct"] == 3.0
+    assert wake["order_intents"][0]["sl_pct"] == 0.4
+
+
 def test_wake_position_management_derives_protected_sl_from_mark_move(tmp_path):
     bundle = _bundle(
         tmp_path,
@@ -967,6 +1064,56 @@ def test_wake_order_intent_uses_explicit_execution_sizing(tmp_path):
     assert wake["order_intents"][0]["quantity"] == "1.25"
     assert wake["order_intents"][0]["notional_usd"] == 10
     assert wake["order_intents"][0]["trade_mode"] == "isolated"
+
+
+def test_wake_entry_intent_uses_short_side_split_policy(tmp_path):
+    strategy_source = (
+        "def decide(context):\n"
+        "    return {'trade_action': 'ENTER', 'direction': 'SHORT', 'confidence': 0.7, 'reason_code': 'test_short_entry'}\n"
+    )
+    bundle = _bundle(
+        tmp_path,
+        strategy_source=strategy_source,
+        setup={
+            "setup": {
+                "entry_model": "market",
+                "position_quantity": "1.25",
+                "policy_mode": "side_specific",
+                "final_tp_pct": 1.0,
+                "initial_sl_pct": 0.5,
+                "side_policies": {
+                    "LONG": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 1.0,
+                        "lock_profit_pct": 1.0,
+                        "initial_sl_pct": 0.5,
+                    },
+                    "SHORT": {
+                        "protection_enabled": False,
+                        "final_tp_pct": 3.5,
+                        "lock_profit_pct": 3.5,
+                        "initial_sl_pct": 1.25,
+                    },
+                },
+            }
+        },
+    )
+    repository = FakeRepository(route=_route(bundle), bundle=bundle)
+    adapter = FakeAdapter()
+
+    wake = run_route_wake(
+        route_id="aave-live",
+        repository=repository,
+        adapter=adapter,
+        live_signal_scanner=lambda **kwargs: _signal("sig-1"),
+    )
+
+    intent = wake["order_intents"][0]
+    assert intent["direction"] == "SHORT"
+    assert intent["side"] == "sell"
+    assert intent["quantity"] == "1.25"
+    assert intent["tp_pct"] == 3.5
+    assert intent["sl_pct"] == 1.25
 
 
 def test_wake_entry_intent_uses_route_margin_percent_and_leverage_per_pyramid_leg(tmp_path):

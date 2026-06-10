@@ -624,6 +624,48 @@ def _default_protection_decision(
     }
 
 
+def _execution_setup_policy(
+    *,
+    execution_setup: dict[str, Any],
+    direction: str,
+) -> dict[str, Any]:
+    setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
+    direction = str(direction or "LONG").upper()
+    policy_mode = setup.get("policy_mode") or execution_setup.get("policy_mode") or "shared"
+    selected = setup
+    if policy_mode == "side_specific":
+        side_policies = setup.get("side_policies")
+        if not isinstance(side_policies, dict):
+            return {"blocker": "side_specific_execution_setup_missing_side_policies", "policy_mode": policy_mode, "selected_side": direction}
+        side_policy = side_policies.get(direction)
+        if not isinstance(side_policy, dict):
+            return {"blocker": f"side_specific_execution_setup_missing_{direction.lower()}_policy", "policy_mode": policy_mode, "selected_side": direction}
+        selected = side_policy
+
+    final_tp_pct = _numeric(_first_present(selected, "final_tp_pct", "tp_pct", "lock_profit_pct"))
+    initial_sl_pct = _numeric(_first_present(selected, "initial_sl_pct", "sl_pct"))
+    protection_enabled_source = selected if "protection_enabled" in selected else setup
+    protection_enabled = _truthy(protection_enabled_source.get("protection_enabled"))
+    protect_trigger_pct = _numeric(selected.get("protect_trigger_pct"))
+    trail_sl_pct = _numeric(selected.get("trail_sl_pct"))
+    if final_tp_pct <= 0:
+        return {"blocker": "execution_setup_missing_final_tp_pct", "policy_mode": policy_mode, "selected_side": direction}
+    if initial_sl_pct <= 0:
+        return {"blocker": "execution_setup_missing_initial_sl_pct", "policy_mode": policy_mode, "selected_side": direction}
+    if protection_enabled and (protect_trigger_pct <= 0 or trail_sl_pct <= 0):
+        return {"blocker": "protected_execution_setup_missing_protection_values", "policy_mode": policy_mode, "selected_side": direction}
+    return {
+        "policy_mode": policy_mode,
+        "selected_side": direction if policy_mode == "side_specific" else "shared",
+        "protection_enabled": protection_enabled,
+        "final_tp_pct": final_tp_pct,
+        "initial_sl_pct": initial_sl_pct,
+        "protect_trigger_pct": protect_trigger_pct,
+        "trail_sl_pct": trail_sl_pct,
+        "max_hold_hours": _numeric(_first_present(selected, "max_hold_hours", "hard_exit_hours")),
+    }
+
+
 def _resolve_bundle_protection(
     *,
     route: dict[str, Any],
@@ -631,23 +673,25 @@ def _resolve_bundle_protection(
     snapshot: dict[str, Any],
     execution_setup: dict[str, Any],
 ) -> dict[str, Any] | None:
-    setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
-    tp_pct = _numeric(_first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct"))
-    initial_sl_pct = _numeric(_first_present(setup, "initial_sl_pct", "sl_pct"))
+    direction = str(position_context.get("direction") or "LONG").upper()
+    policy = _execution_setup_policy(execution_setup=execution_setup, direction=direction)
+    if policy.get("blocker"):
+        return None
+    tp_pct = float(policy["final_tp_pct"])
+    initial_sl_pct = float(policy["initial_sl_pct"])
     entry_price = _numeric(position_context.get("entry_price"))
     size = _numeric(position_context.get("size"))
     if tp_pct <= 0 or initial_sl_pct <= 0 or entry_price <= 0 or size <= 0:
         return None
 
-    direction = str(position_context.get("direction") or "LONG").upper()
     mark_price = _numeric(position_context.get("mark_price")) or _numeric(position_context.get("last_price"))
     protection_state = _protection_state(snapshot=snapshot, instrument=route["instrument"])
     live_order = protection_state["orders"][0] if protection_state["has_single_live"] else None
     live_sl = _numeric(_first_present(live_order or {}, "slTriggerPx", "sl", "sl_trigger_price"))
     live_tp = _numeric(_first_present(live_order or {}, "tpTriggerPx", "tp", "tp_trigger_price"))
-    protection_enabled = _truthy(setup.get("protection_enabled"))
-    protect_trigger_pct = _numeric(setup.get("protect_trigger_pct"))
-    trail_sl_pct = _numeric(setup.get("trail_sl_pct"))
+    protection_enabled = bool(policy["protection_enabled"])
+    protect_trigger_pct = float(policy["protect_trigger_pct"])
+    trail_sl_pct = float(policy["trail_sl_pct"])
     favorable_move_pct = _favorable_move_pct(entry_price=entry_price, mark_price=mark_price, direction=direction)
     phase = "initial"
     if protection_enabled and protect_trigger_pct > 0 and trail_sl_pct > 0:
@@ -691,6 +735,8 @@ def _resolve_bundle_protection(
         "diagnostics": {
             "entry_price": _format_decimal(entry_price),
             "mark_price": _format_decimal(mark_price) if mark_price > 0 else None,
+            "policy_mode": policy["policy_mode"],
+            "selected_side": policy["selected_side"],
             "phase": phase,
             "protection_enabled": protection_enabled,
             "favorable_move_pct": _rounded_number(favorable_move_pct) if favorable_move_pct is not None else None,
@@ -1152,6 +1198,9 @@ def _coerce_order_intent(
     setup = execution_setup.get("setup") if isinstance(execution_setup.get("setup"), dict) else execution_setup
     action = _canonical_action(intent.get("action") or decision.get("action") or decision.get("trade_action") or "SKIP")
     direction = str(intent.get("direction") or decision.get("direction") or _direction_from_action(action) or "LONG").upper()
+    execution_policy = _execution_setup_policy(execution_setup=execution_setup, direction=direction)
+    if execution_policy.get("blocker") and execution_policy.get("policy_mode") == "side_specific":
+        raise ValueError(str(execution_policy["blocker"]))
     side = str(intent.get("side") or decision.get("side") or _side_for_action(action=action, direction=direction)).lower()
     client_order_id = f"motis-{route['route_id']}-{wake_id}-{index}"
     quantity = (
@@ -1205,8 +1254,8 @@ def _coerce_order_intent(
         "price": intent.get("price") or decision.get("price"),
         "tp": intent.get("tp") or decision.get("tp"),
         "sl": intent.get("sl") or decision.get("sl"),
-        "tp_pct": intent.get("tp_pct") or decision.get("tp_pct") or _first_present(setup, "final_tp_pct", "tp_pct", "lock_profit_pct"),
-        "sl_pct": intent.get("sl_pct") or decision.get("sl_pct") or _first_present(setup, "initial_sl_pct", "sl_pct"),
+        "tp_pct": intent.get("tp_pct") or decision.get("tp_pct") or execution_policy.get("final_tp_pct"),
+        "sl_pct": intent.get("sl_pct") or decision.get("sl_pct") or execution_policy.get("initial_sl_pct"),
         "reduce_only": _truthy(intent.get("reduce_only") if "reduce_only" in intent else _default_reduce_only(action)),
         "client_order_id": str(intent.get("client_order_id") or client_order_id)[:64],
         "status": intent.get("status") or "intent_only",

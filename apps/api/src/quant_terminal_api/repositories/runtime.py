@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import Engine, create_engine, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -12,6 +13,7 @@ from quant_terminal_api.db.models import (
     decisions,
     deployment_routes,
     execution_bundles,
+    jobs,
     market_data_refs,
     owner_states,
     score_summaries,
@@ -27,6 +29,7 @@ from quant_terminal_api.db.models import (
     strategy_modules,
     strategy_versions,
     wake_runs,
+    worker_heartbeats,
 )
 
 
@@ -37,6 +40,235 @@ class RuntimeRepository:
             if isinstance(engine_or_database_url, str)
             else engine_or_database_url
         )
+
+    def enqueue_job(
+        self,
+        *,
+        job_type: str,
+        scope_key: str,
+        payload: dict[str, Any],
+        current_step: str | None = None,
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        with self.engine.begin() as connection:
+            active = connection.execute(
+                select(jobs)
+                .where(jobs.c.scope_key == scope_key)
+                .where(jobs.c.status.in_(("queued", "running")))
+                .order_by(jobs.c.created_at)
+                .limit(1)
+            ).mappings().first()
+            if active:
+                return _normalize_job_row(dict(active))
+            job_id = f"job-{uuid4().hex}"
+            values = {
+                "job_id": job_id,
+                "job_type": job_type,
+                "scope_key": scope_key,
+                "status": "queued",
+                "payload": _json_safe(payload),
+                "result": {},
+                "error": {},
+                "current_step": current_step,
+                "priority": priority,
+                "created_at": now,
+            }
+            connection.execute(insert(jobs).values(values))
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(row))
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as connection:
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().first()
+            return _normalize_job_row(dict(row)) if row else None
+
+    def list_jobs(self, *, scope_key: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        statement = select(jobs).order_by(jobs.c.created_at.desc()).limit(limit)
+        if scope_key:
+            statement = statement.where(jobs.c.scope_key == scope_key)
+        with self.engine.connect() as connection:
+            return [_normalize_job_row(dict(row)) for row in connection.execute(statement).mappings()]
+
+    def cancel_job(self, job_id: str) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        with self.engine.begin() as connection:
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().first()
+            if not row or row["status"] != "queued":
+                return None
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == job_id)
+                .values(status="cancelled", finished_at=now, error={"reason": "cancelled"})
+            )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(updated))
+
+    def record_worker_heartbeat(
+        self,
+        worker_id: str,
+        *,
+        status: str = "idle",
+        current_job_id: str | None = None,
+        current_step: str | None = None,
+        started_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        values = {
+            "worker_id": worker_id,
+            "status": status,
+            "current_job_id": current_job_id,
+            "current_step": current_step,
+            "started_at": started_at or now,
+            "last_seen_at": now,
+        }
+        with self.engine.begin() as connection:
+            connection.execute(self._upsert_worker_heartbeat(values))
+            row = connection.execute(
+                select(worker_heartbeats).where(worker_heartbeats.c.worker_id == worker_id)
+            ).mappings().one()
+            return _normalize_worker_heartbeat_row(dict(row))
+
+    def get_worker_runtime_status(self, *, stale_after_seconds: int = 15) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        stale_cutoff = now - timedelta(seconds=stale_after_seconds)
+        with self.engine.connect() as connection:
+            worker_rows = [
+                _normalize_worker_heartbeat_row(dict(row))
+                for row in connection.execute(
+                    select(worker_heartbeats).order_by(worker_heartbeats.c.last_seen_at.desc())
+                ).mappings()
+            ]
+            queued_count = int(
+                connection.execute(
+                    select(func.count()).select_from(jobs).where(jobs.c.status == "queued")
+                ).scalar_one()
+            )
+            running_count = int(
+                connection.execute(
+                    select(func.count()).select_from(jobs).where(jobs.c.status == "running")
+                ).scalar_one()
+            )
+        active_workers = [
+            row for row in worker_rows if _coerce_datetime(row["last_seen_at"]) >= stale_cutoff
+        ]
+        stale_workers = [
+            row for row in worker_rows if _coerce_datetime(row["last_seen_at"]) < stale_cutoff
+        ]
+        if active_workers:
+            status = "online"
+        elif worker_rows:
+            status = "stale"
+        else:
+            status = "offline"
+        return {
+            "status": status,
+            "online": bool(active_workers),
+            "active_worker_count": len(active_workers),
+            "stale_worker_count": len(stale_workers),
+            "queued_job_count": queued_count,
+            "running_job_count": running_count,
+            "stale_after_seconds": stale_after_seconds,
+            "checked_at": now,
+            "workers": worker_rows[:10],
+        }
+
+    def claim_next_job(self, *, worker_id: str, lock_seconds: int = 900) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        lock_expires_at = now + timedelta(seconds=lock_seconds)
+        with self.engine.begin() as connection:
+            statement = (
+                select(jobs)
+                .where(jobs.c.status == "queued")
+                .order_by(jobs.c.priority.desc(), jobs.c.created_at)
+                .limit(1)
+            )
+            if self.engine.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            row = connection.execute(statement).mappings().first()
+            if not row:
+                return None
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == row["job_id"])
+                .where(jobs.c.status == "queued")
+                .values(
+                    status="running",
+                    started_at=now,
+                    heartbeat_at=now,
+                    locked_by=worker_id,
+                    lock_expires_at=lock_expires_at,
+                )
+            )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == row["job_id"])).mappings().one()
+            return _normalize_job_row(dict(updated))
+
+    def heartbeat_job(self, job_id: str, *, current_step: str | None = None) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        values: dict[str, Any] = {"heartbeat_at": now}
+        if current_step is not None:
+            values["current_step"] = current_step
+        with self.engine.begin() as connection:
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().first()
+            if not row or row["status"] != "running":
+                return None
+            connection.execute(jobs.update().where(jobs.c.job_id == job_id).values(**values))
+            if row["locked_by"]:
+                connection.execute(
+                    self._upsert_worker_heartbeat(
+                        {
+                            "worker_id": row["locked_by"],
+                            "status": "running",
+                            "current_job_id": job_id,
+                            "current_step": current_step or row["current_step"],
+                            "started_at": row["started_at"] or now,
+                            "last_seen_at": now,
+                        }
+                    )
+                )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(updated))
+
+    def complete_job(self, job_id: str, *, result: dict[str, Any]) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        with self.engine.begin() as connection:
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().first()
+            if not row or row["status"] != "running":
+                return None
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == job_id)
+                .values(
+                    status="completed",
+                    result=_json_safe(result),
+                    error={},
+                    finished_at=now,
+                    heartbeat_at=now,
+                    lock_expires_at=None,
+                )
+            )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(updated))
+
+    def fail_job(self, job_id: str, *, error: dict[str, Any]) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        with self.engine.begin() as connection:
+            row = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().first()
+            if not row or row["status"] != "running":
+                return None
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == job_id)
+                .values(
+                    status="failed",
+                    error=_json_safe(error),
+                    finished_at=now,
+                    heartbeat_at=now,
+                    lock_expires_at=None,
+                )
+            )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(updated))
 
     def register_signal_engine(self, registration: dict[str, Any]) -> None:
         with self.engine.begin() as connection:
@@ -1433,6 +1665,19 @@ class RuntimeRepository:
             )
         return insert(signal_sets).values(**values).prefix_with("OR REPLACE")
 
+    def _upsert_worker_heartbeat(self, values: dict[str, Any]):
+        if self.engine.dialect.name == "postgresql":
+            return postgres_insert(worker_heartbeats).values(**values).on_conflict_do_update(
+                index_elements=["worker_id"],
+                set_={
+                    "status": values["status"],
+                    "current_job_id": values["current_job_id"],
+                    "current_step": values["current_step"],
+                    "last_seen_at": values["last_seen_at"],
+                },
+            )
+        return insert(worker_heartbeats).values(**values).prefix_with("OR REPLACE")
+
     def _insert_strategy_development_run_ignore_conflict(self, values: dict[str, Any]):
         if self.engine.dialect.name == "postgresql":
             return postgres_insert(strategy_development_runs).values(**values).on_conflict_do_nothing(
@@ -1681,6 +1926,23 @@ def _normalize_signal_set_row(row: dict[str, Any]) -> dict[str, Any]:
         "packet_end_ts": _coerce_optional_datetime(row.get("end_ts")),
         "coverage_start_ts": _coerce_optional_datetime(coverage_start) or _coerce_optional_datetime(row.get("start_ts")),
         "coverage_end_ts": _coerce_optional_datetime(coverage_end) or _coerce_optional_datetime(row.get("end_ts")),
+    }
+
+
+def _normalize_job_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **row,
+        "payload": row.get("payload") or {},
+        "result": row.get("result") or {},
+        "error": row.get("error") or {},
+    }
+
+
+def _normalize_worker_heartbeat_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **row,
+        "started_at": _coerce_datetime(row["started_at"]),
+        "last_seen_at": _coerce_datetime(row["last_seen_at"]),
     }
 
 

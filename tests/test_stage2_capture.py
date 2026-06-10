@@ -71,6 +71,12 @@ def test_run_stage2_capture_curve_scores_match_set_by_slice(tmp_path: Path):
     assert result["results"]["1.0"]["full_cycle"] == {"reached": 2, "total": 2, "rate": 100.0}
     assert result["results"]["1.5"]["training"] == {"reached": 1, "total": 1, "rate": 100.0}
     assert result["results"]["2.0"]["walk_forward_test"] == {"reached": 0, "total": 1, "rate": 0.0}
+    assert result["side_splits"]["LONG"]["count"] == 1
+    assert result["side_splits"]["SHORT"]["count"] == 1
+    assert result["side_splits"]["LONG"]["results"]["2.0"]["full_cycle"] == {"reached": 1, "total": 1, "rate": 100.0}
+    assert result["side_splits"]["SHORT"]["results"]["2.0"]["full_cycle"] == {"reached": 0, "total": 1, "rate": 0.0}
+    assert result["side_splits"]["LONG"]["sl_results"]["0.3"]["full_cycle"] == {"hit": 0, "total": 1, "rate": 0.0}
+    assert result["side_splits"]["SHORT"]["sl_results"]["0.5"]["full_cycle"] == {"hit": 1, "total": 1, "rate": 100.0}
     assert result["per_signal"][0]["first_tp_reached"] == 0.5
     assert (promotion_root / "stage2_capture_curve.json").exists()
     assert (promotion_root / "stage2_capture_per_signal.json").exists()
@@ -80,7 +86,12 @@ def test_run_stage2_capture_curve_scores_match_set_by_slice(tmp_path: Path):
 def test_run_stage2_capture_curve_profiles_match_decisions_and_writes_stage3_all_trade_inputs(tmp_path: Path):
     artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
     promotion_root = artifact_root / "promotion"
+    stage0_root = tmp_path / "dev/stage0/stage0-aave"
     promotion_root.mkdir(parents=True)
+    (stage0_root / "scores").mkdir(parents=True)
+    (stage0_root / "scores" / "ground_truth_summary.json").write_text(
+        json.dumps({"metrics": {"significance_threshold_pct": 0.8, "forward_hours": 1}})
+    )
     (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
         json.dumps(
             {
@@ -117,6 +128,7 @@ def test_run_stage2_capture_curve_profiles_match_decisions_and_writes_stage3_all
         "strategy_version": "v0.1",
         "signal_engine_id": "vegas_ema",
         "signal_set_id": "AAVE-vegas_ema-canonical",
+        "stage0_artifact_root": str(stage0_root),
     }
     signal_rows = [
         {
@@ -160,11 +172,19 @@ def test_run_stage2_capture_curve_profiles_match_decisions_and_writes_stage3_all
     assert result["per_signal"][0]["agreement"] == "MATCH"
     assert result["per_signal"][0]["max_favorable_excursion_pct"] == 0.8
     assert result["per_signal"][0]["max_adverse_excursion_pct"] == 0.3
+    assert result["sl_levels"][:5] == [0.1, 0.2, 0.3, 0.4, 0.5]
+    assert result["sl_levels"][-1] == 0.8
+    assert result["sl_results"]["0.2"]["full_cycle"] == {"hit": 1, "total": 1, "rate": 100.0}
+    assert result["sl_results"]["0.3"]["full_cycle"] == {"hit": 1, "total": 1, "rate": 100.0}
+    assert result["sl_results"]["0.4"]["full_cycle"] == {"hit": 0, "total": 1, "rate": 0.0}
     assert result["per_signal"][0]["time_to_first_tp_minutes"] == 5.0
     assert result["cohorts"]["MATCH"]["0.4"] == {"reached": 1, "total": 1, "rate": 100.0}
     assert result["cohorts"]["MISMATCH"]["0.4"] == {"reached": 0, "total": 0, "rate": 0.0}
     assert result["stage3_input"]["recommended_tp_min_pct"] == 0.1
     assert result["stage3_input"]["recommended_tp_max_pct"] == 0.8
+    assert result["stage3_input"]["sl_range_source"] == "stage2_matched_adverse_profile"
+    assert result["stage3_input"]["recommended_sl_min_pct"] == 0.1
+    assert result["stage3_input"]["recommended_sl_max_pct"] == 0.8
     stage3_inputs = json.loads((promotion_root / "stage3_trade_inputs.json").read_text())
     assert {row["signal_id"] for row in stage3_inputs} == {"sig-match-long", "sig-mismatch-long"}
     assert {row["agreement"] for row in stage3_inputs} == {"MATCH", "MISMATCH"}
