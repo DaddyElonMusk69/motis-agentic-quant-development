@@ -177,6 +177,7 @@ class RuntimeRepository:
         now = datetime.now(UTC)
         lock_expires_at = now + timedelta(seconds=lock_seconds)
         with self.engine.begin() as connection:
+            self._requeue_expired_running_jobs(connection, now=now)
             statement = (
                 select(jobs)
                 .where(jobs.c.status == "queued")
@@ -203,9 +204,44 @@ class RuntimeRepository:
             updated = connection.execute(select(jobs).where(jobs.c.job_id == row["job_id"])).mappings().one()
             return _normalize_job_row(dict(updated))
 
+    def claim_job(self, *, job_id: str, worker_id: str, lock_seconds: int = 900) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        lock_expires_at = now + timedelta(seconds=lock_seconds)
+        with self.engine.begin() as connection:
+            statement = select(jobs).where(jobs.c.job_id == job_id).limit(1)
+            if self.engine.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            row = connection.execute(statement).mappings().first()
+            if not row:
+                return None
+            if row["status"] == "running" and row["lock_expires_at"] and _coerce_datetime(row["lock_expires_at"]) < now:
+                connection.execute(
+                    jobs.update()
+                    .where(jobs.c.job_id == job_id)
+                    .where(jobs.c.status == "running")
+                    .values(status="queued", locked_by=None, lock_expires_at=None)
+                )
+                row = connection.execute(statement).mappings().first()
+            if not row or row["status"] != "queued":
+                return None
+            connection.execute(
+                jobs.update()
+                .where(jobs.c.job_id == job_id)
+                .where(jobs.c.status == "queued")
+                .values(
+                    status="running",
+                    started_at=now,
+                    heartbeat_at=now,
+                    locked_by=worker_id,
+                    lock_expires_at=lock_expires_at,
+                )
+            )
+            updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
+            return _normalize_job_row(dict(updated))
+
     def heartbeat_job(self, job_id: str, *, current_step: str | None = None) -> dict[str, Any] | None:
         now = datetime.now(UTC)
-        values: dict[str, Any] = {"heartbeat_at": now}
+        values: dict[str, Any] = {"heartbeat_at": now, "lock_expires_at": now + timedelta(seconds=900)}
         if current_step is not None:
             values["current_step"] = current_step
         with self.engine.begin() as connection:
@@ -228,6 +264,20 @@ class RuntimeRepository:
                 )
             updated = connection.execute(select(jobs).where(jobs.c.job_id == job_id)).mappings().one()
             return _normalize_job_row(dict(updated))
+
+    def _requeue_expired_running_jobs(self, connection: Any, *, now: datetime) -> None:
+        connection.execute(
+            jobs.update()
+            .where(jobs.c.status == "running")
+            .where(jobs.c.lock_expires_at.is_not(None))
+            .where(jobs.c.lock_expires_at < now)
+            .values(
+                status="queued",
+                locked_by=None,
+                lock_expires_at=None,
+                error={"reason": "expired_worker_lock_requeued"},
+            )
+        )
 
     def complete_job(self, job_id: str, *, result: dict[str, Any]) -> dict[str, Any] | None:
         now = datetime.now(UTC)

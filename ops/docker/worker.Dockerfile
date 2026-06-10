@@ -6,4 +6,4 @@ COPY apps ./apps
 COPY packages ./packages
 RUN pip install --no-cache-dir -e .
 
-CMD ["python", "-m", "quant_terminal_worker.service"]
+CMD ["sh", "-c", "celery -A quant_terminal_worker.celery_app:celery_app worker --loglevel=INFO --concurrency=${CELERY_CONCURRENCY:-4} -Q ${CELERY_QUEUES:-market_data,signal_generation,research,execution,default}"]

@@ -54,11 +54,18 @@ skills/stage1a-training-optimizer/SKILL.md
 ```bash
 cp .env.example .env
 python3 -m pytest tests -q
+# Start Redis separately when using the Celery job backend, or use compose-up.
 make dev-api
 make dev-worker
 npm install
 make dev-web
 ```
+
+`make dev-worker` runs the Celery-backed concurrent job worker. Use
+`CELERY_CONCURRENCY=8 make dev-worker` to increase parallel job slots, and keep
+live/execution workers isolated with `CELERY_QUEUES=execution,default` when needed.
+The previous single-job Postgres polling worker remains available as
+`make dev-worker-legacy`.
 
 Current v2 frontend:
 

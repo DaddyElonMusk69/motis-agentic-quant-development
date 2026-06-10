@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from quant_terminal_api.job_dispatch import dispatch_runtime_job
 from quant_terminal_api.repositories.market_data import PostgresMarketDataRepository
 from quant_terminal_api.repositories.runtime import RuntimeRepository
 from quant_terminal_api.services.market_data_catalog import (
@@ -311,7 +312,14 @@ def create_app(
             payload=payload,
             current_step=current_step,
         )
-        return {"accepted": True, "job": _relative_nested_paths(Path.cwd(), job)}
+        try:
+            dispatch = dispatch_runtime_job(job)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"message": str(exc), "job_id": job.get("job_id")},
+            ) from exc
+        return {"accepted": True, "job": _relative_nested_paths(Path.cwd(), job), "dispatch": dispatch}
 
     def build_execution_adapter(route: dict[str, Any]) -> Any:
         try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -60,22 +61,47 @@ def run_claimed_job(
     workspace_root: Path,
     market_data_repository: Any | None = None,
 ) -> dict[str, Any] | None:
-    try:
-        result = execute_job(
-            repository=repository,
-            job=job,
-            workspace_root=workspace_root,
-            market_data_repository=market_data_repository,
-        )
-    except Exception as exc:
-        return repository.fail_job(
-            job["job_id"],
-            error={
-                "message": str(exc),
-                "type": exc.__class__.__name__,
-            },
-        )
-    return repository.complete_job(job["job_id"], result=result)
+    with _job_heartbeat(repository=repository, job_id=job["job_id"]):
+        try:
+            result = execute_job(
+                repository=repository,
+                job=job,
+                workspace_root=workspace_root,
+                market_data_repository=market_data_repository,
+            )
+        except Exception as exc:
+            return repository.fail_job(
+                job["job_id"],
+                error={
+                    "message": str(exc),
+                    "type": exc.__class__.__name__,
+                },
+            )
+        return repository.complete_job(job["job_id"], result=result)
+
+
+class _job_heartbeat:
+    def __init__(self, *, repository: Any, job_id: str, interval_seconds: float = 10.0) -> None:
+        self.repository = repository
+        self.job_id = job_id
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"job-heartbeat-{job_id}", daemon=True)
+
+    def __enter__(self) -> "_job_heartbeat":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.repository.heartbeat_job(self.job_id)
+            except Exception:
+                pass
 
 
 def _execute_market_data_refresh(

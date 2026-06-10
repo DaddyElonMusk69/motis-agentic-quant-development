@@ -109,6 +109,66 @@ def test_runtime_repository_enqueues_and_dedupes_active_jobs_by_scope():
     assert next_job["status"] == "queued"
 
 
+def test_runtime_repository_claims_specific_job_without_draining_queue():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    first = repository.enqueue_job(
+        job_type="stage1_score",
+        scope_key="stage1_session:stage1-aave",
+        payload={"session_id": "stage1-aave"},
+    )
+    second = repository.enqueue_job(
+        job_type="signal_pool_extend",
+        scope_key="signal_set:vegas_ema:BTC",
+        payload={"asset": "BTC"},
+    )
+
+    claimed_second = repository.claim_job(job_id=second["job_id"], worker_id="celery-worker-1")
+    claimed_first = repository.claim_next_job(worker_id="legacy-worker-1")
+
+    assert claimed_second["job_id"] == second["job_id"]
+    assert claimed_second["locked_by"] == "celery-worker-1"
+    assert claimed_first["job_id"] == first["job_id"]
+    assert claimed_first["locked_by"] == "legacy-worker-1"
+
+
+def test_runtime_repository_requeues_expired_running_jobs_before_claiming():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    queued = repository.enqueue_job(
+        job_type="signal_pool_extend",
+        scope_key="signal_set:vegas_ema:BTC",
+        payload={"asset": "BTC"},
+    )
+    expired = repository.claim_job(job_id=queued["job_id"], worker_id="dead-worker", lock_seconds=-1)
+
+    reclaimed = repository.claim_next_job(worker_id="live-worker")
+
+    assert expired["status"] == "running"
+    assert reclaimed["job_id"] == queued["job_id"]
+    assert reclaimed["status"] == "running"
+    assert reclaimed["locked_by"] == "live-worker"
+
+
+def test_runtime_repository_heartbeat_extends_running_lock():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    queued = repository.enqueue_job(
+        job_type="signal_pool_extend",
+        scope_key="signal_set:vegas_ema:BTC",
+        payload={"asset": "BTC"},
+    )
+    claimed = repository.claim_job(job_id=queued["job_id"], worker_id="worker-1", lock_seconds=1)
+
+    refreshed = repository.heartbeat_job(claimed["job_id"], current_step="chunk_1")
+
+    assert refreshed["current_step"] == "chunk_1"
+    assert refreshed["lock_expires_at"] > claimed["lock_expires_at"]
+
+
 def test_runtime_repository_cancels_only_queued_jobs():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     metadata.create_all(engine)
