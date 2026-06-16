@@ -479,6 +479,7 @@ def create_app(
         signal_engine_id: str | None = None,
         asset: str | None = None,
         limit: int = 25,
+        descending: bool = False,
     ) -> dict[str, Any]:
         return {
             "signals": get_runtime_repository().list_signals(
@@ -486,6 +487,7 @@ def create_app(
                 signal_engine_id=signal_engine_id,
                 asset=asset,
                 limit=min(limit, 200),
+                descending=descending,
             )
         }
 
@@ -2405,7 +2407,25 @@ def _signal_engine_catalog(repository: Any, *, workspace_root: Path) -> list[dic
                     "signal_set_count": 0,
                     "packet_count": 0,
                 }
-    return sorted(engines_by_id.values(), key=lambda engine: str(engine.get("signal_engine_id") or ""))
+    return sorted(engines_by_id.values(), key=_signal_engine_catalog_sort_key)
+
+
+def _signal_engine_catalog_sort_key(engine: dict[str, Any]) -> tuple[bool, float, str]:
+    created_at = engine.get("created_at")
+    created_at_ts = _signal_engine_created_at_timestamp(created_at)
+    return (created_at_ts is None, -(created_at_ts or 0.0), str(engine.get("signal_engine_id") or ""))
+
+
+def _signal_engine_created_at_timestamp(value: Any) -> float | None:
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.timestamp()
+    return None
 
 
 def _materialize_signal_engine(repository: Any, *, workspace_root: Path, signal_engine_id: str) -> dict[str, Any] | None:

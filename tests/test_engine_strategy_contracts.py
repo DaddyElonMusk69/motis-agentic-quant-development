@@ -385,6 +385,35 @@ def test_recursive_vegas_features_base_enters_long_with_aligned_features():
     assert decision["diagnostics"]["feature_bias"] == "LONG"
 
 
+def test_recursive_vegas_features_base_enters_long_with_5m_only_signal_packet():
+    strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_recursive_features_base")
+
+    decision = strategy.decide(
+        {
+            "signal": {
+                "signal_id": "vegas_ema_recursive_features:ETH:test:20260608T060000Z",
+                "payload": _recursive_feature_payload(
+                    active_timeframes=["5m"],
+                    fast_mid_gap=0.8,
+                    mid_slow_gap=0.6,
+                    ema_stack_state="bull_stack",
+                    returns_5m=[0.03, 0.04, 0.05],
+                    return_2h_12=0.8,
+                    return_1d_48=2.4,
+                    bb_position_5m=54,
+                    atr_pct_5m=0.22,
+                ),
+            },
+            "runtime_mode": "backtest",
+        }
+    )
+
+    assert decision["action"] == "ENTER"
+    assert decision["direction"] == "LONG"
+    assert decision["reason_code"] == "feature_aligned_recursive_vegas_long"
+    assert decision["diagnostics"]["active_timeframe_count"] == 1
+
+
 def test_recursive_vegas_features_base_enters_short_with_aligned_features():
     strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_recursive_features_base")
 
@@ -414,6 +443,43 @@ def test_recursive_vegas_features_base_enters_short_with_aligned_features():
     assert decision["diagnostics"]["feature_bias"] == "SHORT"
 
 
+def test_recursive_vegas_features_base_uses_interactions_and_ema_chart_context_for_direction():
+    strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_recursive_features_base")
+
+    decision = strategy.decide(
+        {
+            "signal": {
+                "signal_id": "vegas_ema_recursive_features:ETH:test:20260608T060000Z",
+                "payload": _recursive_feature_payload(
+                    active_timeframes=["5m"],
+                    fast_mid_gap=0.0,
+                    mid_slow_gap=0.0,
+                    ema_stack_state="mixed",
+                    returns_5m=[-0.01, 0.0, 0.01],
+                    return_2h_12=0.0,
+                    return_1d_48=0.0,
+                    bb_position_5m=53,
+                    atr_pct_5m=0.22,
+                    interaction_distances={"36": "0.0004", "43": "0.0006", "144": "0.0011"},
+                    ema_values_5m={"36": "100.10", "43": "100.00", "144": "99.80", "169": "99.70", "576": "99.40", "676": "99.20"},
+                    ema_validity_5m={"36": True, "43": True, "144": True, "169": True, "576": True, "676": True},
+                    five_minute_closes=[99.6, 99.8, 100.1, 100.4],
+                    two_hour_closes=[99.0, 99.2, 99.6, 100.0],
+                    one_day_closes=[98.0, 98.4, 99.0, 100.0],
+                ),
+            },
+            "runtime_mode": "backtest",
+        }
+    )
+
+    assert decision["action"] == "ENTER"
+    assert decision["direction"] == "LONG"
+    assert decision["reason_code"] == "weighted_recursive_feature_votes_long"
+    assert decision["diagnostics"]["weighted_vote_direction"] == "LONG"
+    assert decision["diagnostics"]["interaction_direction"] == "LONG"
+    assert decision["diagnostics"]["ema_chart_direction"] == "LONG"
+
+
 def test_recursive_vegas_features_base_skips_overextended_or_too_volatile_signals():
     strategy = importlib.import_module("quant_terminal_strategies.vegas_ema_recursive_features_base")
 
@@ -440,6 +506,47 @@ def test_recursive_vegas_features_base_skips_overextended_or_too_volatile_signal
     assert decision["action"] == "SKIP"
     assert decision["direction"] == "FLAT"
     assert decision["reason_code"] == "feature_context_overextended_or_volatile"
+
+
+def test_liquidity_sweep_v1_base_strategy_uses_basic_reversal_seed_direction():
+    strategy = importlib.import_module("quant_terminal_strategies.liquidity_sweep_v1_base")
+
+    high_decision = strategy.decide({"signal": {"signal_id": "liquidity_sweep_v1:AAVE:test:high", "payload": _liquidity_sweep_payload("HIGH_SWEEP")}})
+    low_decision = strategy.decide({"signal": {"signal_id": "liquidity_sweep_v1:AAVE:test:low", "payload": _liquidity_sweep_payload("LOW_SWEEP")}})
+
+    assert high_decision["action"] == "ENTER"
+    assert high_decision["direction"] == "SHORT"
+    assert high_decision["reason_code"] == "high_sweep_reversal_seed_short"
+    assert high_decision["diagnostics"]["directional_prior"] == "reversal"
+    assert low_decision["action"] == "ENTER"
+    assert low_decision["direction"] == "LONG"
+    assert low_decision["reason_code"] == "low_sweep_reversal_seed_long"
+    assert low_decision["diagnostics"]["directional_prior"] == "reversal"
+
+
+def _liquidity_sweep_payload(event_type: str) -> dict[str, object]:
+    return {
+        "schema_version": "signal_packet.v2",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+        "timestamp": "2026-06-08T06:00:00Z",
+        "active_timeframes": ["5m"],
+        "evidence": {
+            "pattern": "liquidity_sweep_event",
+            "event_type": event_type,
+            "reference_window_hours": 72,
+            "reference_level": "105",
+            "trigger_price": "108",
+            "trigger_candle_close": "101",
+            "atr_14": "10",
+            "sweep_distance": "3",
+            "sweep_distance_atr": "0.3",
+            "close_location_pct": "60",
+            "cooldown_hours": 12,
+            "level_id": "sweep-20260608",
+        },
+        "charts": {"5m": {"role": "trigger_context"}},
+    }
 
 
 def test_current_aave_execution_bundle_validates_with_legacy_aliases():
@@ -506,6 +613,12 @@ def _recursive_feature_payload(
     return_1d_48: float,
     bb_position_5m: float,
     atr_pct_5m: float,
+    interaction_distances: dict[str, str] | None = None,
+    ema_values_5m: dict[str, str] | None = None,
+    ema_validity_5m: dict[str, bool] | None = None,
+    five_minute_closes: list[float] | None = None,
+    two_hour_closes: list[float] | None = None,
+    one_day_closes: list[float] | None = None,
 ) -> dict[str, object]:
     feature_window_5m = [
         {
@@ -547,16 +660,56 @@ def _recursive_feature_payload(
             "window_bars": 10,
         },
     }
+    columns = ["ts", "open", "high", "low", "close", "volume", "vol_ccy", "vol_ccy_quote", "confirm"]
+    matched_periods = [int(period) for period in (interaction_distances or {}).keys()]
+    market_price = str((five_minute_closes or [100])[-1])
+    interactions = [
+        {
+            "timeframe": "5m",
+            "tunnel": "fast" if int(period) in {36, 43} else "mid" if int(period) in {144, 169} else "slow",
+            "period": int(period),
+            "ema_value": str((ema_values_5m or {}).get(period, "100")),
+            "market_price": market_price,
+            "distance_pct": distance,
+        }
+        for period, distance in (interaction_distances or {}).items()
+    ]
+    charts = {
+        "5m": {
+            "role": "trigger",
+            "columns": columns,
+            "completed_candles": [_candle_row(index, close) for index, close in enumerate(five_minute_closes or [100, 100, 100])],
+            "ema_values": ema_values_5m or {},
+            "ema_distances": interaction_distances or {},
+            "ema_validity": ema_validity_5m or {},
+        },
+        "2h": {
+            "role": "context",
+            "columns": columns,
+            "completed_candles": [_candle_row(index, close) for index, close in enumerate(two_hour_closes or [100, 100, 100])],
+        },
+        "1d": {
+            "role": "context",
+            "columns": columns,
+            "completed_candles": [_candle_row(index, close) for index, close in enumerate(one_day_closes or [100, 100, 100])],
+        },
+    }
     return {
         "schema_version": "signal_packet.v2",
         "asset": "ETH",
         "instrument": "ETH-USDT-SWAP",
         "timestamp": "2026-06-08T06:00:00Z",
         "active_timeframes": active_timeframes,
+        "interactions": interactions,
+        "charts": charts,
         "features": features,
         "evidence": {
             "pattern": "vegas_ema_tunnel_proximity_with_features",
             "active_timeframes": active_timeframes,
+            "matched_ema_count": len(matched_periods),
+            "matched_periods": matched_periods,
+            "interactions": interactions,
+            "charts": charts,
             "features": features,
         },
     }

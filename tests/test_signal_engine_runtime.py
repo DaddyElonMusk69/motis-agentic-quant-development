@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -620,6 +620,163 @@ def test_recursive_vegas_features_training_can_stream_packets_in_chunks(tmp_path
     assert streamed_chunks[0][0]["evidence"]["features"]["5m"]["latest"]["base_candle"]["return_pct"] == 0.2
 
 
+def test_liquidity_sweep_registry_entry_is_contract_compliant():
+    validate_signal_engine_spec("liquidity_sweep_v1")
+    resolved = resolve_signal_engine("liquidity_sweep_v1", repository=_repository(), workspace_root=Path.cwd())
+    assert resolved.spec.required_data == [
+        {
+            "data_type": "candles",
+            "origin": "raw",
+            "timeframe": "5m",
+            "lookback_bars": 20000,
+            "freshness_tolerance_seconds": 300,
+        }
+    ]
+    assert resolved.spec.code_ref["base_strategy_path"] == "packages/strategy_modules/src/quant_terminal_strategies/liquidity_sweep_v1_base.py"
+    validate_strategy_module(resolved.spec.code_ref["base_strategy_path"])
+
+
+def test_liquidity_sweep_training_detects_high_and_low_sweeps(tmp_path: Path):
+    from quant_terminal_worker.signal_engines.liquidity_sweep_v1 import generate_training_signals
+
+    root, repository = _workspace_with_liquidity_sweep_pool(tmp_path)
+    rows = _liquidity_reference_rows()
+    rows.append(_ohlcv_row("2026-06-04T00:00:00Z", open_=100, high=108, low=98, close=101))
+    rows.extend(_liquidity_reference_rows(start="2026-06-04T12:05:00Z", count=144))
+    rows.append(_ohlcv_row("2026-06-05T00:05:00Z", open_=100, high=102, low=87, close=99))
+    _register_candle_ref(repository, root=root, asset="AAVE", timeframe="5m", origin="raw", rows=rows)
+    reader = MarketDataReader(repository=repository, workspace_root=root)
+
+    output = generate_training_signals(
+        EngineTrainingContext(
+            asset="AAVE",
+            instrument="AAVE-USDT-SWAP",
+            signal_set=repository.get_signal_set(build_signal_set_key("liquidity_sweep_v1", "AAVE", "AAVE-liquidity_sweep_v1-canonical")),
+            signal_set_key=build_signal_set_key("liquidity_sweep_v1", "AAVE", "AAVE-liquidity_sweep_v1-canonical"),
+            parameters={"reference_window_hours": 72, "atr_period": 14, "min_sweep_atr": 0.2, "cooldown_hours": 12},
+            market_data_reader=reader,
+            spec=resolve_signal_engine("liquidity_sweep_v1", repository=repository, workspace_root=root).spec,
+            workspace_root=root,
+            repository=repository,
+            start=datetime.fromisoformat("2026-06-04T00:00:00+00:00"),
+            end=datetime.fromisoformat("2026-06-05T00:05:00+00:00"),
+            raw_candle_end=datetime.fromisoformat("2026-06-05T00:05:00+00:00"),
+        )
+    )
+
+    assert output.result.generated_packet_count == 2
+    assert [packet["evidence"]["event_type"] for packet in output.packets] == ["HIGH_SWEEP", "LOW_SWEEP"]
+    high_packet = output.packets[0]
+    validate_signal_packet(high_packet)
+    assert high_packet["schema_version"] == "signal_packet.v2"
+    assert high_packet["active_timeframes"] == ["5m"]
+    assert high_packet["evidence"]["pattern"] == "liquidity_sweep_event"
+    assert high_packet["evidence"]["reference_window_hours"] == 72
+    assert high_packet["evidence"]["reference_level"] == "105"
+    assert high_packet["evidence"]["trigger_price"] == "108"
+    assert high_packet["evidence"]["atr_14"] == "10"
+    assert high_packet["evidence"]["sweep_distance"] == "3"
+    assert high_packet["evidence"]["sweep_distance_atr"] == "0.3"
+    assert high_packet["charts"]["5m"]["role"] == "trigger_context"
+    assert "direction" not in json.dumps(high_packet)
+    assert "side" not in json.dumps(high_packet)
+
+
+def test_liquidity_sweep_training_ignores_microscopic_breach_and_respects_cooldown(tmp_path: Path):
+    root, repository = _workspace_with_liquidity_sweep_pool(tmp_path)
+    rows = _liquidity_reference_rows()
+    rows.append(_ohlcv_row("2026-06-04T00:00:00Z", open_=100, high=106, low=98, close=101))
+    rows.append(_ohlcv_row("2026-06-04T00:05:00Z", open_=100, high=109, low=98, close=101))
+    rows.append(_ohlcv_row("2026-06-04T06:00:00Z", open_=100, high=112, low=98, close=101))
+    _register_candle_ref(repository, root=root, asset="AAVE", timeframe="5m", origin="raw", rows=rows)
+
+    result = extend_signal_pool_from_local_candles(
+        workspace_root=root,
+        repository=repository,
+        signal_engine_id="liquidity_sweep_v1",
+        asset="AAVE",
+        target_end="2026-06-04T06:00:00Z",
+    )
+
+    assert result["status"] == "extended"
+    assert result["appended_packet_count"] == 2
+    signals = repository.list_signals(signal_set_key=build_signal_set_key("liquidity_sweep_v1", "AAVE", "AAVE-liquidity_sweep_v1-canonical"))
+    assert [signal["timestamp"].replace(tzinfo=UTC) for signal in signals] == [
+        datetime.fromisoformat("2026-06-04T00:05:00+00:00"),
+        datetime.fromisoformat("2026-06-04T06:00:00+00:00"),
+    ]
+    assert [signal["payload"]["evidence"]["event_type"] for signal in signals] == ["HIGH_SWEEP", "HIGH_SWEEP"]
+
+
+def test_liquidity_sweep_live_scan_scans_latest_confirmed_raw_5m_candle_only(tmp_path: Path):
+    root, repository = _workspace_with_liquidity_sweep_pool(tmp_path)
+    rows = _liquidity_reference_rows()
+    rows.append(_ohlcv_row("2026-06-04T00:00:00Z", open_=100, high=108, low=98, close=101))
+    _register_candle_ref(repository, root=root, asset="AAVE", timeframe="5m", origin="raw", rows=rows)
+    route = {
+        **_route(root),
+        "route_id": "aave-lse-live",
+        "signal_engine_id": "liquidity_sweep_v1",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "instrument": "AAVE-USDT-SWAP",
+    }
+
+    signal = scan_latest_live_signal(route=route, repository=repository, workspace_root=root)
+
+    assert signal is not None
+    assert signal["signal_engine_id"] == "liquidity_sweep_v1"
+    assert signal["payload"]["timestamp"] == "2026-06-04T00:00:00Z"
+    assert signal["payload"]["evidence"]["event_type"] == "HIGH_SWEEP"
+
+    root_no_signal, repository_no_signal = _workspace_with_liquidity_sweep_pool(tmp_path / "no-signal")
+    rows_no_signal = _liquidity_reference_rows()
+    rows_no_signal.append(_ohlcv_row("2026-06-04T00:00:00Z", open_=100, high=104, low=96, close=100))
+    _register_candle_ref(repository_no_signal, root=root_no_signal, asset="AAVE", timeframe="5m", origin="raw", rows=rows_no_signal)
+    no_signal = scan_latest_live_signal(route=route, repository=repository_no_signal, workspace_root=root_no_signal)
+    assert no_signal is None
+
+
+def test_liquidity_sweep_training_uses_bounded_reference_window(monkeypatch):
+    from quant_terminal_sdk.market_data_reader import MarketDataCandle
+    from quant_terminal_worker.signal_engines import liquidity_sweep_v1 as engine
+
+    rows = [
+        MarketDataCandle(
+            timestamp=datetime(2026, 6, 1, tzinfo=UTC) + timedelta(minutes=5 * index),
+            open=100,
+            high=101,
+            low=99,
+            close=100,
+            volume=1,
+            vol_ccy=1,
+            vol_ccy_quote=1,
+            confirm=1,
+        )
+        for index in range(1_000)
+    ]
+    observed_history_sizes = []
+
+    def capture_scan_row(*, rows, index, history_start_index, **kwargs):
+        del kwargs
+        observed_history_sizes.append(index - history_start_index)
+        return None
+
+    monkeypatch.setattr(engine, "_scan_row", capture_scan_row)
+
+    engine.generate_liquidity_sweep_packets(
+        workspace_root=Path.cwd(),
+        asset="AAVE",
+        instrument="AAVE-USDT-SWAP",
+        raw_5m=rows,
+        start=rows[0].timestamp,
+        end=rows[-1].timestamp,
+        parameters={"reference_window_hours": 12, "atr_period": 14, "min_sweep_atr": 0.2, "cooldown_hours": 2},
+    )
+
+    assert max(observed_history_sizes) <= 144
+
+
 def test_5m_cluster_vegas_registry_entry_is_contract_compliant():
     validate_signal_engine_spec("vegas_ema_5m_cluster")
     resolved = resolve_signal_engine("vegas_ema_5m_cluster", repository=_repository(), workspace_root=Path.cwd())
@@ -1169,6 +1326,39 @@ def _workspace_with_5m_cluster_pool(tmp_path: Path) -> tuple[Path, RuntimeReposi
     return root, repository
 
 
+def _workspace_with_liquidity_sweep_pool(tmp_path: Path) -> tuple[Path, RuntimeRepository]:
+    root = tmp_path / "workspace-liquidity-sweep"
+    root.mkdir(parents=True, exist_ok=True)
+    repository = _repository()
+    _register_liquidity_sweep_engine(repository)
+    asset = "AAVE"
+    repository.upsert_signal_set(
+        {
+            "signal_set_key": build_signal_set_key("liquidity_sweep_v1", asset, f"{asset}-liquidity_sweep_v1-canonical"),
+            "signal_set_id": f"{asset}-liquidity_sweep_v1-canonical",
+            "signal_engine_id": "liquidity_sweep_v1",
+            "signal_engine_version": "0.1",
+            "asset": asset,
+            "instrument": f"{asset}-USDT-SWAP",
+            "start_ts": None,
+            "end_ts": None,
+            "packet_count": 0,
+            "payload_schema": "signal_packet.v2",
+            "source_path": "canonicalized:signals",
+            "manifest": {
+                "parameters": {
+                    "reference_window_hours": 12,
+                    "atr_period": 14,
+                    "min_sweep_atr": 0.2,
+                    "cooldown_hours": 2,
+                    "context_bars": 144,
+                }
+            },
+        }
+    )
+    return root, repository
+
+
 def _register_threshold_engine(repository: RuntimeRepository) -> None:
     repository.register_signal_engine(
         {
@@ -1183,6 +1373,43 @@ def _register_threshold_engine(repository: RuntimeRepository) -> None:
             "runtime_entrypoint": "quant_terminal_engines.threshold_reversal:generate_training_signals",
             "live_scanner_entrypoint": "quant_terminal_engines.threshold_reversal:scan_live_signal",
             "configuration_schema": {},
+        }
+    )
+
+
+def _register_liquidity_sweep_engine(repository: RuntimeRepository) -> None:
+    repository.register_signal_engine(
+        {
+            "signal_engine_id": "liquidity_sweep_v1",
+            "name": "Liquidity Sweep v1",
+            "description": "Lean 5m liquidity sweep event engine.",
+            "version": "0.1",
+            "code_ref": {
+                "path": "apps/worker/src/quant_terminal_worker/signal_engines/liquidity_sweep_v1.py",
+                "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/liquidity_sweep_v1_base.py",
+            },
+            "supported_input_data_types": ["candles"],
+            "required_data": [
+                {
+                    "data_type": "candles",
+                    "origin": "raw",
+                    "timeframe": "5m",
+                    "lookback_bars": 20000,
+                    "freshness_tolerance_seconds": 300,
+                }
+            ],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "quant_terminal_worker.signal_engines.liquidity_sweep_v1:generate_training_signals",
+            "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.liquidity_sweep_v1:scan_live_signal",
+            "configuration_schema": {
+                "default_parameters": {
+                    "reference_window_hours": 12,
+                    "atr_period": 14,
+                    "min_sweep_atr": 0.2,
+                    "cooldown_hours": 2,
+                    "context_bars": 144,
+                }
+            },
         }
     )
 
@@ -1465,6 +1692,34 @@ def _candle_row(timestamp: str, *, open_: float, close: float) -> dict[str, obje
         "vol_ccy_quote": 1.0,
         "confirm": 1,
     }
+
+
+def _ohlcv_row(timestamp: str, *, open_: float, high: float, low: float, close: float) -> dict[str, object]:
+    return {
+        "timestamp": timestamp,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": 1.0,
+        "vol_ccy": 1.0,
+        "vol_ccy_quote": 1.0,
+        "confirm": 1,
+    }
+
+
+def _liquidity_reference_rows(*, start: str = "2026-06-01T00:00:00Z", count: int = 864) -> list[dict[str, object]]:
+    start_ts = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    return [
+        _ohlcv_row(
+            (start_ts.replace(tzinfo=UTC) + timedelta(minutes=5 * index)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            open_=100,
+            high=105,
+            low=95,
+            close=100,
+        )
+        for index in range(count)
+    ]
 
 
 def _ema_candle_row(timestamp: str, *, close: float) -> dict[str, object]:

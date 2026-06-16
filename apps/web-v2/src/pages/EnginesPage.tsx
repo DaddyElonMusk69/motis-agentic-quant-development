@@ -67,6 +67,25 @@ function selectSignalSet(signalSets: SignalSet[], searchParams: URLSearchParams)
   return signalSets.find((set) => set.signal_set_key === requestedSet) ?? signalSets.find((set) => set.asset === requestedAsset) ?? signalSets[0];
 }
 
+function sortEnginesByCreatedAt(engines: SignalEngine[] | undefined): SignalEngine[] {
+  if (!engines?.length) {
+    return [];
+  }
+  return [...engines].sort((left, right) => {
+    const leftCreated = Date.parse(left.created_at ?? "");
+    const rightCreated = Date.parse(right.created_at ?? "");
+    const leftHasCreated = Number.isFinite(leftCreated);
+    const rightHasCreated = Number.isFinite(rightCreated);
+    if (leftHasCreated && rightHasCreated && leftCreated !== rightCreated) {
+      return rightCreated - leftCreated;
+    }
+    if (leftHasCreated !== rightHasCreated) {
+      return leftHasCreated ? -1 : 1;
+    }
+    return left.signal_engine_id.localeCompare(right.signal_engine_id);
+  });
+}
+
 function signalSetState(set: SignalSet): { label: string; tone: "pass" | "warn" | "idle" | "info" } {
   const coverageEnd = set.coverage_end_ts ?? set.end_ts;
   const packetEnd = set.packet_end_ts ?? set.end_ts;
@@ -169,7 +188,8 @@ export function EnginesPage() {
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const enginesQuery = useQuery({ queryKey: ["signal-engines"], queryFn: fetchSignalEngines });
   const catalogQuery = useQuery({ queryKey: ["market-data-catalog"], queryFn: fetchMarketDataCatalog });
-  const selectedEngine = selectEngine(enginesQuery.data?.engines, searchParams);
+  const orderedEngines = useMemo(() => sortEnginesByCreatedAt(enginesQuery.data?.engines), [enginesQuery.data?.engines]);
+  const selectedEngine = selectEngine(orderedEngines, searchParams);
   const engineId = selectedEngine?.signal_engine_id ?? "";
   const signalSetsQuery = useQuery({
     enabled: Boolean(engineId),
@@ -184,7 +204,7 @@ export function EnginesPage() {
   const signalsQuery = useQuery({
     enabled: Boolean(selectedSignalSet?.signal_set_key),
     queryKey: ["signals", selectedSignalSet?.signal_set_key],
-    queryFn: () => fetchSignals(selectedSignalSet!.signal_set_key, 5)
+    queryFn: () => fetchSignals(selectedSignalSet!.signal_set_key, 5, true)
   });
   const activeScopeKey = engineId && selectedSignalSet?.asset ? `signal_set:${engineId}:${selectedSignalSet.asset.toUpperCase()}` : null;
   const latestScopeJobsQuery = useQuery({
@@ -322,8 +342,8 @@ export function EnginesPage() {
                 </div>
                 {enginesQuery.isLoading ? <div className="state-line">Loading signal engine catalog...</div> : null}
                 {enginesQuery.error ? <div className="state-line state-line--error">{enginesQuery.error.message}</div> : null}
-                {enginesQuery.data?.engines.length === 0 ? <div className="state-line">No signal engines registered.</div> : null}
-                {enginesQuery.data?.engines.map((engine) => (
+                {orderedEngines.length === 0 ? <div className="state-line">No signal engines registered.</div> : null}
+                {orderedEngines.map((engine) => (
                   <div className="entity-row entity-row--with-menu" key={engine.signal_engine_id}>
                     <button className="entity-row__main" onClick={() => updateEngineUrl({ engine: engine.signal_engine_id })} type="button">
                       <strong>{engine.name}</strong>
@@ -406,9 +426,9 @@ export function EnginesPage() {
               <div className="workbench-grid">
                 <TerminalPanel title="Registry Summary">
                   <div className="field-stack">
-                    <FieldRow label="Registered engines" value={formatNumber(enginesQuery.data?.engines.length ?? 0)} />
-                    <FieldRow label="Signal pools" value={formatNumber((enginesQuery.data?.engines ?? []).reduce((total, engine) => total + engine.signal_set_count, 0))} />
-                    <FieldRow label="Signal packets" value={formatNumber((enginesQuery.data?.engines ?? []).reduce((total, engine) => total + engine.packet_count, 0))} />
+                    <FieldRow label="Registered engines" value={formatNumber(orderedEngines.length)} />
+                    <FieldRow label="Signal pools" value={formatNumber(orderedEngines.reduce((total, engine) => total + engine.signal_set_count, 0))} />
+                    <FieldRow label="Signal packets" value={formatNumber(orderedEngines.reduce((total, engine) => total + engine.packet_count, 0))} />
                   </div>
                 </TerminalPanel>
                 <TerminalPanel title="Navigation">
@@ -449,7 +469,7 @@ export function EnginesPage() {
                   ]}
                   getRowKey={(row) => row.signal_engine_id}
                   onRowClick={(row) => updateEngineUrl({ engine: row.signal_engine_id })}
-                  rows={enginesQuery.data?.engines ?? []}
+                  rows={orderedEngines}
                 />
               </TerminalPanel>
             </>

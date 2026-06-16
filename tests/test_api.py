@@ -40,6 +40,7 @@ class StubRuntimeRepository:
                 "name": "Vegas EMA Tunnel",
                 "description": "Legacy engine",
                 "version": "0.1",
+                "created_at": "2026-06-01T00:00:00Z",
                 "code_ref": {
                     "path": "artifacts/signal_engine",
                     "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/vegas_ema_base.py",
@@ -75,6 +76,7 @@ class StubRuntimeRepository:
         ]
 
     def list_signals(self, **kwargs):
+        self.last_list_signals_kwargs = kwargs
         assert kwargs["signal_set_key"] == "vegas_ema:BTC:2026-BTC-2h-dedupe-vote2"
         return [
             {
@@ -106,6 +108,7 @@ class StubRuntimeRepository:
             "name": registration["name"],
             "description": registration.get("description", ""),
             "version": registration["version"],
+            "created_at": registration.get("created_at") or "2026-06-15T00:00:00Z",
             "code_ref": registration.get("code_ref", {}),
             "required_data": registration.get("required_data", []),
             "output_envelope_version": registration.get("output_envelope_version", "signal_packet.v2"),
@@ -473,6 +476,22 @@ def test_signal_engine_catalog_endpoints_expose_sets_and_packets():
     }
 
 
+def test_list_signals_accepts_descending_order_request():
+    repository = StubRuntimeRepository()
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(
+        "/api/v1/signals",
+        params={
+            "signal_set_key": "vegas_ema:BTC:2026-BTC-2h-dedupe-vote2",
+            "descending": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    assert repository.last_list_signals_kwargs["descending"] is True
+
+
 def test_signal_engine_catalog_includes_repo_registry_entries(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     registry_root = tmp_path / "artifacts" / "signal_engine"
@@ -508,6 +527,65 @@ def test_signal_engine_catalog_includes_repo_registry_entries(tmp_path, monkeypa
     assert engines[0]["signal_engine_id"] == "bollinger"
     assert engines[0]["signal_set_count"] == 0
     assert engines[0]["packet_count"] == 0
+
+
+def test_signal_engine_catalog_orders_by_created_at_descending():
+    repository = StubRuntimeRepository()
+    repository.signal_engines = [
+        {
+            "signal_engine_id": "old_engine",
+            "name": "Old Engine",
+            "description": "Older",
+            "version": "0.1",
+            "created_at": "2026-06-01T00:00:00Z",
+            "code_ref": {},
+            "required_data": [],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "old:generate",
+            "live_scanner_entrypoint": "old:scan",
+            "configuration_schema": {},
+            "signal_set_count": 0,
+            "packet_count": 0,
+        },
+        {
+            "signal_engine_id": "new_engine",
+            "name": "New Engine",
+            "description": "Newer",
+            "version": "0.1",
+            "created_at": "2026-06-16T00:00:00Z",
+            "code_ref": {},
+            "required_data": [],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "new:generate",
+            "live_scanner_entrypoint": "new:scan",
+            "configuration_schema": {},
+            "signal_set_count": 0,
+            "packet_count": 0,
+        },
+        {
+            "signal_engine_id": "undated_engine",
+            "name": "Undated Engine",
+            "description": "Missing timestamp",
+            "version": "0.1",
+            "code_ref": {},
+            "required_data": [],
+            "output_envelope_version": "signal_packet.v2",
+            "runtime_entrypoint": "undated:generate",
+            "live_scanner_entrypoint": "undated:scan",
+            "configuration_schema": {},
+            "signal_set_count": 0,
+            "packet_count": 0,
+        },
+    ]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get("/api/v1/signal-engines")
+
+    assert response.status_code == 200
+    engines = response.json()["engines"]
+    ordered_ids = [engine["signal_engine_id"] for engine in engines if engine["signal_engine_id"] in {"new_engine", "old_engine", "undated_engine"}]
+    assert ordered_ids == ["new_engine", "old_engine", "undated_engine"]
+    assert next(engine for engine in engines if engine["signal_engine_id"] == "new_engine")["created_at"] == "2026-06-16T00:00:00Z"
 
 
 def test_signal_engine_rename_materializes_registry_engine(tmp_path, monkeypatch):

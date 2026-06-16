@@ -12,7 +12,9 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
     payload = signal.get("payload") if isinstance(signal.get("payload"), dict) else signal
     evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
     features = payload.get("features") if isinstance(payload.get("features"), dict) else evidence.get("features")
-    charts = payload.get("charts") if isinstance(payload.get("charts"), dict) else {}
+    interactions = payload.get("interactions") if isinstance(payload.get("interactions"), list) else evidence.get("interactions")
+    charts = payload.get("charts") if isinstance(payload.get("charts"), dict) else evidence.get("charts")
+    charts = charts if isinstance(charts, dict) else {}
     signal_id = str(signal.get("signal_id", "unknown"))
 
     if not isinstance(features, dict):
@@ -28,6 +30,7 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
     five_minute = _latest(features, "5m")
     two_hour = _latest(features, "2h")
     one_day = _latest(features, "1d")
+    five_minute_chart = charts.get("5m") if isinstance(charts.get("5m"), dict) else {}
     if not all(isinstance(item, dict) and item for item in (five_minute, two_hour, one_day)):
         return _decision(
             signal_id=signal_id,
@@ -42,27 +45,18 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
             },
         )
 
-    feature_bias = _feature_bias(five_minute=five_minute, two_hour=two_hour, one_day=one_day)
-    chart_bias = _chart_bias(charts)
+    vote_breakdown = _vote_breakdown(
+        five_minute=five_minute,
+        two_hour=two_hour,
+        one_day=one_day,
+        interactions=interactions if isinstance(interactions, list) else [],
+        five_minute_chart=five_minute_chart,
+        charts=charts,
+    )
+    feature_bias = vote_breakdown["weighted_vote_direction"]
+    chart_bias = vote_breakdown["ema_chart_direction"] or _chart_bias(charts)
     active_timeframes = list(evidence.get("active_timeframes") or payload.get("active_timeframes") or [])
     vote_count = len(active_timeframes)
-    if vote_count < 2:
-        return _decision(
-            signal_id=signal_id,
-            action="SKIP",
-            direction="FLAT",
-            confidence=0.28,
-            reason_code="insufficient_recursive_vegas_votes",
-            diagnostics=_diagnostics(
-                feature_bias=feature_bias,
-                chart_bias=chart_bias,
-                active_timeframes=active_timeframes,
-                five_minute=five_minute,
-                two_hour=two_hour,
-                one_day=one_day,
-                runtime_mode=context.get("runtime_mode", "backtest"),
-            ),
-        )
 
     if _is_overextended_or_volatile(five_minute=five_minute, feature_bias=feature_bias):
         return _decision(
@@ -96,34 +90,20 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
                 five_minute=five_minute,
                 two_hour=two_hour,
                 one_day=one_day,
+                vote_breakdown=vote_breakdown,
                 runtime_mode=context.get("runtime_mode", "backtest"),
             ),
         )
 
-    if chart_bias in {"LONG", "SHORT"} and chart_bias != feature_bias:
-        return _decision(
-            signal_id=signal_id,
-            action="SKIP",
-            direction="FLAT",
-            confidence=0.35,
-            reason_code="feature_chart_directional_conflict",
-            diagnostics=_diagnostics(
-                feature_bias=feature_bias,
-                chart_bias=chart_bias,
-                active_timeframes=active_timeframes,
-                five_minute=five_minute,
-                two_hour=two_hour,
-                one_day=one_day,
-                runtime_mode=context.get("runtime_mode", "backtest"),
-            ),
-        )
-
+    reason_prefix = "feature_aligned_recursive_vegas"
+    if vote_breakdown.get("base_vote_direction") != feature_bias:
+        reason_prefix = "weighted_recursive_feature_votes"
     return _decision(
         signal_id=signal_id,
         action="ENTER",
         direction=feature_bias,
         confidence=_confidence(feature_bias=feature_bias, chart_bias=chart_bias, vote_count=vote_count),
-        reason_code=f"feature_aligned_recursive_vegas_{feature_bias.lower()}",
+        reason_code=f"{reason_prefix}_{feature_bias.lower()}",
         diagnostics=_diagnostics(
             feature_bias=feature_bias,
             chart_bias=chart_bias,
@@ -131,6 +111,7 @@ def decide(context: dict[str, Any]) -> dict[str, Any]:
             five_minute=five_minute,
             two_hour=two_hour,
             one_day=one_day,
+            vote_breakdown=vote_breakdown,
             runtime_mode=context.get("runtime_mode", "backtest"),
         ),
     )
@@ -143,20 +124,59 @@ def manage_position(context: dict[str, Any]) -> dict[str, Any]:
     return {"action": "HOLD", "reason_code": "mechanical_policy"}
 
 
-def _feature_bias(*, five_minute: dict[str, Any], two_hour: dict[str, Any], one_day: dict[str, Any]) -> str | None:
-    votes = [
+def _vote_breakdown(
+    *,
+    five_minute: dict[str, Any],
+    two_hour: dict[str, Any],
+    one_day: dict[str, Any],
+    interactions: list[Any],
+    five_minute_chart: dict[str, Any],
+    charts: dict[str, Any],
+) -> dict[str, Any]:
+    interaction_direction = _interaction_direction(interactions)
+    ema_chart_direction = _ema_chart_direction(five_minute_chart)
+    context_chart_direction = _chart_bias(charts)
+    base_votes: list[str | None] = [
         _ema_structure_direction(two_hour) or _ema_structure_direction(five_minute),
         _momentum_direction(two_hour, threshold_pct=0.25),
         _momentum_direction(one_day, threshold_pct=0.75),
         _micro_flow_direction(five_minute),
     ]
+    votes: list[str | None] = [
+        *base_votes,
+        interaction_direction,
+        ema_chart_direction,
+        context_chart_direction,
+    ]
+    base_long_votes = base_votes.count("LONG")
+    base_short_votes = base_votes.count("SHORT")
     long_votes = votes.count("LONG")
     short_votes = votes.count("SHORT")
-    if long_votes >= 3 and long_votes > short_votes:
-        return "LONG"
-    if short_votes >= 3 and short_votes > long_votes:
-        return "SHORT"
-    return None
+    if base_long_votes > base_short_votes and base_long_votes >= 3:
+        base_weighted = "LONG"
+    elif base_short_votes > base_long_votes and base_short_votes >= 3:
+        base_weighted = "SHORT"
+    else:
+        base_weighted = None
+    if long_votes > short_votes and long_votes >= 3:
+        weighted = "LONG"
+    elif short_votes > long_votes and short_votes >= 3:
+        weighted = "SHORT"
+    else:
+        weighted = None
+    return {
+        "weighted_vote_direction": weighted,
+        "base_vote_direction": base_weighted,
+        "vote_count": len([vote for vote in votes if vote in {"LONG", "SHORT"}]),
+        "base_long_votes": base_long_votes,
+        "base_short_votes": base_short_votes,
+        "long_votes": long_votes,
+        "short_votes": short_votes,
+        "interaction_direction": interaction_direction,
+        "ema_chart_direction": ema_chart_direction,
+        "context_chart_direction": context_chart_direction,
+        "votes": votes,
+    }
 
 
 def _ema_structure_direction(row: dict[str, Any]) -> str | None:
@@ -198,6 +218,54 @@ def _micro_flow_direction(row: dict[str, Any]) -> str | None:
     if value <= -0.02:
         return "SHORT"
     return None
+
+
+def _interaction_direction(interactions: list[Any]) -> str | None:
+    if not interactions:
+        return None
+    weighted_bias = 0.0
+    usable = 0
+    for interaction in interactions:
+        if not isinstance(interaction, dict):
+            continue
+        distance = _number(interaction.get("distance_pct"))
+        ema_value = _number(interaction.get("ema_value"))
+        market_price = _number(interaction.get("market_price"))
+        if distance is None or ema_value in (None, 0) or market_price is None:
+            continue
+        proximity_weight = max(0.0, 0.002 - distance)
+        if proximity_weight <= 0:
+            continue
+        usable += 1
+        weighted_bias += proximity_weight if market_price > ema_value else -proximity_weight if market_price < ema_value else 0.0
+    if usable >= 2 and weighted_bias > 0:
+        return "LONG"
+    if usable >= 2 and weighted_bias < 0:
+        return "SHORT"
+    return None
+
+
+def _ema_chart_direction(chart: Any) -> str | None:
+    if not isinstance(chart, dict):
+        return None
+    columns = chart.get("columns", [])
+    candles = chart.get("completed_candles") if isinstance(chart.get("completed_candles"), list) else []
+    closes = [_close(candle, columns) for candle in candles]
+    closes = [close for close in closes if close is not None]
+    if len(closes) < 2:
+        return None
+    trend = _pct_change(closes[0], closes[-1])
+    if trend is None:
+        return None
+    ema_values = chart.get("ema_values") if isinstance(chart.get("ema_values"), dict) else {}
+    ema_distances = chart.get("ema_distances") if isinstance(chart.get("ema_distances"), dict) else {}
+    valid_count = sum(1 for value in (chart.get("ema_validity") or {}).values() if value is True)
+    close_bias = "LONG" if trend > 0 else "SHORT" if trend < 0 else None
+    if close_bias is None:
+        return None
+    if valid_count >= 3 and ema_values and ema_distances:
+        return close_bias
+    return close_bias
 
 
 def _chart_bias(charts: dict[str, Any]) -> str | None:
@@ -303,9 +371,10 @@ def _diagnostics(
     five_minute: dict[str, Any],
     two_hour: dict[str, Any],
     one_day: dict[str, Any],
+    vote_breakdown: dict[str, Any] | None = None,
     runtime_mode: Any,
 ) -> dict[str, Any]:
-    return {
+    diagnostics = {
         "feature_bias": feature_bias,
         "chart_bias": chart_bias,
         "active_timeframes": active_timeframes,
@@ -317,6 +386,14 @@ def _diagnostics(
         "one_day_momentum_pct": _number(_family(one_day, "regime_momentum").get("return_pct_48")),
         "runtime_mode": runtime_mode,
     }
+    if vote_breakdown is not None:
+        diagnostics["vote_breakdown"] = vote_breakdown
+        diagnostics["weighted_vote_direction"] = vote_breakdown.get("weighted_vote_direction")
+        diagnostics["interaction_direction"] = vote_breakdown.get("interaction_direction")
+        diagnostics["ema_chart_direction"] = vote_breakdown.get("ema_chart_direction")
+        diagnostics["long_votes"] = vote_breakdown.get("long_votes")
+        diagnostics["short_votes"] = vote_breakdown.get("short_votes")
+    return diagnostics
 
 
 def _decision(

@@ -14,11 +14,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[5]
+SCRIPT_DIR = Path(__file__).resolve().parent
 SRC = WORKSPACE_ROOT / "artifacts" / "signal_engine" / "src"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from vegas.workspace import find_workspace_root
+from stage0_scan_utils import build_candle_time_index, first_candle_after
 
 
 WORKSPACE_ROOT = find_workspace_root(WORKSPACE_ROOT)
@@ -55,6 +59,13 @@ def load_candles(csv_path: str, start: datetime, end: datetime) -> list:
 
 def get_reference_price(sig_data: dict) -> float | None:
     """Extract reference price from signal packet."""
+    evidence = sig_data.get("evidence", {})
+    if isinstance(evidence, dict):
+        for key in ("trigger_candle_close", "trigger_price", "reference_price"):
+            value = evidence.get(key)
+            if value is not None:
+                return float(value)
+
     # Try interactions first. Support both legacy {timeframe: [...]} and
     # canonical [{timeframe: "...", market_price: "..."}] packet shapes.
     interactions = sig_data.get("interactions", {})
@@ -82,17 +93,18 @@ def get_reference_price(sig_data: dict) -> float | None:
     return None
 
 
-def compute_max_travel(candles: list, signal_ts: datetime, ref_price: float,
-                       forward_hours: int) -> float:
+def compute_max_travel(
+    candles: list,
+    signal_ts: datetime,
+    ref_price: float,
+    forward_hours: int,
+    candle_time_index: list[datetime] | None = None,
+) -> float:
     """Walk forward from signal_ts and return max_favorable_pct (abs move)."""
     cutoff = signal_ts + timedelta(hours=forward_hours)
 
     # Find first candle after signal
-    first_idx = None
-    for i, c in enumerate(candles):
-        if c["ts"] > signal_ts:
-            first_idx = i
-            break
+    first_idx = first_candle_after(candle_time_index or build_candle_time_index(candles), signal_ts)
     if first_idx is None:
         return 0.0
 
@@ -175,6 +187,7 @@ def main():
     print(f"Signal range: {earliest} → {latest}")
     print(f"Loading candles from {candles_path}...")
     candles = load_candles(str(candles_path), earliest, latest)
+    candle_time_index = build_candle_time_index(candles)
     print(f"Loaded {len(candles):,} candles. Processing {len(signal_timestamps)} signals...")
 
     travel_pcts = []
@@ -195,7 +208,7 @@ def main():
             errors += 1
             continue
 
-        max_travel = compute_max_travel(candles, sig_ts, ref_price, forward_hours)
+        max_travel = compute_max_travel(candles, sig_ts, ref_price, forward_hours, candle_time_index)
         travel_pcts.append(round(max_travel, 4))
 
         if (idx + 1) % report_every == 0:

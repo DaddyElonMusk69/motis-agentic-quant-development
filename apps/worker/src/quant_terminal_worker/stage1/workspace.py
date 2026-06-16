@@ -536,6 +536,11 @@ def _stage3_grid_state(artifact_root: Path) -> dict[str, Any]:
         best = optimal.get("best")
     if best is None and grid:
         best = (grid.get("optimal") or {}).get("best")
+    fixed_result = _compact_stage3_result(grid.get("fixed_sl_baseline_result", {}) if grid else {})
+    exact_result = _compact_stage3_result(grid.get("exact_protection_result", {}) if grid else {})
+    exact_policy_result = _compact_stage3_result(grid.get("exact_policy_result", {}) if grid else {})
+    shortlist = [_compact_stage3_result(item) for item in grid.get("stage3c_shortlist", [])] if grid else []
+    top_5 = [_compact_stage3_result(item) for item in (optimal.get("top_5") if optimal else (grid.get("optimal") or {}).get("top_5") if grid else []) or []]
     fixed_complete = bool(grid and grid.get("fixed_sl_complete")) or bool(grid and grid.get("fixed_sl_baseline_result"))
     exact_complete = bool(grid and grid.get("exact_protection_complete")) or bool(
         grid and (grid.get("exact_protection_result") or grid.get("exact_policy_result"))
@@ -562,14 +567,14 @@ def _stage3_grid_state(artifact_root: Path) -> dict[str, Any]:
         "fees_bps_per_side": grid.get("fees_bps_per_side") if grid else None,
         "stage0_risk_policy": grid.get("stage0_risk_policy", {}) if grid else {},
         "stage2_exit_policy": grid.get("stage2_exit_policy", {}) if grid else {},
-        "fixed_sl_baseline_result": grid.get("fixed_sl_baseline_result", {}) if grid else {},
-        "exact_protection_result": grid.get("exact_protection_result", {}) if grid else {},
-        "exact_policy_result": grid.get("exact_policy_result", {}) if grid else {},
+        "fixed_sl_baseline_result": fixed_result,
+        "exact_protection_result": exact_result,
+        "exact_policy_result": exact_policy_result,
         "stage3c_total_combinations_tested": grid.get("stage3c_total_combinations_tested", 0) if grid else 0,
         "stage3c_value_ranges": grid.get("stage3c_value_ranges", {}) if grid else {},
-        "stage3c_shortlist": grid.get("stage3c_shortlist", []) if grid else [],
-        "best": best or {},
-        "top_5": (optimal.get("top_5") if optimal else (grid.get("optimal") or {}).get("top_5") if grid else []) or [],
+        "stage3c_shortlist": shortlist,
+        "best": _compact_stage3_result(best or {}),
+        "top_5": top_5,
     }
 
 
@@ -592,9 +597,9 @@ def _stage3_pyramid_state(artifact_root: Path) -> dict[str, Any]:
         "sl_pct": results.get("sl_pct") if results else None,
         "max_legs": results.get("max_legs") if results else None,
         "sl_breakeven": results.get("sl_breakeven") if results else None,
-        "baseline": results.get("baseline", {}) if results else {},
-        "best": best or {},
-        "results": results.get("results", []) if results else [],
+        "baseline": _compact_stage3_result(results.get("baseline", {}) if results else {}),
+        "best": _compact_stage3_result(best or {}),
+        "results": [_compact_stage3_result(item) for item in results.get("results", [])] if results else [],
     }
 
 
@@ -619,12 +624,34 @@ def _stage4_realized_expectancy_state(artifact_root: Path) -> dict[str, Any]:
         "optimal_path": str(optimal_path) if optimal_path.exists() else None,
         "summary_path": str(summary_path) if summary_path.exists() else None,
         "best_candidate_id": realized.get("best_candidate_id") if realized else None,
-        "best_candidate": best or {},
-        "candidates": realized.get("candidates", []) if realized else [],
+        "best_candidate": _compact_stage4_candidate(best or {}),
+        "candidates": [_compact_stage4_candidate(item) for item in realized.get("candidates", [])] if realized else [],
         "latest_run_id": realized.get("run_id") if realized else run_index.get("latest_run_id"),
         "latest_simulation_inputs": realized.get("simulation_inputs", {}) if realized else {},
         "latest_account": (best or {}).get("account", {}) if best else {},
         "stage4_runs": run_index.get("runs", []),
+    }
+
+
+def _compact_stage3_result(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    heavy_keys = {"outcomes", "trades", "ledger", "signals", "records", "decisions"}
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in heavy_keys
+    }
+
+
+def _compact_stage4_candidate(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        return {}
+    heavy_keys = {"trades", "ledger", "trade_ledger", "executions", "decisions"}
+    return {
+        key: value
+        for key, value in candidate.items()
+        if key not in heavy_keys
     }
 
 
@@ -777,10 +804,6 @@ def _render_handoff(
     sample: dict[str, Any],
     iteration_root: Path,
 ) -> str:
-    signal_lines = "\n".join(
-        f"- {item['signal_id']} @ {item['timestamp']}"
-        for item in sample["signals"]
-    )
     return f"""# Stage 1A Evaluator Handoff
 
 Session: {session['session_id']}
@@ -791,10 +814,7 @@ Stage: stage1a_directional_agreement
 Signal set: {session['signal_set_id']}
 Signal count: {sample['signal_count']}
 
-Process all listed signals sequentially, one at a time, using signal_sample.json as the checklist.
-
-Signal sample entries:
-{signal_lines}
+Process every entry in signal_sample.json sequentially, one at a time, using that file as the checklist.
 
 Rules:
 - Use only the embedded `packet` JSON in signal_sample.json and the strategy module snapshot.
@@ -1051,19 +1071,6 @@ def _render_strategy_builder_prompt(
     strategy_path: Path,
     snapshot_dir: Path,
 ) -> str:
-    long_count = sum(
-        1 for item in builder_sample["signals"] if item.get("ground_truth", {}).get("natural_direction") == "LONG"
-    )
-    short_count = sum(
-        1 for item in builder_sample["signals"] if item.get("ground_truth", {}).get("natural_direction") == "SHORT"
-    )
-    label_policy = "- Use training-window natural_direction labels in builder_training_sample.json."
-    forbidden_policy = (
-        "- Do not use walk-forward labels, packets, score files, or future candles.\n"
-        "- Do not modify signal packets, Stage 0 evidence, sample files, or evaluator handoff files.\n"
-        "- Do not claim promotion readiness from this training bundle; the walk-forward test must pass separately."
-    )
-    next_step = f"- After editing {strategy_path}, the user should click Score on this iteration, then create the walk-forward test bundle if training passes."
     return f"""You are the strategy-builder agent for a Stage 1A deterministic strategy-script iteration.
 
 Session: {session['session_id']}
@@ -1077,35 +1084,28 @@ Read-only strategy snapshot for this iteration: {snapshot_dir}
 Read:
 - {iteration_root / "manifest.json"}
 - {iteration_root / "builder_training_sample.json"}
+- {iteration_root / "signal_sample.json"}
 - {strategy_path}
 - {snapshot_dir}
 
 Task:
-Edit {strategy_path} so the deterministic `decide(...)` function learns packet-evidence patterns that improve agreement with Stage 0 natural direction on the selected builder sample.
+Edit only {strategy_path} so deterministic `decide(...)` improves Stage 1A directional agreement on the training sample.
 
 Training sample:
 - sample method: {sample['sample_method']}
 - signal count: {builder_sample['signal_count']}
-- label balance: LONG {long_count}, SHORT {short_count}
-
-Required decision contract:
-- Return a deterministic StrategyDecision-compatible object.
-- Stage 1A must choose a direction for scoreable signals.
-- Include confidence, reason_code, and diagnostics that explain packet evidence.
-- Do not add live execution, order routing, exchange calls, randomness, or network access.
-
-Allowed:
-{label_policy}
-- Inspect embedded training packet JSON in builder_training_sample.json/signal_sample.json and the current strategy module.
-- Update only the session strategy file: {strategy_path}
+- Use training-window natural_direction labels in builder_training_sample.json.
+- Inspect embedded training packet JSON in builder_training_sample.json and signal_sample.json.
 - Treat {snapshot_dir} as read-only evidence of what this iteration started from.
 
-Forbidden:
-{forbidden_policy}
-
-Important:
+Rules:
+- Return a deterministic StrategyDecision-compatible object with confidence, reason_code, and diagnostics.
+- Stage 1A is direction-only. Do not add Stage 1B entry gates, expected-travel filters, TP/SL logic, live execution, randomness, network access, or exchange calls.
+- Do not use validation, walk-forward, locked OOS, live state, or future candles.
+- Do not modify signal packets, Stage 0 evidence, sample files, evaluator handoff files, or the read-only snapshot.
+- Do not claim promotion readiness from this training bundle.
 - New Stage 1 bundles automatically snapshot the current session strategy file into their own source_artifacts/strategy_module_snapshot folder.
-{next_step}
+- After editing, the user should rerun Score on this iteration.
 
 After editing, summarize the changed deterministic rules and the training failure patterns they target in {iteration_root / "summaries" / "iteration_summary.md"}.
 """

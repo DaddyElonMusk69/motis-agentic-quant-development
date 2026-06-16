@@ -125,6 +125,59 @@ def decide(context):
     assert scores["records"][0]["agreement"] == "NEUTRAL"
 
 
+def test_run_stage1a_training_score_wraps_raw_packet_as_runtime_signal_payload(tmp_path: Path):
+    iteration_root = tmp_path / "iteration"
+    packets_root = tmp_path / "packets"
+    strategy_root = iteration_root / "strategy_module"
+    packets_root.mkdir(parents=True)
+    strategy_root.mkdir(parents=True)
+    (iteration_root / "decisions").mkdir()
+    (iteration_root / "scores").mkdir()
+    (iteration_root / "summaries").mkdir()
+    (strategy_root / "__init__.py").write_text("")
+    (strategy_root / "strategy.py").write_text(
+        """
+def decide(context):
+    signal = context["signal"]
+    event_type = signal["payload"]["evidence"]["event_type"]
+    direction = "SHORT" if event_type == "HIGH_SWEEP" else "LONG"
+    return {
+        "decision_id": f"raw-packet-{signal['signal_id']}",
+        "strategy_id": "unit-strategy",
+        "strategy_version": "v0.1",
+        "signal_id": signal["signal_id"],
+        "trade_action": "ENTER",
+        "action": "ENTER",
+        "direction": direction,
+        "confidence": 0.8,
+        "reason_code": "event_type_rule",
+        "diagnostics": {"event_type": event_type},
+    }
+"""
+    )
+    raw_packet = {
+        "schema_version": "signal_packet.v2",
+        "asset": "AAVE",
+        "timestamp": "2025-04-01T05:10:00Z",
+        "active_timeframes": ["5m"],
+        "evidence": {"pattern": "liquidity_sweep_event", "event_type": "HIGH_SWEEP"},
+    }
+    (packets_root / "20250401T051000Z.json").write_text(json.dumps(raw_packet))
+    signal_id = "liquidity_sweep_v1:AAVE:AAVE-liquidity_sweep_v1-canonical:20250401T051000Z"
+    (iteration_root / "signal_sample.json").write_text(
+        json.dumps({"signals": [{"signal_id": signal_id, "packet_path": str(packets_root / "20250401T051000Z.json")}]})
+    )
+    (iteration_root / "builder_training_sample.json").write_text(
+        json.dumps({"signals": [{"signal_id": signal_id, "ground_truth": {"natural_direction": "SHORT"}}]})
+    )
+
+    result = run_stage1a_training_score(iteration_root=iteration_root)
+
+    decisions = json.loads((iteration_root / "decisions/stage1a_directional_decisions.json").read_text())
+    assert result["metrics"]["matches"] == 1
+    assert decisions["decisions"][0]["diagnostics"]["event_type"] == "HIGH_SWEEP"
+
+
 def test_run_stage1a_training_score_uses_session_strategy_when_iteration_copy_is_absent(tmp_path: Path):
     session_root = tmp_path / "dev/training_sessions/aave/stage1-aave"
     iteration_root = session_root / "iterations" / "iter_001_v0.1"
@@ -173,16 +226,58 @@ def test_generate_stage1a_failure_audit_writes_failure_ledger_and_prompt(tmp_pat
     (iteration_root / "decisions").mkdir()
     (iteration_root / "scores").mkdir()
     packets_root.mkdir()
-    (packets_root / "sig-miss.json").write_text(json.dumps({"signal_id": "sig-miss", "payload": {"setup": "miss"}}))
-    (packets_root / "sig-flat.json").write_text(json.dumps({"signal_id": "sig-flat", "payload": {"setup": "flat"}}))
-    (packets_root / "sig-win.json").write_text(json.dumps({"signal_id": "sig-win", "payload": {"setup": "win"}}))
+    miss_packet = {
+        "signal_id": "sig-miss",
+        "active_timeframes": ["5m"],
+        "features": {"5m": {"latest": {"base_candle": {"return_pct": -0.4}}}, "2h": {}, "1d": {}},
+        "charts": {"5m": {}, "2h": {}, "1d": {}},
+        "evidence": {
+            "pattern": "feature_packet",
+            "trigger_timeframe": "5m",
+            "context_timeframes": ["2h", "1d"],
+            "matched_ema_count": 3,
+            "matched_periods": [36, 43, 144],
+        },
+    }
+    flat_packet = {
+        "signal_id": "sig-flat",
+        "active_timeframes": ["5m"],
+        "features": {"5m": {"latest": {"base_candle": {"return_pct": 0.1}}}},
+        "charts": {"5m": {}},
+        "evidence": {"pattern": "feature_packet", "trigger_timeframe": "5m"},
+    }
+    win_packet = {
+        "signal_id": "sig-win",
+        "active_timeframes": ["5m"],
+        "features": {"5m": {"latest": {"base_candle": {"return_pct": 0.5}}}},
+        "charts": {"5m": {}},
+        "evidence": {"pattern": "feature_packet", "trigger_timeframe": "5m"},
+    }
+    (packets_root / "sig-miss.json").write_text(json.dumps(miss_packet))
+    (packets_root / "sig-flat.json").write_text(json.dumps(flat_packet))
+    (packets_root / "sig-win.json").write_text(json.dumps(win_packet))
     (iteration_root / "signal_sample.json").write_text(
         json.dumps(
             {
                 "signals": [
-                    {"signal_id": "sig-miss", "packet_path": str(packets_root / "sig-miss.json")},
-                    {"signal_id": "sig-flat", "packet_path": str(packets_root / "sig-flat.json")},
-                    {"signal_id": "sig-win", "packet_path": str(packets_root / "sig-win.json")},
+                    {
+                        "signal_id": "sig-miss",
+                        "timestamp": "2026-03-01T00:00:00Z",
+                        "packet_path": str(packets_root / "sig-miss.json"),
+                        "packet": miss_packet,
+                    },
+                    {
+                        "signal_id": "sig-flat",
+                        "timestamp": "2026-03-02T00:00:00Z",
+                        "packet_path": str(packets_root / "sig-flat.json"),
+                        "packet": flat_packet,
+                    },
+                    {
+                        "signal_id": "sig-win",
+                        "timestamp": "2026-04-01T00:00:00Z",
+                        "packet_path": str(packets_root / "sig-win.json"),
+                        "packet": win_packet,
+                    },
                 ]
             }
         )
@@ -228,13 +323,32 @@ def test_generate_stage1a_failure_audit_writes_failure_ledger_and_prompt(tmp_pat
     prompt = (iteration_root / "agent_failure_audit_prompt.md").read_text()
     markdown = (iteration_root / "audits/failure_audit.md").read_text()
     assert result["metrics"]["failure_count"] == 2
+    assert audit["schema_version"] == "0.2"
+    assert audit["score_metrics"]["scoreable"] == 2
+    assert audit["evidence_summary"]["reason_counts"] == [
+        {"reason_code": "right", "count": 1},
+        {"reason_code": "skip", "count": 1},
+        {"reason_code": "wrong", "count": 1},
+    ]
+    assert audit["coverage_summary"]["strategy_neutral_rate"] == 0.333333
+    assert audit["monthly_summary"][0]["month"] == "2026-03"
+    assert audit["monthly_summary"][0]["metrics"]["mismatches"] == 1
+    assert audit["side_summary"]["LONG"]["truth_count"] == 2
+    assert audit["side_summary"]["SHORT"]["mismatches"] == 1
     assert audit["failure_cases"][0]["signal_id"] == "sig-miss"
+    assert audit["failure_cases"][0]["timestamp"] == "2026-03-01T00:00:00Z"
+    assert audit["failure_cases"][0]["packet_context"]["active_timeframes"] == ["5m"]
+    assert audit["failure_cases"][0]["packet_context"]["matched_ema_count"] == 3
+    assert audit["failure_cases"][0]["packet_context"]["feature_frames"] == ["1d", "2h", "5m"]
     assert audit["protected_cases"][0]["signal_id"] == "sig-win"
+    assert audit["protected_case_count"] == 1
     assert "smallest possible Stage 1A direction-only update" in prompt
     assert "Do not add Stage 1B entry gates" in prompt
     assert str(iteration_root / "audits" / "failure_audit.json") in prompt
     assert str(iteration_root.parents[1] / "strategy_module" / "strategy.py") in prompt
     assert "New Stage 1 bundles automatically snapshot the current session strategy file" in prompt
+    assert "sig-miss" not in prompt
+    assert "sig-flat" not in prompt
     assert "sig-flat" in markdown
 
 
@@ -499,3 +613,71 @@ def decide(context):
     assert scores["slice_metrics"]["walk_forward_test"]["matches"] == 1
     assert decisions["decisions"][1]["sample_role"] == "walk_forward_test"
     assert (artifact_root / "promotion/frozen_stage1a_strategy_module/strategy.py").exists()
+
+
+def test_run_stage1a_canonical_full_cycle_wraps_raw_packets_for_strategy_context(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-lse/stage1-aave-lse"
+    strategy_root = artifact_root / "strategy_module"
+    packets_root = tmp_path / "dev/signals/liquidity_sweep_v1/AAVE/AAVE-liquidity_sweep_v1-canonical/packets"
+    stage0_root = tmp_path / "dev/stage0/aave-lse"
+    ground_truth_root = stage0_root / "scores" / "ground_truth"
+    strategy_root.mkdir(parents=True)
+    packets_root.mkdir(parents=True)
+    ground_truth_root.mkdir(parents=True)
+    (strategy_root / "__init__.py").write_text("")
+    (strategy_root / "strategy.py").write_text(
+        """
+def decide(context):
+    signal = context["signal"]
+    event_type = signal["payload"]["evidence"]["event_type"]
+    direction = "SHORT" if event_type == "HIGH_SWEEP" else "LONG"
+    return {
+        "decision_id": f"canonical-raw-{signal['signal_id']}",
+        "strategy_id": "aave-lse",
+        "strategy_version": "v0.1",
+        "signal_id": signal["signal_id"],
+        "trade_action": "ENTER",
+        "action": "ENTER",
+        "direction": direction,
+        "confidence": 0.8,
+        "reason_code": "canonical_raw_packet",
+        "diagnostics": {"event_type": event_type},
+    }
+"""
+    )
+    raw_packet = {
+        "schema_version": "signal_packet.v2",
+        "asset": "AAVE",
+        "timestamp": "2025-04-01T05:10:00Z",
+        "active_timeframes": ["5m"],
+        "evidence": {"pattern": "liquidity_sweep_event", "event_type": "HIGH_SWEEP"},
+    }
+    (packets_root / "20250401T051000Z.json").write_text(json.dumps(raw_packet))
+    (ground_truth_root / "20250401T051000Z.json").write_text(
+        json.dumps({"signal_id": "20250401T051000Z", "natural_direction": "SHORT"})
+    )
+    session = {
+        "session_id": "stage1-aave-lse",
+        "artifact_root": str(artifact_root),
+        "stage0_artifact_root": str(stage0_root),
+        "source_candidate_id": "candidate-aave-lse",
+        "signal_set_key": "liquidity_sweep_v1:AAVE:AAVE-liquidity_sweep_v1-canonical",
+        "signal_engine_id": "liquidity_sweep_v1",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "signal_set_id": "AAVE-liquidity_sweep_v1-canonical",
+        "strategy_id": "aave-lse",
+        "strategy_version": "v0.1",
+        "manifest": {"stage0_artifact_root": str(stage0_root)},
+    }
+    signal_id = "liquidity_sweep_v1:AAVE:AAVE-liquidity_sweep_v1-canonical:20250401T051000Z"
+
+    result = run_stage1a_canonical_full_cycle(
+        workspace_root=tmp_path,
+        session=session,
+        signals_by_role={"training": [{"signal_id": signal_id, "signal_set_key": session["signal_set_key"]}]},
+    )
+
+    decisions = json.loads((artifact_root / "promotion/stage1a_canonical_full_cycle_decisions.json").read_text())
+    assert result["metrics"]["matches"] == 1
+    assert decisions["decisions"][0]["diagnostics"]["event_type"] == "HIGH_SWEEP"

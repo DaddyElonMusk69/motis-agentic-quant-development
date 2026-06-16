@@ -127,9 +127,10 @@ def test_create_stage1_iteration_workspace_writes_handoff_sample_and_snapshot(tm
     assert "future_ground_truth" not in handoff
     assert "future_ground_truth" not in prompt
     assert "Do not use future outcomes" in handoff
-    assert "embedded `packet` JSON" in handoff
+    assert "embedded packet JSON" in handoff
     assert "packet paths" not in handoff.lower()
-    assert "signal folder" in handoff
+    assert "Do not scan any signal folder" in handoff
+    assert "sig-old @ " not in handoff
     assert "source_artifacts/strategy_module_snapshot" in prompt
     assert str(iteration_root / "signal_sample.json") in prompt
     assert "embedded packet JSON" in prompt
@@ -334,7 +335,7 @@ def test_create_stage1_iteration_workspace_writes_builder_bundle_with_training_l
     assert builder_sample["ground_truth_visible"] is True
     assert builder_sample["signals"][0]["ground_truth"]["natural_direction"] == "LONG"
     assert builder_sample["signals"][1]["ground_truth"]["natural_direction"] == "SHORT"
-    assert f"Edit {artifact_root / 'strategy_module' / 'strategy.py'}" in prompt
+    assert f"Edit only {artifact_root / 'strategy_module' / 'strategy.py'}" in prompt
     assert "New Stage 1 bundles automatically snapshot the current session strategy file" in prompt
     assert str(iteration_root / "builder_training_sample.json") in prompt
     assert "embedded training packet JSON" in prompt
@@ -385,8 +386,8 @@ def test_create_stage1_iteration_workspace_writes_training_builder_prompt(tmp_pa
     prompt = (iteration_root / "strategy_builder_prompt.md").read_text()
 
     assert "training-window natural_direction labels" in prompt
-    assert "Do not use walk-forward labels, packets, score files, or future candles" in prompt
-    assert "click Score on this iteration, then create the walk-forward test bundle" in prompt
+    assert "Do not use validation, walk-forward, locked OOS, live state, or future candles" in prompt
+    assert "rerun Score on this iteration" in prompt
 
 
 def test_list_stage1_iterations_reports_bundle_score_and_audit_state(tmp_path: Path):
@@ -580,6 +581,74 @@ def test_build_stage1_gate_summary_reports_stage3_grid_complete(tmp_path: Path):
     assert gate["stage3_grid"]["grid_results_path"].endswith("promotion/stage3_grid_results.json")
     assert gate["stage3_grid"]["best"]["tp"] == 2.5
     assert gate["stage3_pyramid"]["exists"] is False
+
+
+def test_build_stage1_gate_summary_omits_heavy_stage3_and_stage4_ledgers(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    heavy_setup = {
+        "config_id": "cfg-heavy",
+        "tp": 2.5,
+        "sl": 1.0,
+        "final_tp_pct": 2.5,
+        "initial_sl_pct": 1.0,
+        "protect_trigger_pct": 1.5,
+        "trail_sl_pct": 0.8,
+        "wr": 60.0,
+        "profit_factor": 1.8,
+        "pnl_pct": 12.0,
+        "net_pnl_pct": 11.5,
+        "tp_count": 6,
+        "initial_sl_count": 2,
+        "protected_sl_count": 1,
+        "time_exit_count": 1,
+        "outcomes": [{"signal_id": f"sig-{index}", "payload": "x" * 2000} for index in range(3)],
+    }
+    (promotion_root / "stage3_grid_results.json").write_text(
+        json.dumps(
+            {
+                "total_signals": 10,
+                "total_executable_decisions": 10,
+                "fixed_sl_complete": True,
+                "exact_protection_complete": True,
+                "local_variants_complete": True,
+                "fixed_sl_baseline_result": heavy_setup,
+                "exact_protection_result": heavy_setup,
+                "exact_policy_result": heavy_setup,
+                "stage3c_shortlist": [heavy_setup],
+                "optimal": {"best": heavy_setup, "top_5": [heavy_setup]},
+            }
+        )
+    )
+    (promotion_root / "stage3_optimal.json").write_text(json.dumps({"best": heavy_setup, "top_5": [heavy_setup]}))
+    (promotion_root / "stage4_candidates.json").write_text(json.dumps({"candidates": [{"candidate_id": "market"}]}))
+    (promotion_root / "stage3_summary.md").write_text("# Stage 3 Grid Search\n")
+    (promotion_root / "stage4_realized_expectancy.json").write_text(
+        json.dumps(
+            {
+                "best_candidate_id": "market",
+                "best_candidate": {"candidate_id": "market", "net_expectancy_pct": 1.2, "trades": [{"signal_id": "sig"}]},
+                "candidates": [{"candidate_id": "market", "net_expectancy_pct": 1.2, "trades": [{"signal_id": "sig"}]}],
+                "ledger": {"candidates": [{"candidate_id": "market", "trades": [{"signal_id": "sig"}]}]},
+            }
+        )
+    )
+    (promotion_root / "stage4_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (promotion_root / "stage4_optimal.json").write_text(json.dumps({"best": {"candidate_id": "market", "net_expectancy_pct": 1.2}}))
+    (promotion_root / "stage4_summary.md").write_text("# Stage 4 Realized Expectancy\n")
+    session = {"session_id": "stage1-aave", "artifact_root": str(artifact_root), "status": "stage1a_frozen"}
+
+    gate = build_stage1_gate_summary(workspace_root=tmp_path, session=session)
+
+    assert "outcomes" not in gate["stage3_grid"]["fixed_sl_baseline_result"]
+    assert "outcomes" not in gate["stage3_grid"]["exact_protection_result"]
+    assert "outcomes" not in gate["stage3_grid"]["best"]
+    assert "outcomes" not in gate["stage3_grid"]["top_5"][0]
+    assert "outcomes" not in gate["stage3_grid"]["stage3c_shortlist"][0]
+    assert "ledger" not in gate["stage4_realized_expectancy"]
+    assert "trades" not in gate["stage4_realized_expectancy"]["best_candidate"]
+    assert "trades" not in gate["stage4_realized_expectancy"]["candidates"][0]
 
 
 def test_build_stage1_gate_summary_reports_stage3_pyramid_complete(tmp_path: Path):

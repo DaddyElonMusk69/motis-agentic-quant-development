@@ -398,8 +398,38 @@
         "dedupe_window_minutes": 120
       }
     }
-  }
-,
+  },
+  "liquidity_sweep_v1": {
+    "signal_engine_id": "liquidity_sweep_v1",
+    "version": "0.1",
+    "name": "Liquidity Sweep v1",
+    "description": "Lean 5m liquidity sweep event engine using raw candle data only.",
+    "code_ref": {
+      "path": "apps/worker/src/quant_terminal_worker/signal_engines/liquidity_sweep_v1.py",
+      "base_strategy_path": "packages/strategy_modules/src/quant_terminal_strategies/liquidity_sweep_v1_base.py"
+    },
+    "required_data": [
+      {
+        "data_type": "candles",
+        "origin": "raw",
+        "timeframe": "5m",
+        "lookback_bars": 20000,
+        "freshness_tolerance_seconds": 300
+      }
+    ],
+    "output_envelope_version": "signal_packet.v2",
+    "runtime_entrypoint": "quant_terminal_worker.signal_engines.liquidity_sweep_v1:generate_training_signals",
+    "live_scanner_entrypoint": "quant_terminal_worker.signal_engines.liquidity_sweep_v1:scan_live_signal",
+    "configuration_schema": {
+      "default_parameters": {
+        "reference_window_hours": 12,
+        "atr_period": 14,
+        "min_sweep_atr": 0.2,
+        "cooldown_hours": 2,
+        "context_bars": 144
+      }
+    }
+  },
   "vegas_ema_recursive_features": {
     "signal_engine_id": "vegas_ema_recursive_features",
     "version": "0.1",

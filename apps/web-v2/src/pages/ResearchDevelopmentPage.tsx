@@ -51,6 +51,7 @@ import {
 import { formatNumber } from "../app/format";
 import { queryClient } from "../app/queryClient";
 import { useAppRouter } from "../app/router";
+import { buildStage1Consistency, type Stage1ConsistencyMonth, type Stage1ConsistencySide } from "../app/stage1Consistency";
 import { DataTable } from "../components/DataTable";
 import { FieldRow } from "../components/FieldRow";
 import { SplitPane } from "../components/SplitPane";
@@ -422,6 +423,61 @@ function formatPct(value: number | undefined | null): string {
     return "-";
   }
   return `${value.toFixed(1)}%`;
+}
+
+function formatRate(value: number | undefined | null, digits = 1): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "-";
+  }
+  return `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatSignedPp(value: number | undefined | null): string {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "-";
+  }
+  const points = value * 100;
+  return `${points >= 0 ? "+" : ""}${points.toFixed(1)}pp`;
+}
+
+function consistencyAgreementTone(value: number | null): "pass" | "warn" | "risk" | "idle" {
+  if (value === null) {
+    return "idle";
+  }
+  if (value >= 0.55) {
+    return "pass";
+  }
+  if (value >= 0.5) {
+    return "warn";
+  }
+  return "risk";
+}
+
+function consistencyDeviationTone(value: number | null): "pass" | "warn" | "risk" | "idle" {
+  if (value === null) {
+    return "idle";
+  }
+  const magnitude = Math.abs(value);
+  if (magnitude > 0.25) {
+    return "risk";
+  }
+  if (magnitude >= 0.15) {
+    return "warn";
+  }
+  return "pass";
+}
+
+function consistencyImbalanceTone(value: number | null): "pass" | "warn" | "risk" | "idle" {
+  if (value === null) {
+    return "idle";
+  }
+  if (value >= 0.5) {
+    return "risk";
+  }
+  if (value >= 0.25) {
+    return "warn";
+  }
+  return "pass";
 }
 
 function formatDecimal(value: number | undefined | null, digits = 2): string {
@@ -1365,7 +1421,7 @@ export function ResearchDevelopmentPage() {
             <div className="terminal-modal__body">
               {iterationDetailQuery.isLoading ? <div className="state-line">Loading iteration detail...</div> : null}
               {iterationDetailQuery.error ? <div className="state-line state-line--error">{iterationDetailQuery.error.message}</div> : null}
-              {iterationDetailQuery.data?.detail ? <IterationDetailPanel detail={iterationDetailQuery.data.detail} /> : null}
+              {iterationDetailQuery.data?.detail ? <IterationDetailPanel detail={iterationDetailQuery.data.detail} iteration={selectedIteration} /> : null}
             </div>
             <footer className="terminal-modal__footer">
               <span>Review the full signal ledger before auditing or spawning the next bundle.</span>
@@ -1497,7 +1553,150 @@ function StageTabs({
   );
 }
 
-function IterationDetailPanel({ detail }: { detail: Stage1IterationDetail }) {
+function ConsistencyMetricCard({
+  label,
+  meta,
+  tone,
+  value
+}: {
+  label: string;
+  meta: string;
+  tone: "pass" | "warn" | "risk" | "info" | "idle";
+  value: string;
+}) {
+  return (
+    <div className={`consistency-metric consistency-metric--${tone}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{meta}</small>
+    </div>
+  );
+}
+
+function ConsistencyFlagList({ flags }: { flags: string[] }) {
+  if (!flags.length) {
+    return <span className="consistency-flags consistency-flags--quiet">stable</span>;
+  }
+  return (
+    <span className="consistency-flags">
+      {flags.map((flag) => (
+        <span key={flag}>{flag}</span>
+      ))}
+    </span>
+  );
+}
+
+function Stage1ConsistencyPanel({ detail, iteration }: { detail: Stage1IterationDetail; iteration: Stage1IterationSummary }) {
+  const consistency = useMemo(() => buildStage1Consistency(detail), [detail]);
+  const protectedCount = iteration.failure_audit?.metrics.protected_count;
+  const protectedValue = typeof protectedCount === "number" ? formatNumber(protectedCount) : "not audited";
+  const protectedMeta = typeof protectedCount === "number" ? "from failure audit" : "generate audit to show protected cases";
+
+  return (
+    <TerminalPanel eyebrow="stage 1a" title="Consistency Gates">
+      <div className="consistency-layout">
+        <div className="consistency-metric-grid">
+          <ConsistencyMetricCard
+            label="Agreement"
+            meta={`${formatNumber(detail.metrics.matches)} match / ${formatNumber(detail.metrics.mismatches)} mismatch`}
+            tone={consistencyAgreementTone(consistency.summary.directionalAgreement)}
+            value={formatRate(consistency.summary.directionalAgreement, 2)}
+          />
+          <ConsistencyMetricCard
+            label="Worst Month"
+            meta={consistency.summary.worstMonth ? consistency.summary.worstMonth.month : "no monthly sample"}
+            tone={consistencyAgreementTone(consistency.summary.worstMonth?.directionalAgreement ?? null)}
+            value={formatRate(consistency.summary.worstMonth?.directionalAgreement ?? null, 2)}
+          />
+          <ConsistencyMetricCard
+            label="Coverage"
+            meta={`${formatNumber(consistency.summary.called)} called / ${formatNumber(consistency.summary.total)} total`}
+            tone="info"
+            value={formatRate(consistency.summary.calledCoverage)}
+          />
+          <ConsistencyMetricCard
+            label="Skip Drift"
+            meta={`${formatRate(consistency.summary.skipRate)} skip vs ${formatRate(consistency.summary.naturalNullRate)} null-GT`}
+            tone={consistencyDeviationTone(consistency.summary.neutralDeviation)}
+            value={formatSignedPp(consistency.summary.neutralDeviation)}
+          />
+          <ConsistencyMetricCard
+            label="Side Imbalance"
+            meta="abs(LONG calls - SHORT calls) / called"
+            tone={consistencyImbalanceTone(consistency.summary.sideImbalance)}
+            value={formatRate(consistency.summary.sideImbalance)}
+          />
+          <ConsistencyMetricCard
+            label="Protected Cases"
+            meta={protectedMeta}
+            tone={typeof protectedCount === "number" ? "pass" : "idle"}
+            value={protectedValue}
+          />
+        </div>
+
+        <div className="consistency-split-grid">
+          <div className="consistency-table-block">
+            <div className="consistency-table-heading">
+              <strong>LONG / SHORT Balance</strong>
+              <span>Call agreement is measured only on non-neutral calls.</span>
+            </div>
+            <DataTable<Stage1ConsistencySide>
+              columns={[
+                { key: "side", header: "Side", render: (item) => <strong>{item.side}</strong> },
+                { key: "truth", header: "Truth", align: "right", render: (item) => formatNumber(item.truthCount) },
+                { key: "calls", header: "Calls", align: "right", render: (item) => formatNumber(item.callCount) },
+                { key: "matches", header: "Match", align: "right", render: (item) => formatNumber(item.matches) },
+                { key: "mismatches", header: "Mismatch", align: "right", render: (item) => formatNumber(item.mismatches) },
+                { key: "agreement", header: "Agreement", align: "right", render: (item) => <span className={`tone-${consistencyAgreementTone(item.agreement)}`}>{formatRate(item.agreement, 2)}</span> },
+              ]}
+              getRowKey={(item) => item.side}
+              rows={consistency.sides}
+            />
+          </div>
+
+          <div className="consistency-table-block">
+            <div className="consistency-table-heading">
+              <strong>Coverage Discipline</strong>
+              <span>Natural null-GT is read from returned ground-truth directions.</span>
+            </div>
+            <div className="consistency-discipline-grid">
+              <FieldRow label="Highest skip month" value={consistency.summary.highestSkipMonth ? `${consistency.summary.highestSkipMonth.month} · ${formatRate(consistency.summary.highestSkipMonth.skipRate)}` : "n/a"} />
+              <FieldRow label="Neutral count" value={formatNumber(consistency.summary.neutral)} />
+              <FieldRow label="Natural null-GT" value={formatRate(consistency.summary.naturalNullRate)} />
+              <FieldRow label="Neutral deviation" value={formatSignedPp(consistency.summary.neutralDeviation)} />
+            </div>
+          </div>
+        </div>
+
+        <div className="consistency-table-block consistency-monthly-block">
+          <div className="consistency-table-heading">
+            <strong>Monthly Consistency</strong>
+            <span>Chronological stability, side health, and coverage warnings.</span>
+          </div>
+          <DataTable<Stage1ConsistencyMonth>
+            columns={[
+              { key: "month", header: "Month", render: (item) => <strong>{item.month}</strong> },
+              { key: "scoreable", header: "Scoreable", align: "right", render: (item) => formatNumber(item.scoreable) },
+              { key: "agreement", header: "Agreement", align: "right", render: (item) => <span className={`tone-${consistencyAgreementTone(item.directionalAgreement)}`}>{formatRate(item.directionalAgreement, 2)}</span> },
+              { key: "coverage", header: "Coverage", align: "right", render: (item) => formatRate(item.calledCoverage) },
+              { key: "skip", header: "Skip", align: "right", render: (item) => formatRate(item.skipRate) },
+              { key: "null", header: "Null-GT", align: "right", render: (item) => formatRate(item.naturalNullRate) },
+              { key: "drift", header: "Drift", align: "right", render: (item) => <span className={`tone-${consistencyDeviationTone(item.neutralDeviation)}`}>{formatSignedPp(item.neutralDeviation)}</span> },
+              { key: "long", header: "LONG", align: "right", render: (item) => formatRate(item.longAgreement, 2) },
+              { key: "short", header: "SHORT", align: "right", render: (item) => formatRate(item.shortAgreement, 2) },
+              { key: "flags", header: "Flags", render: (item) => <ConsistencyFlagList flags={item.flags} /> },
+            ]}
+            getRowClassName={(item) => item.flags.length ? "consistency-month-row consistency-month-row--flagged" : "consistency-month-row"}
+            getRowKey={(item) => item.month}
+            rows={consistency.months}
+          />
+        </div>
+      </div>
+    </TerminalPanel>
+  );
+}
+
+function IterationDetailPanel({ detail, iteration }: { detail: Stage1IterationDetail; iteration: Stage1IterationSummary }) {
   return (
     <div className="iteration-detail-layout">
       <div className="workbench-grid">
@@ -1519,21 +1718,7 @@ function IterationDetailPanel({ detail }: { detail: Stage1IterationDetail }) {
         </TerminalPanel>
       </div>
 
-      <TerminalPanel className="scroll-panel" title="Monthly Clusters">
-        <DataTable
-          columns={[
-            { key: "month", header: "Month", render: (item) => item.month },
-            { key: "signals", header: "Signals", align: "right", render: (item) => formatNumber(item.metrics.total) },
-            { key: "scoreable", header: "Scoreable", align: "right", render: (item) => formatNumber(item.metrics.scoreable) },
-            { key: "matches", header: "Matches", align: "right", render: (item) => formatNumber(item.metrics.matches) },
-            { key: "mismatches", header: "Mismatches", align: "right", render: (item) => formatNumber(item.metrics.mismatches) },
-            { key: "neutral", header: "Neutral", align: "right", render: (item) => formatNumber(item.metrics.neutral) },
-            { key: "agreement", header: "Agreement", align: "right", render: (item) => stage1Agreement(item.metrics.directional_agreement) },
-          ]}
-          getRowKey={(item) => item.month}
-          rows={detail.monthly}
-        />
-      </TerminalPanel>
+      <Stage1ConsistencyPanel detail={detail} iteration={iteration} />
 
       <TerminalPanel className="scroll-panel" title="Signal Breakdown">
         <DataTable

@@ -20,11 +20,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[5]
+SCRIPT_DIR = Path(__file__).resolve().parent
 SRC = WORKSPACE_ROOT / "artifacts" / "signal_engine" / "src"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from vegas.workspace import find_workspace_root
+from stage0_scan_utils import build_candle_time_index, first_candle_after
 
 
 WORKSPACE_ROOT = find_workspace_root(WORKSPACE_ROOT)
@@ -61,6 +65,13 @@ def load_candles(csv_path: str, start: datetime, end: datetime) -> list:
 
 
 def get_reference_price(sig_data: dict) -> float | None:
+    evidence = sig_data.get("evidence", {})
+    if isinstance(evidence, dict):
+        for key in ("trigger_candle_close", "trigger_price", "reference_price"):
+            value = evidence.get(key)
+            if value is not None:
+                return float(value)
+
     interactions = sig_data.get("interactions", {})
     if isinstance(interactions, dict):
         for tf in interactions:
@@ -83,8 +94,14 @@ def get_reference_price(sig_data: dict) -> float | None:
     return None
 
 
-def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
-                   forward_hours: int, threshold_pct: float) -> dict:
+def analyze_signal(
+    candles: list,
+    signal_ts: datetime,
+    ref_price: float,
+    forward_hours: int,
+    threshold_pct: float,
+    candle_time_index: list[datetime] | None = None,
+) -> dict:
     """
     For a given threshold, determine:
     - natural_direction: which side hit threshold first (or None if neither)
@@ -94,12 +111,7 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
     cutoff = signal_ts + timedelta(hours=forward_hours)
     threshold_abs = threshold_pct / 100.0
 
-    # Find first candle after signal
-    first_idx = None
-    for i, c in enumerate(candles):
-        if c["ts"] > signal_ts:
-            first_idx = i
-            break
+    first_idx = first_candle_after(candle_time_index or build_candle_time_index(candles), signal_ts)
     if first_idx is None:
         return {"natural_direction": None, "first_move_pct": 0, "reversed": False,
                 "status": "no_candles"}
@@ -109,6 +121,8 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
 
     long_hit_ts = None
     short_hit_ts = None
+    long_hit_idx = None
+    short_hit_idx = None
 
     for i in range(first_idx, len(candles)):
         c = candles[i]
@@ -116,8 +130,10 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
             break
         if long_hit_ts is None and c["high"] >= long_target:
             long_hit_ts = c["ts"]
+            long_hit_idx = i
         if short_hit_ts is None and c["low"] <= short_target:
             short_hit_ts = c["ts"]
+            short_hit_idx = i
         if long_hit_ts is not None and short_hit_ts is not None:
             break
 
@@ -129,35 +145,19 @@ def analyze_signal(candles: list, signal_ts: datetime, ref_price: float,
     # Determine natural direction
     if long_hit_ts is not None and short_hit_ts is None:
         natural_direction = "LONG"
-        first_hit_idx = None
-        for i, c in enumerate(candles):
-            if c["ts"] == long_hit_ts:
-                first_hit_idx = i
-                break
+        first_hit_idx = long_hit_idx
     elif short_hit_ts is not None and long_hit_ts is None:
         natural_direction = "SHORT"
-        first_hit_idx = None
-        for i, c in enumerate(candles):
-            if c["ts"] == short_hit_ts:
-                first_hit_idx = i
-                break
+        first_hit_idx = short_hit_idx
     else:
         # Both hit in same candle — check which one was closer to ref
         # Or use the one that was hit first (closer to signal_ts)
         if long_hit_ts < short_hit_ts:
             natural_direction = "LONG"
-            first_hit_idx = None
-            for i, c in enumerate(candles):
-                if c["ts"] == long_hit_ts:
-                    first_hit_idx = i
-                    break
+            first_hit_idx = long_hit_idx
         else:
             natural_direction = "SHORT"
-            first_hit_idx = None
-            for i, c in enumerate(candles):
-                if c["ts"] == short_hit_ts:
-                    first_hit_idx = i
-                    break
+            first_hit_idx = short_hit_idx
 
     if first_hit_idx is None:
         return {"natural_direction": None, "first_move_pct": 0, "reversed": False,
@@ -411,6 +411,7 @@ def main():
 
     print(f"Loading candles...")
     candles = load_candles(str(candles_path), earliest, latest)
+    candle_time_index = build_candle_time_index(candles)
     print(f"Loaded {len(candles):,} candles. Signal range: {earliest} → {latest}")
 
     # Pre-load all signal data
@@ -453,8 +454,14 @@ def main():
         resolution_minutes = []
 
         for sd in signal_data:
-            r = analyze_signal(candles, sd["signal_ts"], sd["ref_price"],
-                              forward_hours, threshold)
+            r = analyze_signal(
+                candles,
+                sd["signal_ts"],
+                sd["ref_price"],
+                forward_hours,
+                threshold,
+                candle_time_index,
+            )
 
             if r["status"] == "no_trigger":
                 no_trigger += 1

@@ -95,6 +95,13 @@ def run_stage2_capture_curve(
 
 
 def get_reference_price(packet: dict[str, Any]) -> float:
+    evidence = packet.get("evidence", {})
+    if isinstance(evidence, dict):
+        for key in ("trigger_candle_close", "trigger_price", "reference_price"):
+            value = evidence.get(key)
+            if value is not None:
+                return float(value)
+
     interactions = packet.get("interactions", {})
     if isinstance(interactions, list):
         for timeframe in packet.get("active_timeframes", []):

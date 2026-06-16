@@ -107,6 +107,7 @@ export type SignalEngine = {
   name: string;
   description: string;
   version: string | null;
+  created_at?: string | null;
   code_ref: Record<string, unknown> | null;
   required_data?: Array<Record<string, unknown>>;
   output_envelope_version?: string | null;
@@ -1016,8 +1017,11 @@ export function createSignalSet(request: { signal_engine_id: string; asset: stri
   });
 }
 
-export function fetchSignals(signalSetKey: string, limit = 5): Promise<{ signals: SignalRecord[] }> {
+export function fetchSignals(signalSetKey: string, limit = 5, descending = false): Promise<{ signals: SignalRecord[] }> {
   const params = new URLSearchParams({ signal_set_key: signalSetKey, limit: String(limit) });
+  if (descending) {
+    params.set("descending", "true");
+  }
   return requestJson<{ signals: SignalRecord[] }>(`/api/v1/signals?${params.toString()}`);
 }
 

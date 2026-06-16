@@ -4,6 +4,66 @@ from pathlib import Path
 from quant_terminal_worker.stage2.capture_curve import run_stage2_capture_curve
 
 
+def test_run_stage2_capture_curve_reads_liquidity_sweep_reference_price(tmp_path: Path):
+    artifact_root = tmp_path / "dev/training_sessions/aave-lse/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True)
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "signal_id": "sig-lse-high",
+                        "sample_role": "training",
+                        "decision_direction": "SHORT",
+                        "agreement": "MATCH",
+                    }
+                ]
+            }
+        )
+    )
+    session = {
+        "session_id": "stage1-aave-lse",
+        "artifact_root": str(artifact_root),
+        "asset": "AAVE",
+        "strategy_id": "aave-lse",
+        "strategy_version": "v0.1",
+        "signal_engine_id": "liquidity_sweep_v1",
+        "signal_set_id": "AAVE-liquidity_sweep_v1-canonical",
+    }
+    signal_rows = [
+        {
+            "signal_id": "sig-lse-high",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "payload": {
+                "schema_version": "signal_packet.v2",
+                "active_timeframes": ["5m"],
+                "evidence": {
+                    "pattern": "liquidity_sweep_event",
+                    "event_type": "HIGH_SWEEP",
+                    "trigger_candle_close": "100",
+                    "trigger_price": "101",
+                },
+            },
+        }
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 100.2, "low": 99.2, "close": 99.5},
+    ]
+
+    result = run_stage2_capture_curve(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signal_rows,
+        candles=candles,
+        tp_levels=[0.5],
+        forward_hours=1,
+    )
+
+    assert result["per_signal"][0]["reference_price"] == 100.0
+    assert result["per_signal"][0]["first_tp_reached"] == 0.5
+
+
 def test_run_stage2_capture_curve_scores_match_set_by_slice(tmp_path: Path):
     artifact_root = tmp_path / "dev/training_sessions/aave-vegas/stage1-aave"
     promotion_root = artifact_root / "promotion"

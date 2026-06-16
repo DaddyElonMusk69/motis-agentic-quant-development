@@ -34,7 +34,21 @@ For current runtime examples, read:
 - Training generator must consume canonical Parquet through `MarketDataReader` or the engine runtime context.
 - Live scanner must scan the latest eligible canonical Parquet candle state, not historical DB signal backlog.
 - Signal packets must be neutral market evidence only. Do not include direction, side, confidence, sizing, leverage, TP, SL, or order intent.
-- Strategy direction belongs in the paired base strategy `decide(context)`.
+- Stage 1/runtime strategy invocation is the canonical interface boundary. Engines emit raw `signal_packet.v2` packets; every strategy caller must wrap those packets before calling `decide(context)`.
+- Canonical `decide(context)` shape:
+  - `context["signal"]["signal_id"]`
+  - `context["signal"]["signal_set_key"]` when available
+  - `context["signal"]["signal_engine_id"]` when available
+  - `context["signal"]["asset"]`
+  - `context["signal"]["instrument"]`
+  - `context["signal"]["timestamp"]`
+  - `context["signal"]["payload_schema"] == "signal_packet.v2"`
+  - `context["signal"]["payload"] == <raw emitted packet>`
+  - `context["runtime_mode"]` set to `stage1`, `backtest`, or `live`
+  - `context["parameters"]` as a dict
+  - `context["raw_data"]` as a dict
+- Strategy direction belongs in the paired base strategy `decide(context)`, and strategies should read packet evidence through `context["signal"]["payload"]`, not by assuming the raw packet was passed directly as `context["signal"]`.
+- The paired base strategy must match the engine's actual emitted packet shape. Do not copy legacy Vegas gates such as requiring two active timeframes unless the new engine really emits and requires that shape.
 - Execution setup and live router own sizing, TP/SL price derivation, protection, pyramiding, and order submission.
 - The engine registry entry should include `code_ref.base_strategy_path`, and that file must expose a valid strategy `decide()`.
 - The engine must be visible through `GET /api/v1/signal-engines`, even before any DB signal pool exists. Repo registry entries must merge into the API catalog with zero counts when the DB has no row yet.
@@ -61,6 +75,9 @@ For current runtime examples, read:
    - live scan from Parquet
    - packet neutrality
    - paired base strategy validates
+   - canonical strategy context: wrap at least one real emitted training packet and one live-scan packet as `context["signal"]["payload"]` before calling `decide(context)`
+   - engine/strategy compatibility: assert the paired strategy does not skip solely because of packet-shape assumptions such as active timeframe count, wrapper path, or missing legacy fields
+   - Stage 1 scorer compatibility: exercise the actual Stage 1 scoring path with a representative raw emitted packet artifact and assert it produces scoreable `LONG`/`SHORT` decisions when the paired strategy has directional rules
    - Stage 0 signal-pool preparation still works where relevant
 6. If catalog behavior changes, update `apps/api/src/quant_terminal_api/main.py` and tests so DB rows win but repo registry entries fill missing engines.
 7. Run focused tests, then `pytest -q`. Run `npm --workspace apps/web-v2 run build` if frontend/API types were touched.
@@ -73,6 +90,9 @@ For current runtime examples, read:
 - Assuming `engine_registry.json` alone makes the engine visible in the UI. The Engines page reads the API catalog, so registry-only engines must be merged into `GET /api/v1/signal-engines`.
 - Letting a packet imply `LONG` or `SHORT`.
 - Forgetting `code_ref.base_strategy_path`, which leaves Stage 1 to fall back to the generic starter.
+- Reusing a paired base strategy that expects an older packet shape. Example: a 5m-only engine emitting `active_timeframes: ["5m"]` must not use a base strategy that requires two active timeframe votes before it can score.
+- Testing `decide(context)` by passing the raw emitted packet as `context["signal"]`. This bypasses the canonical runtime wrapper and can hide Stage 1/live execution contract bugs.
+- Making each strategy defensively support malformed scorer input instead of fixing the caller. Stage 1, backtests, promotion, and live execution must all call strategies with the same canonical signal wrapper.
 - Using live exchange fetches inside the engine instead of canonical Parquet.
 - Changing Vegas defaults while adding a variant. Add a separate engine id and spec defaults instead.
 
@@ -81,6 +101,9 @@ For current runtime examples, read:
 - `validate_signal_engine_spec(...)` passes.
 - `validate_signal_packet(...)` passes for emitted packets.
 - `validate_strategy_module(base_strategy_path)` passes.
+- A representative emitted packet from the training generator and live scanner can be wrapped as `context["signal"]["payload"]` and passed to the paired `decide(context)` without being rejected for stale packet-shape reasons.
+- The actual Stage 1 scorer path can consume a representative raw emitted packet artifact and call `decide(context)` with the canonical runtime signal wrapper.
+- Strategy callers in Stage 1, backtests, promotion, and live execution use the same canonical wrapper shape.
 - `GET /api/v1/signal-engines` returns the new engine after backend restart, even with zero signal sets.
 - The v2 Engines tab can list/select the new engine.
 - Existing engines keep their old behavior unless the user explicitly asked for a behavior change.
