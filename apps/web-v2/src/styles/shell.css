@@ -2182,7 +2182,39 @@
 }
 
 .portfolio-backtest-body {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
   min-width: 0;
+}
+
+.portfolio-backtest-layout {
+  display: grid;
+  flex: 1 1 auto;
+  gap: var(--space-4);
+  grid-template-columns: 300px minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.portfolio-backtest-controls,
+.portfolio-backtest-results,
+.portfolio-control-stack,
+.portfolio-allocation-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+}
+
+.portfolio-backtest-results {
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
 }
 
 .archived-strategies-modal {
@@ -2202,27 +2234,12 @@
 
 .portfolio-backtest-layout {
   display: grid;
+  flex: 1 1 auto;
   gap: var(--space-4);
-  grid-template-columns: 320px minmax(0, 1fr);
-  height: 100%;
+  grid-template-columns: 300px minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
   overflow: hidden;
-}
-
-.portfolio-backtest-controls,
-.portfolio-backtest-results,
-.portfolio-control-stack,
-.portfolio-allocation-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  min-height: 0;
-}
-
-.portfolio-backtest-results {
-  overflow: auto;
-  padding-right: 2px;
 }
 
 .portfolio-backtest-controls {
@@ -2469,7 +2486,7 @@
 }
 
 .portfolio-chart-card .stage4-equity-curve svg {
-  height: 260px;
+  height: 200px;
 }
 
 .portfolio-ledger-tabs {
@@ -3160,7 +3177,7 @@
   }
 
   .portfolio-chart-card .stage4-equity-curve svg {
-    height: 280px;
+    height: 200px;
   }
 
   .portfolio-ledger-section .table-frame {
