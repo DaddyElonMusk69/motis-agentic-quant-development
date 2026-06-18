@@ -353,8 +353,9 @@ def _simulate(
                 ))
                 continue
 
-            # Check margin using account equity (realized + unrealized)
-            margin_needed = account_equity * ctx["margin_allocation_pct"] / 100
+            # Position sizing uses realized equity (isolated margin behavior).
+            # Margin availability check uses account_equity (prevents liquidation).
+            margin_needed = equity * ctx["margin_allocation_pct"] / 100
             free_margin = account_equity - used_margin
             if margin_needed > free_margin:
                 skipped_signals.append(_skip_record(
@@ -370,7 +371,7 @@ def _simulate(
                 signal=signal,
                 candle=candle,
                 ctx=ctx,
-                equity=account_equity,
+                equity=equity,
                 margin_budget=margin_needed,
             )
             open_positions[asset] = position
