@@ -752,6 +752,17 @@ export type PortfolioBacktestResult = {
     total_fees_usdt: number;
     return_pct: number;
     gross_return_pct: number;
+    win_rate_pct?: number;
+    profit_factor?: number | null;
+    expectancy_usdt?: number;
+    avg_win_usdt?: number;
+    avg_loss_usdt?: number;
+    largest_win_usdt?: number;
+    largest_loss_usdt?: number;
+    max_drawdown_pct?: number;
+    max_drawdown_usdt?: number;
+    sharpe_ratio?: number;
+    sortino_ratio?: number;
   };
   equity_curve: Array<{
     timestamp: string | null;

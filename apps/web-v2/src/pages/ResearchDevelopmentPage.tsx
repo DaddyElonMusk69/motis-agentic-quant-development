@@ -2922,8 +2922,28 @@ function PortfolioBacktestModal({
                   </div>
                   <div className="portfolio-summary-strip__group">
                     <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">Return</span>
+                      <strong className="portfolio-summary-strip__value">{result.account.return_pct != null ? formatPct(result.account.return_pct) : "-"}</strong>
+                    </div>
+                    <div className="portfolio-summary-strip__stat">
                       <span className="portfolio-summary-strip__label">Win Rate</span>
                       <strong className="portfolio-summary-strip__value">{result.summary.executed_positions > 0 ? formatPct((stage4FilledTrades(result.trade_ledger ?? []).filter((t) => (t.net_pnl_usdt ?? 0) > 0).length / result.summary.executed_positions) * 100) : "-"}</strong>
+                    </div>
+                    <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">Sharpe</span>
+                      <strong className="portfolio-summary-strip__value">{result.account.sharpe_ratio != null ? result.account.sharpe_ratio.toFixed(2) : "-"}</strong>
+                    </div>
+                    <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">Sortino</span>
+                      <strong className="portfolio-summary-strip__value">{result.account.sortino_ratio != null ? result.account.sortino_ratio.toFixed(2) : "-"}</strong>
+                    </div>
+                    <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">Max DD</span>
+                      <strong className="portfolio-summary-strip__value portfolio-summary-strip__value--cost">{result.account.max_drawdown_pct != null ? formatPct(result.account.max_drawdown_pct) : "-"}</strong>
+                    </div>
+                    <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">PF</span>
+                      <strong className="portfolio-summary-strip__value">{result.account.profit_factor != null ? result.account.profit_factor.toFixed(2) : "-"}</strong>
                     </div>
                     <div className="portfolio-summary-strip__stat">
                       <span className="portfolio-summary-strip__label">Fees Paid</span>

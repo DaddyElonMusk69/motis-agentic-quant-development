@@ -409,6 +409,7 @@ def _simulate(
         initial_capital_usdt=initial_capital_usdt,
         ending_equity_usdt=equity,
         trades=trade_ledger,
+        equity_curve=equity_curve,
     )
     summary = {
         "eligible_asset_count": len(asset_contexts),
@@ -862,10 +863,73 @@ def _skip_record(
     }
 
 
-def _account_summary(*, initial_capital_usdt: float, ending_equity_usdt: float, trades: list[dict[str, Any]]) -> dict[str, Any]:
+def _account_summary(
+    *,
+    initial_capital_usdt: float,
+    ending_equity_usdt: float,
+    trades: list[dict[str, Any]],
+    equity_curve: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     gross_pnl = sum(float(trade.get("gross_pnl_usdt") or 0) for trade in trades)
     net_pnl = ending_equity_usdt - initial_capital_usdt
     fees = sum(float(trade.get("total_fees_usdt") or 0) for trade in trades)
+
+    # Per-trade returns for risk metrics
+    pnls = [float(t.get("net_pnl_usdt") or 0) for t in trades]
+    winning = [p for p in pnls if p > 0]
+    losing = [p for p in pnls if p < 0]
+    win_rate = len(winning) / len(pnls) * 100 if pnls else 0.0
+    avg_win = sum(winning) / len(winning) if winning else 0.0
+    avg_loss = abs(sum(losing) / len(losing)) if losing else 0.0
+    profit_factor = sum(winning) / abs(sum(losing)) if losing and sum(losing) != 0 else float("inf") if winning else 0.0
+    expectancy = (sum(pnls) / len(pnls)) if pnls else 0.0
+    largest_win = max(winning) if winning else 0.0
+    largest_loss = min(losing) if losing else 0.0
+
+    # Drawdown from equity curve
+    max_dd_pct = 0.0
+    max_dd_usdt = 0.0
+    if equity_curve:
+        peak = float(equity_curve[0].get("equity_usdt") or initial_capital_usdt)
+        for point in equity_curve:
+            eq = float(point.get("equity_usdt") or 0)
+            if eq > peak:
+                peak = eq
+            dd = peak - eq
+            dd_pct = dd / peak * 100 if peak > 0 else 0.0
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+                max_dd_usdt = dd
+
+    # Sharpe ratio (annualized, assuming 5m candles — 105,120 per year)
+    # Uses per-trade returns, not per-candle, so we annualize by trade frequency
+    sharpe_ratio = 0.0
+    sortino_ratio = 0.0
+    if len(pnls) > 1:
+        import statistics
+        mean_ret = statistics.mean(pnls)
+        stdev_ret = statistics.stdev(pnls)
+        # Estimate trades per year from equity curve time span
+        trades_per_year = len(pnls)
+        if equity_curve and len(equity_curve) > 1:
+            first_ts = equity_curve[0].get("timestamp")
+            last_ts = equity_curve[-1].get("timestamp")
+            if first_ts and last_ts:
+                from datetime import datetime as _dt
+                try:
+                    start_dt = _coerce_datetime(first_ts) if first_ts else None
+                    end_dt = _coerce_datetime(last_ts) if last_ts else None
+                    if start_dt and end_dt:
+                        span_days = max((end_dt - start_dt).total_seconds() / 86400, 1.0)
+                        trades_per_year = len(pnls) / span_days * 365
+                except Exception:
+                    pass
+        if stdev_ret > 0:
+            sharpe_ratio = (mean_ret / stdev_ret) * (trades_per_year ** 0.5)
+        downside_dev = statistics.stdev([p for p in pnls if p < 0]) if len([p for p in pnls if p < 0]) > 1 else 0.0
+        if downside_dev > 0:
+            sortino_ratio = (mean_ret / downside_dev) * (trades_per_year ** 0.5)
+
     return {
         "initial_capital_usdt": _round_money(initial_capital_usdt),
         "ending_equity_usdt": _round_money(ending_equity_usdt),
@@ -874,6 +938,17 @@ def _account_summary(*, initial_capital_usdt: float, ending_equity_usdt: float, 
         "total_fees_usdt": _round_money(fees),
         "return_pct": round(net_pnl / initial_capital_usdt * 100, 8) if initial_capital_usdt else 0.0,
         "gross_return_pct": round(gross_pnl / initial_capital_usdt * 100, 8) if initial_capital_usdt else 0.0,
+        "win_rate_pct": round(win_rate, 4),
+        "profit_factor": round(profit_factor, 4) if profit_factor != float("inf") else None,
+        "expectancy_usdt": _round_money(expectancy),
+        "avg_win_usdt": _round_money(avg_win),
+        "avg_loss_usdt": _round_money(avg_loss),
+        "largest_win_usdt": _round_money(largest_win),
+        "largest_loss_usdt": _round_money(largest_loss),
+        "max_drawdown_pct": round(max_dd_pct, 4),
+        "max_drawdown_usdt": _round_money(max_dd_usdt),
+        "sharpe_ratio": round(sharpe_ratio, 4),
+        "sortino_ratio": round(sortino_ratio, 4),
     }
 
 
