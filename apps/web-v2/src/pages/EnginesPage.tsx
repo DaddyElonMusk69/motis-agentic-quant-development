@@ -114,20 +114,93 @@ function signalUpdateResultText(result: SignalPoolExtendResult | undefined): str
   ].join(" · ");
 }
 
-function engineRequiredData(engine: SignalEngine | undefined): Array<{ label: string; value: string }> {
+type RequiredDataItem = {
+  id: string;
+  dataType: string;
+  origin: string;
+  raw: Record<string, unknown> | string | null;
+  role: string;
+  source: string | null;
+  timeframe: string;
+};
+
+function formatRequirementToken(value: unknown, fallback: string): string {
+  const token = String(value ?? fallback).trim();
+  if (!token) {
+    return fallback;
+  }
+  return token.replace(/^feature_/, "").replaceAll("_", " ");
+}
+
+function formatRequirementSource(source: unknown): string | null {
+  if (!source || typeof source !== "object") {
+    return null;
+  }
+  const sourceRecord = source as Record<string, unknown>;
+  const origin = formatRequirementToken(sourceRecord.origin ?? sourceRecord.data_origin, "raw");
+  const timeframe = formatRequirementToken(sourceRecord.timeframe, "");
+  const dataType = formatRequirementToken(sourceRecord.data_type, "data");
+  return [origin, timeframe, dataType].filter(Boolean).join(" ");
+}
+
+function engineRequiredData(engine: SignalEngine | undefined): RequiredDataItem[] {
   const codeRef = engine?.code_ref ?? {};
   const requiredData = Array.isArray(engine?.required_data) ? engine.required_data : Array.isArray(codeRef.required_data) ? codeRef.required_data : null;
   if (!requiredData?.length) {
     return [
-      { label: "Canonical input", value: "Raw 5m Parquet candles" },
-      { label: "Derived use", value: "Engine-defined replay state" },
-      { label: "Future updates", value: "No legacy CSV source" }
+      {
+        id: "default-raw-5m",
+        dataType: "candles",
+        origin: "raw",
+        raw: null,
+        role: "canonical source",
+        source: null,
+        timeframe: "5m"
+      }
     ];
   }
-  return requiredData.slice(0, 4).map((item, index) => ({
-    label: `Requirement ${index + 1}`,
-    value: typeof item === "string" ? item : JSON.stringify(item)
-  }));
+  return requiredData.map((item, index) => {
+    if (typeof item === "string") {
+      return {
+        id: `requirement-${index}`,
+        dataType: item,
+        origin: "input",
+        raw: item,
+        role: "engine requirement",
+        source: null,
+        timeframe: "any"
+      };
+    }
+    const origin = formatRequirementToken(item.origin ?? item.data_origin, "raw");
+    const dataType = formatRequirementToken(item.data_type, "data");
+    const timeframe = formatRequirementToken(item.timeframe, "any");
+    const source = formatRequirementSource(item.source);
+    return {
+      id: `${origin}-${dataType}-${timeframe}-${index}`,
+      dataType,
+      origin,
+      raw: item,
+      role: source ? `from ${source}` : origin === "raw" ? "canonical source" : "engine produced",
+      source,
+      timeframe
+    };
+  });
+}
+
+function requiredDataSummary(items: RequiredDataItem[], explicitContract: boolean): string {
+  const rawItem = items.find((item) => item.origin === "raw");
+  const derivedCount = items.filter((item) => item.origin === "derived").length;
+  const parts = [`${formatNumber(items.length)} ${items.length === 1 ? "requirement" : "requirements"}`];
+  if (rawItem) {
+    parts.push(`${rawItem.origin} ${rawItem.timeframe} base`);
+  }
+  if (derivedCount) {
+    parts.push(`${formatNumber(derivedCount)} derived rebuild${derivedCount === 1 ? "" : "s"}`);
+  }
+  if (!explicitContract) {
+    parts.push("registry fallback");
+  }
+  return parts.join(" · ");
 }
 
 function engineRequirements(engine: SignalEngine | undefined): Array<Record<string, unknown>> {
@@ -156,6 +229,41 @@ function assetRequirementState(asset: CatalogAsset, engine: SignalEngine | undef
     })
     .map((requirement) => `${String(requirement.origin ?? requirement.data_origin ?? "raw")} ${String(requirement.data_type ?? "data")} ${String(requirement.timeframe ?? "")}`.trim());
   return { eligible: missing.length === 0, missing };
+}
+
+function RequiredDataPanel({ engine }: { engine: SignalEngine | undefined }) {
+  const items = engineRequiredData(engine);
+  const explicitContract = Boolean(items.some((item) => item.raw));
+  const rawItems = items.filter((item) => item.raw);
+
+  return (
+    <TerminalPanel eyebrow={engine?.output_envelope_version ?? "data contract"} title="Required Data">
+      <div className="required-data-panel">
+        <div className="required-data-panel__summary">
+          <strong>{requiredDataSummary(items, explicitContract)}</strong>
+          <span>{explicitContract ? "Registry-declared canonical inputs" : "No explicit registry contract declared"}</span>
+        </div>
+        <div className="required-data-list">
+          {items.map((item) => (
+            <div className="required-data-row" key={item.id}>
+              <span className={`required-data-badge required-data-badge--${item.origin === "derived" ? "derived" : item.origin === "raw" ? "raw" : "input"}`}>
+                {item.origin}
+              </span>
+              <strong>{item.dataType}</strong>
+              <span className="required-data-row__timeframe">{item.timeframe}</span>
+              <small>{item.role}</small>
+            </div>
+          ))}
+        </div>
+        {rawItems.length ? (
+          <details className="required-data-raw">
+            <summary>Raw contract</summary>
+            <pre>{JSON.stringify(rawItems.map((item) => item.raw), null, 2)}</pre>
+          </details>
+        ) : null}
+      </div>
+    </TerminalPanel>
+  );
 }
 
 function PacketPreview({ error, loading, signals }: { error: Error | null; loading: boolean; signals?: SignalRecord[] }) {
@@ -203,7 +311,6 @@ export function EnginesPage() {
   const signalSets = signalSetsQuery.data?.signal_sets ?? [];
   const selectedSignalSet = selectSignalSet(signalSets, searchParams);
   const selectedState = selectedSignalSet ? signalSetState(selectedSignalSet) : undefined;
-  const requiredData = useMemo(() => engineRequiredData(selectedEngine), [selectedEngine]);
 
   const signalsQuery = useQuery({
     enabled: Boolean(selectedSignalSet?.signal_set_key),
@@ -535,13 +642,7 @@ export function EnginesPage() {
             ) : null}
 
             <div className="workbench-grid">
-              <TerminalPanel title="Required Data">
-                <div className="field-stack">
-                  {requiredData.map((item) => (
-                    <FieldRow key={item.label} label={item.label} value={item.value} />
-                  ))}
-                </div>
-              </TerminalPanel>
+              <RequiredDataPanel engine={selectedEngine} />
               <TerminalPanel title="Coverage Semantics">
                 <div className="field-stack">
                   <FieldRow label="Scanned coverage" value="Canonical Parquet horizon" />
