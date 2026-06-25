@@ -17,6 +17,7 @@ from quant_terminal_worker.stage4.realized_expectancy import (
     _next_entry,
     _normalize_candidates,
     _normalize_side_policies,
+    _resolve_dual_hit,
     _target_price,
     _tp_sl_hit,
 )
@@ -70,7 +71,7 @@ def run_portfolio_backtest(
     ]
 
     payload = {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "artifact_role": "portfolio_backtest",
         "created_at": created_at,
         "run_id": run_id,
@@ -262,16 +263,19 @@ def _simulate(
     asset_contexts: list[dict[str, Any]],
     initial_capital_usdt: float,
 ) -> dict[str, Any]:
-    equity = float(initial_capital_usdt)
+    available_cash = float(initial_capital_usdt)
     open_positions: dict[str, dict[str, Any]] = {}
     trade_ledger: list[dict[str, Any]] = []
     skipped_signals: list[dict[str, Any]] = []
+    data_gap_candles = 0
+    continuous_5m_steps = 0
     equity_curve: list[dict[str, Any]] = [
-        {"timestamp": None, "equity_usdt": _round_money(equity), "used_margin_usdt": 0.0, "free_margin_usdt": _round_money(equity)}
+        _curve_point(None, account_equity=available_cash, isolated_margin=0.0, available_cash=available_cash)
     ]
 
     # Build per-asset candle index and signal cursor
     candles_by_asset: dict[str, dict[datetime, dict[str, Any]]] = {}
+    candle_spans_by_asset: dict[str, tuple[datetime, datetime]] = {}
     signal_cursors: dict[str, int] = {}
     all_timestamps: set[datetime] = set()
 
@@ -282,15 +286,23 @@ def _simulate(
             candle_index[candle["timestamp"]] = candle
             all_timestamps.add(candle["timestamp"])
         candles_by_asset[asset] = candle_index
+        if candle_index:
+            ordered = sorted(candle_index)
+            candle_spans_by_asset[asset] = (ordered[0], ordered[-1])
         signal_cursors[asset] = 0
 
-    unified_timeline = sorted(all_timestamps)
+    unified_timeline = _continuous_5m_timeline(sorted(all_timestamps))
 
     for ts in unified_timeline:
+        continuous_5m_steps += 1
+        for asset, span in candle_spans_by_asset.items():
+            if span[0] <= ts <= span[1] and ts not in candles_by_asset.get(asset, {}):
+                data_gap_candles += 1
+
         # Compute account equity (realized + unrealized) for margin checks
         unrealized = _unrealized_pnl(open_positions, candles_by_asset, ts)
-        account_equity = equity + unrealized
-        used_margin = _used_margin(open_positions)
+        isolated_margin = _used_margin(open_positions)
+        account_equity = available_cash + isolated_margin + unrealized
 
         # Phase 1: Manage existing positions
         closed_assets: list[str] = []
@@ -298,27 +310,31 @@ def _simulate(
             candle = candles_by_asset[asset].get(ts)
             if candle is None:
                 continue
-            closed = _manage_position(
+            managed = _manage_position(
                 position=position,
                 candle=candle,
                 ts=ts,
-                equity=equity,
-                account_equity=account_equity,
-                free_margin=account_equity - used_margin,
+                available_cash=available_cash,
             )
+            available_cash -= managed["margin_consumed"]
+            skipped_signals.extend(managed["pyramid_skips"])
+            closed = managed["closed"]
             if closed:
                 net_pnl = closed["net_pnl"]
-                equity += net_pnl
+                position_margin = closed["position_margin"]
+                available_cash += position_margin + net_pnl
                 trade_ledger.append(closed["trade"])
                 closed_assets.append(asset)
-                equity_curve.append(_curve_point(ts, equity=equity, used_margin=_used_margin(open_positions, exclude=asset)))
+                isolated_after_close = _used_margin(open_positions, exclude=asset)
+                account_after_close = available_cash + isolated_after_close + _unrealized_pnl(open_positions, candles_by_asset, ts, exclude=asset)
+                equity_curve.append(_curve_point(ts, account_equity=account_after_close, isolated_margin=isolated_after_close, available_cash=available_cash))
         for asset in closed_assets:
             open_positions.pop(asset, None)
 
         # Recompute account equity after phase 1 closes
         unrealized = _unrealized_pnl(open_positions, candles_by_asset, ts)
-        account_equity = equity + unrealized
-        used_margin = _used_margin(open_positions)
+        isolated_margin = _used_margin(open_positions)
+        account_equity = available_cash + isolated_margin + unrealized
 
         # Phase 2: Process new signals
         for ctx in asset_contexts:
@@ -330,7 +346,7 @@ def _simulate(
                 while cursor < len(inputs) and inputs[cursor]["signal_ts"] <= ts:
                     skipped_signals.append(_skip_record(
                         asset=asset, signal=inputs[cursor], reason="asset_position_open",
-                        equity=account_equity, used_margin=used_margin,
+                        account_equity=account_equity, isolated_margin=isolated_margin, available_cash=available_cash,
                     ))
                     cursor += 1
                 signal_cursors[asset] = cursor
@@ -353,28 +369,26 @@ def _simulate(
             if signal["direction"] not in {"LONG", "SHORT"}:
                 skipped_signals.append(_skip_record(
                     asset=asset, signal=signal, reason="no_trade_decision",
-                    equity=account_equity, used_margin=used_margin,
+                    account_equity=account_equity, isolated_margin=isolated_margin, available_cash=available_cash,
                 ))
                 continue
 
-            # Position sizing: account_equity = realized + unrealized (matches live behavior).
-            # Margin availability: free_margin = account_equity - used_margin.
-            # Trade is rejected if margin_needed > free_margin (insufficient available margin).
             margin_needed = account_equity * ctx["margin_allocation_pct"] / 100
-            free_margin = account_equity - used_margin
-            if margin_needed > free_margin:
-                skipped_signals.append(_skip_record(
-                    asset=asset, signal=signal, reason="insufficient_free_margin",
-                    equity=account_equity, used_margin=used_margin,
-                    requested_margin=margin_needed,
-                ))
-                continue
 
             # Apply max position notional cap (exchange tier + liquidity constraint)
             max_notional = ctx.get("max_position_notional_usdt", 500_000.0)
             max_margin_for_notional = max_notional / ctx["leverage"] if ctx["leverage"] > 0 else margin_needed
             if margin_needed > max_margin_for_notional:
                 margin_needed = max_margin_for_notional
+
+            initial_leg_margin = _initial_leg_margin(ctx=ctx, signal=signal, margin_budget=margin_needed)
+            if initial_leg_margin > available_cash:
+                skipped_signals.append(_skip_record(
+                    asset=asset, signal=signal, reason="insufficient_free_margin",
+                    account_equity=account_equity, isolated_margin=isolated_margin, available_cash=available_cash,
+                    requested_margin=initial_leg_margin,
+                ))
+                continue
 
             # Open position
             position = _open_position(
@@ -386,8 +400,10 @@ def _simulate(
                 margin_budget=margin_needed,
             )
             open_positions[asset] = position
-            used_margin = _used_margin(open_positions)
-            equity_curve.append(_curve_point(ts, equity=equity, used_margin=used_margin))
+            available_cash -= initial_leg_margin
+            isolated_margin = _used_margin(open_positions)
+            account_equity = available_cash + isolated_margin + _unrealized_pnl(open_positions, candles_by_asset, ts)
+            equity_curve.append(_curve_point(ts, account_equity=account_equity, isolated_margin=isolated_margin, available_cash=available_cash))
 
     # Close any remaining open positions at the last available candle
     for asset, position in list(open_positions.items()):
@@ -397,28 +413,35 @@ def _simulate(
             closed = _force_close_position(
                 position=position,
                 candle=last_candle,
-                equity=equity,
             )
             if closed:
-                equity += closed["net_pnl"]
+                available_cash += closed["position_margin"] + closed["net_pnl"]
                 trade_ledger.append(closed["trade"])
-                equity_curve.append(_curve_point(last_candle["timestamp"], equity=equity, used_margin=0.0))
                 open_positions.pop(asset, None)
+                isolated_margin = _used_margin(open_positions)
+                equity_curve.append(_curve_point(last_candle["timestamp"], account_equity=available_cash + isolated_margin, isolated_margin=isolated_margin, available_cash=available_cash))
 
     account = _account_summary(
         initial_capital_usdt=initial_capital_usdt,
-        ending_equity_usdt=equity,
+        ending_equity_usdt=available_cash,
         trades=trade_ledger,
         equity_curve=equity_curve,
     )
+    final_isolated_margin = _used_margin(open_positions)
     summary = {
         "eligible_asset_count": len(asset_contexts),
         "total_signals": sum(len(ctx["signal_inputs"]) for ctx in asset_contexts),
         "executed_positions": len(trade_ledger),
         "skipped_signals": len(skipped_signals),
         "skipped_insufficient_margin": sum(1 for item in skipped_signals if item["skip_reason"] == "insufficient_free_margin"),
+        "skipped_pyramid_margin": sum(1 for item in skipped_signals if item["skip_reason"] == "insufficient_free_margin_pyramid"),
         "skipped_asset_open": sum(1 for item in skipped_signals if item["skip_reason"] == "asset_position_open"),
         "skipped_no_trade": sum(1 for item in skipped_signals if item["skip_reason"] == "no_trade_decision"),
+        "available_cash_usdt": _round_money(available_cash),
+        "isolated_margin_usdt": _round_money(final_isolated_margin),
+        "margin_deficit_candles": 0,
+        "continuous_5m_steps": continuous_5m_steps,
+        "data_gap_candles": data_gap_candles,
     }
     return {
         "account": account,
@@ -434,21 +457,21 @@ def _manage_position(
     position: dict[str, Any],
     candle: dict[str, Any],
     ts: datetime,
-    equity: float,
-    account_equity: float,
-    free_margin: float,
-) -> dict[str, Any] | None:
+    available_cash: float,
+) -> dict[str, Any]:
     ctx = position["ctx"]
     candidate = ctx["candidate"]
     direction = position["direction"]
     policy = _candidate_policy_for_direction(candidate, direction)
     fee_rate = ctx["fees_bps_per_side"] / 10_000
     slippage_rate = ctx["slippage_bps_per_side"] / 10_000
+    result: dict[str, Any] = {"closed": None, "margin_consumed": 0.0, "pyramid_skips": []}
 
     # Check hard exit
     cutoff = position["signal_ts"] + timedelta(hours=policy["max_hold_hours"])
     if ts >= cutoff:
-        return _close_position(position=position, exit_price=candle["close"], exit_ts=ts, equity=equity, exit_status="HARD_EXIT")
+        result["closed"] = _close_position(position=position, exit_price=candle["close"], exit_ts=ts, exit_status="HARD_EXIT")
+        return result
 
     # Check pyramid entry
     max_legs = int((policy.get("pyramid") or {}).get("max_legs", 1))
@@ -462,10 +485,17 @@ def _manage_position(
         next_entry = _next_entry(last_entry, step_pct=step_pct, direction=direction)
         if _entry_hit(candle, next_entry, direction=direction):
             per_leg_margin = position["margin_budget"] / max_legs
-            # Gap 3: Check if free margin is available for this pyramid leg
-            if per_leg_margin > free_margin:
-                # Not enough free margin — skip this pyramid leg
-                pass
+            remaining_cash = available_cash - result["margin_consumed"]
+            if per_leg_margin > remaining_cash:
+                result["pyramid_skips"].append(_skip_record(
+                    asset=position["asset"],
+                    signal=position["signal"],
+                    reason="insufficient_free_margin_pyramid",
+                    account_equity=remaining_cash + _position_margin(position),
+                    isolated_margin=_position_margin(position),
+                    available_cash=remaining_cash,
+                    requested_margin=per_leg_margin,
+                ))
             else:
                 leg = _open_leg(
                     leg_number=len(position["legs"]) + 1,
@@ -479,6 +509,7 @@ def _manage_position(
                     slippage_rate=slippage_rate,
                 )
                 position["legs"].append(leg)
+                result["margin_consumed"] += per_leg_margin
                 if sl_breakeven:
                     position["sl_price"] = sum(leg["entry_price"] for leg in position["legs"]) / len(position["legs"])
                     position["active_sl_kind"] = "breakeven"
@@ -505,9 +536,8 @@ def _manage_position(
         tp_hit, sl_hit = _tp_sl_hit(candle, tp=leg["tp_price"], sl=sl_price, direction=direction)
         if not tp_hit and not sl_hit:
             continue
-        # Gap 4: When both TP and SL hit in the same candle, assume SL first (conservative)
         if tp_hit and sl_hit:
-            exit_status = "SL"
+            exit_status = _resolve_dual_hit(candle, direction=direction)
         elif tp_hit:
             exit_status = "TP"
         else:
@@ -523,9 +553,10 @@ def _manage_position(
     active_legs = [leg for leg in position["legs"] if not leg.get("exit_status")]
     if not active_legs:
         # All legs closed — close the position
-        return _close_position(position=position, exit_price=closed_legs[-1][2], exit_ts=ts, equity=equity, exit_status=_resolve_exit_status(position["legs"]))
+        result["closed"] = _close_position(position=position, exit_price=closed_legs[-1][2], exit_ts=ts, exit_status=_resolve_exit_status(position["legs"]))
+        return result
 
-    return None
+    return result
 
 
 def _open_position(
@@ -540,8 +571,7 @@ def _open_position(
     candidate = ctx["candidate"]
     direction = signal["direction"]
     policy = _candidate_policy_for_direction(candidate, direction)
-    # Gap 2: Use candle open as entry price (realistic execution after signal fires)
-    entry_price = float(candle["open"])
+    entry_price = float(signal["reference_price"])
     max_legs = int((policy.get("pyramid") or {}).get("max_legs", 1))
     max_legs = max(1, max_legs)
     per_leg_margin = margin_budget / max_legs
@@ -577,6 +607,7 @@ def _open_position(
         "signal_ts": signal["signal_ts"],
         "position_id": position_id,
         "margin_budget": margin_budget,
+        "entry_account_equity": equity,
         "leverage": ctx["leverage"],
         "legs": [leg],
         "sl_price": sl_price,
@@ -595,7 +626,6 @@ def _close_position(
     position: dict[str, Any],
     exit_price: float,
     exit_ts: datetime,
-    equity: float,
     exit_status: str,
 ) -> dict[str, Any]:
     ctx = position["ctx"]
@@ -613,8 +643,10 @@ def _close_position(
     net_pnl = sum(float(leg.get("net_pnl_usdt") or 0) for leg in legs)
     entry_fees = sum(float(leg.get("entry_fee_usdt") or 0) for leg in legs)
     exit_fees = sum(float(leg.get("exit_fee_usdt") or 0) for leg in legs)
+    slippage = sum(float(leg.get("entry_slippage_usdt") or 0) + float(leg.get("exit_slippage_usdt") or 0) for leg in legs)
     position_margin = sum(float(leg.get("margin_usdt") or 0) for leg in legs)
     position_notional = sum(float(leg.get("entry_notional_usdt") or 0) for leg in legs)
+    equity = float(position.get("entry_account_equity") or position_margin)
     equity_after = equity + net_pnl
     signal = position["signal"]
     policy = position["policy"]
@@ -652,6 +684,7 @@ def _close_position(
         "total_fees_usdt": _round_money(entry_fees + exit_fees),
         "total_entry_fees_usdt": _round_money(entry_fees),
         "total_exit_fees_usdt": _round_money(exit_fees),
+        "total_slippage_usdt": _round_money(slippage),
         "equity_before": _round_money(equity),
         "equity_after": _round_money(equity_after),
         "net_pnl_pct": round(net_pnl / equity * 100, 8) if equity else 0.0,
@@ -661,14 +694,13 @@ def _close_position(
         "portfolio_entry_equity_usdt": _round_money(equity),
         "portfolio_margin_allocation_pct": ctx["margin_allocation_pct"],
     }
-    return {"trade": trade, "net_pnl": net_pnl}
+    return {"trade": trade, "net_pnl": net_pnl, "position_margin": position_margin}
 
 
 def _force_close_position(
     *,
     position: dict[str, Any],
     candle: dict[str, Any],
-    equity: float,
 ) -> dict[str, Any] | None:
     open_legs = [leg for leg in position["legs"] if not leg.get("exit_status")]
     if not open_legs:
@@ -677,7 +709,6 @@ def _force_close_position(
         position=position,
         exit_price=candle["close"],
         exit_ts=candle["timestamp"],
-        equity=equity,
         exit_status="HARD_EXIT",
     )
 
@@ -698,20 +729,19 @@ def _open_leg(
     fee_rate: float,
     slippage_rate: float,
 ) -> dict[str, Any]:
-    # Gap 5: Apply slippage to entry fill price (not as a separate cost)
-    effective_entry = entry_price * (1 + slippage_rate) if direction == "LONG" else entry_price * (1 - slippage_rate)
     entry_notional = margin_usdt * leverage
-    quantity = entry_notional / effective_entry
+    quantity = entry_notional / entry_price
     return {
         "leg": leg_number,
-        "entry_price": effective_entry,
+        "entry_price": entry_price,
         "raw_entry_price": entry_price,
         "entry_ts": _to_iso(entry_ts),
-        "tp_price": _target_price(effective_entry, tp_pct=tp_pct, direction=direction),
+        "tp_price": _target_price(entry_price, tp_pct=tp_pct, direction=direction),
         "margin_usdt": margin_usdt,
         "entry_notional_usdt": entry_notional,
         "quantity": quantity,
         "entry_fee_usdt": entry_notional * fee_rate,
+        "entry_slippage_usdt": entry_notional * slippage_rate,
     }
 
 
@@ -725,20 +755,19 @@ def _close_leg(
     fee_rate: float,
     slippage_rate: float,
 ) -> None:
-    # Gap 5: Apply slippage to exit fill price (not as a separate cost)
-    effective_exit = exit_price * (1 - slippage_rate) if direction == "LONG" else exit_price * (1 + slippage_rate)
-    exit_notional = leg["quantity"] * effective_exit
-    gross_pnl = (effective_exit - leg["entry_price"]) * leg["quantity"] if direction == "LONG" else (leg["entry_price"] - effective_exit) * leg["quantity"]
+    exit_notional = leg["quantity"] * exit_price
+    gross_pnl = (exit_price - leg["entry_price"]) * leg["quantity"] if direction == "LONG" else (leg["entry_price"] - exit_price) * leg["quantity"]
     leg.update({
         "exit_status": exit_status,
-        "exit_price": effective_exit,
+        "exit_price": exit_price,
         "raw_exit_price": exit_price,
         "exit_ts": _to_iso(exit_ts),
         "exit_notional_usdt": exit_notional,
         "exit_fee_usdt": exit_notional * fee_rate,
+        "exit_slippage_usdt": exit_notional * slippage_rate,
         "gross_pnl_usdt": gross_pnl,
-        "net_pnl_usdt": gross_pnl - leg["entry_fee_usdt"] - exit_notional * fee_rate,
-        "move_pct": _direction_move_pct(direction, leg["entry_price"], effective_exit),
+        "net_pnl_usdt": gross_pnl - leg["entry_fee_usdt"] - exit_notional * fee_rate - leg["entry_slippage_usdt"] - exit_notional * slippage_rate,
+        "move_pct": _direction_move_pct(direction, leg["entry_price"], exit_price),
     })
 
 
@@ -804,27 +833,51 @@ def _max_position_notional(asset: str, leverage: float) -> float:
 
 
 def _used_margin(open_positions: dict[str, dict[str, Any]], *, exclude: str | None = None) -> float:
-    """Total margin reserved by open positions.
-
-    Counts the full margin_budget for each open position (not just filled legs),
-    so future pyramid legs don't make phantom free margin available.
-    """
+    """Total isolated margin reserved by currently filled open legs."""
     total = 0.0
     for asset, position in open_positions.items():
         if asset == exclude:
             continue
-        total += float(position.get("margin_budget") or 0)
+        total += _position_margin(position)
     return total
+
+
+def _position_margin(position: dict[str, Any]) -> float:
+    return sum(float(leg.get("margin_usdt") or 0) for leg in position.get("legs", []) if not leg.get("exit_status"))
+
+
+def _initial_leg_margin(*, ctx: dict[str, Any], signal: dict[str, Any], margin_budget: float) -> float:
+    policy = _candidate_policy_for_direction(ctx["candidate"], signal["direction"])
+    max_legs = int((policy.get("pyramid") or {}).get("max_legs", 1))
+    max_legs = max(1, max_legs)
+    return margin_budget / max_legs
+
+
+def _continuous_5m_timeline(timestamps: list[datetime]) -> list[datetime]:
+    if not timestamps:
+        return []
+    start = timestamps[0]
+    end = timestamps[-1]
+    timeline: list[datetime] = []
+    current = start
+    while current <= end:
+        timeline.append(current)
+        current += timedelta(minutes=5)
+    return timeline
 
 
 def _unrealized_pnl(
     open_positions: dict[str, dict[str, Any]],
     candles_by_asset: dict[str, dict[datetime, dict[str, Any]]],
     ts: datetime,
+    *,
+    exclude: str | None = None,
 ) -> float:
     """Sum of unrealized PnL across all open positions at the given timestamp."""
     total = 0.0
     for asset, position in open_positions.items():
+        if asset == exclude:
+            continue
         candle = candles_by_asset.get(asset, {}).get(ts)
         if candle is None:
             continue
@@ -847,8 +900,9 @@ def _skip_record(
     asset: str,
     signal: dict[str, Any],
     reason: str,
-    equity: float,
-    used_margin: float,
+    account_equity: float,
+    isolated_margin: float,
+    available_cash: float,
     requested_margin: float | None = None,
 ) -> dict[str, Any]:
     return {
@@ -857,9 +911,11 @@ def _skip_record(
         "signal_ts": _to_iso(signal["signal_ts"]),
         "skip_reason": reason,
         "requested_margin_usdt": _round_money(requested_margin) if requested_margin is not None else None,
-        "used_margin_usdt": _round_money(used_margin),
-        "free_margin_usdt": _round_money(equity - used_margin),
-        "equity_usdt": _round_money(equity),
+        "used_margin_usdt": _round_money(isolated_margin),
+        "isolated_margin_usdt": _round_money(isolated_margin),
+        "available_cash_usdt": _round_money(available_cash),
+        "free_margin_usdt": _round_money(available_cash),
+        "equity_usdt": _round_money(account_equity),
     }
 
 
@@ -952,12 +1008,14 @@ def _account_summary(
     }
 
 
-def _curve_point(timestamp: datetime | None, *, equity: float, used_margin: float) -> dict[str, Any]:
+def _curve_point(timestamp: datetime | None, *, account_equity: float, isolated_margin: float, available_cash: float) -> dict[str, Any]:
     return {
         "timestamp": _to_iso(timestamp) if timestamp else None,
-        "equity_usdt": _round_money(equity),
-        "used_margin_usdt": _round_money(used_margin),
-        "free_margin_usdt": _round_money(equity - used_margin),
+        "equity_usdt": _round_money(account_equity),
+        "used_margin_usdt": _round_money(isolated_margin),
+        "isolated_margin_usdt": _round_money(isolated_margin),
+        "available_cash_usdt": _round_money(available_cash),
+        "free_margin_usdt": _round_money(available_cash),
     }
 
 
@@ -1102,9 +1160,14 @@ def _render_summary(payload: dict[str, Any]) -> str:
             f"Mode: `candle_by_candle`",
             f"Ending equity: `${account['ending_equity_usdt']:.4f}`",
             f"Net PnL: `${account['net_pnl_usdt']:.4f}`",
+            f"Available cash: `${summary.get('available_cash_usdt', 0):.4f}`",
+            f"Isolated margin: `${summary.get('isolated_margin_usdt', 0):.4f}`",
+            f"Continuous 5m steps: `{summary.get('continuous_5m_steps', 0)}`",
+            f"Data gap candles: `{summary.get('data_gap_candles', 0)}`",
             f"Executed positions: `{summary['executed_positions']}`",
             f"Skipped signals: `{summary['skipped_signals']}`",
             f"Insufficient margin skips: `{summary['skipped_insufficient_margin']}`",
+            f"Pyramid margin skips: `{summary.get('skipped_pyramid_margin', 0)}`",
             f"Same-asset skips: `{summary['skipped_asset_open']}`",
             "",
         ]
