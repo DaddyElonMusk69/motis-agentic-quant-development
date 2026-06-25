@@ -129,6 +129,8 @@ def _load_asset_contexts(
         if not asset:
             continue
         margin_pct = float(margin_allocations_pct.get(asset, 30.0))
+        if margin_pct <= 0:
+            continue
 
         # Load Stage 4 setup
         candidates_payload = json.loads(candidates_path.read_text()) if candidates_path.is_file() else {"candidates": []}

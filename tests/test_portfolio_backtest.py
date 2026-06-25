@@ -264,6 +264,49 @@ def test_portfolio_backtest_does_not_reduce_isolated_cash_by_unrealized_losses(t
     assert result["summary"]["skipped_insufficient_margin"] == 0
 
 
+def test_portfolio_backtest_ignores_zero_percent_allocations(tmp_path: Path, monkeypatch):
+    pool_id = "pool-zero-allocation"
+    aave_root = _write_stage4_artifacts(
+        tmp_path,
+        asset="AAVE",
+        session_id="stage1-aave",
+        candidate_id="candidate-aave",
+        signal_records=[{"signal_id": "sig-aave-1", "decision_direction": "LONG", "agreement": "MATCH"}],
+    )
+    sol_root = _write_stage4_artifacts(
+        tmp_path,
+        asset="SOL",
+        session_id="stage1-sol",
+        candidate_id="candidate-sol",
+        signal_records=[{"signal_id": "sig-sol-1", "decision_direction": "LONG", "agreement": "MATCH"}],
+    )
+    candles = _make_candles("2026-05-01T00:00:00Z", 200, base_price=100.0, trend=0.1)
+    signals = {
+        "sigset-aave": [_make_signal("sig-aave-1", "2026-05-01T00:00:00Z", "LONG", 100.0)],
+        "sigset-sol": [_make_signal("sig-sol-1", "2026-05-01T00:00:00Z", "LONG", 100.0)],
+    }
+
+    monkeypatch.setattr(
+        "quant_terminal_worker.stage4.portfolio_backtest.MarketDataReader",
+        lambda **kw: MockMarketDataReader({"AAVE": candles, "SOL": candles}),
+    )
+
+    result = run_portfolio_backtest(
+        workspace_root=tmp_path,
+        universe_run={"universe_run_id": pool_id},
+        candidates=[_candidate(pool_id, "candidate-aave", "AAVE"), _candidate(pool_id, "candidate-sol", "SOL")],
+        sessions=[_session(pool_id, "candidate-aave", "AAVE", aave_root), _session(pool_id, "candidate-sol", "SOL", sol_root)],
+        initial_capital_usdt=1000,
+        margin_allocations_pct={"AAVE": 0, "SOL": 30},
+        repository=MockRepository(signals),
+    )
+
+    assert result["summary"]["eligible_asset_count"] == 1
+    assert result["summary"]["total_signals"] == 1
+    assert {trade["asset"] for trade in result["trade_ledger"]} == {"SOL"}
+    assert all(item["asset"] != "AAVE" for item in result["skipped_signals"])
+
+
 def test_portfolio_backtest_consumes_pyramid_margin_dynamically(tmp_path: Path, monkeypatch):
     pool_id = "pool-pyramid"
     aave_root = _write_stage4_artifacts(
