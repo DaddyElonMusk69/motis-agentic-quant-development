@@ -23,6 +23,7 @@ from quant_terminal_worker.stage3.grid_search import run_stage3_local_variants
 from quant_terminal_worker.stage3.pyramid import run_stage3_pyramid
 from quant_terminal_worker.stage4.portfolio_backtest import run_portfolio_backtest
 from quant_terminal_worker.stage4.realized_expectancy import run_stage4_realized_expectancy
+from quant_terminal_worker.stage4.timing import run_stage4b_timing_replay
 
 
 def execute_job(
@@ -45,6 +46,7 @@ def execute_job(
         "stage3_policy_step": _execute_stage3_policy_step,
         "stage3_pyramid": _execute_stage3_pyramid,
         "stage4_realized_expectancy": _execute_stage4_realized_expectancy,
+        "stage4b_timing_replay": _execute_stage4b_timing_replay,
         "portfolio_backtest": _execute_portfolio_backtest,
     }
     handler = handlers.get(job["job_type"])
@@ -425,6 +427,26 @@ def _execute_stage4_realized_expectancy(
         leverage=float(payload["leverage"]),
     )
     return {"stage4_realized_expectancy": result, "session_id": session["session_id"]}
+
+
+def _execute_stage4b_timing_replay(
+    *,
+    repository: Any,
+    job: dict[str, Any],
+    workspace_root: Path,
+    market_data_repository: Any | None = None,
+) -> dict[str, Any]:
+    del market_data_repository
+    payload = job.get("payload") or {}
+    session = _stage1_session(repository, str(payload["session_id"]))
+    repository.heartbeat_job(job["job_id"], current_step="stage4b_timing_replay")
+    result = run_stage4b_timing_replay(
+        workspace_root=workspace_root,
+        session=session,
+        signal_rows=_flatten_signal_roles(_stage1_full_cycle_signals(repository, session)),
+        candles=_stage2_raw_candles(repository, session, workspace_root=workspace_root),
+    )
+    return {"stage4b_timing": result, "session_id": session["session_id"]}
 
 
 def _execute_portfolio_backtest(

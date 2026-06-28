@@ -23,6 +23,10 @@ from quant_terminal_worker.stage4.realized_expectancy import (
 )
 
 
+PROMOTION_SOURCE_STAGE4A = "stage4_realized_expectancy"
+PROMOTION_SOURCE_STAGE4B = "stage4b_timing"
+
+
 def run_portfolio_backtest(
     *,
     workspace_root: Path,
@@ -62,6 +66,14 @@ def run_portfolio_backtest(
             "asset": ctx["asset"],
             "session_id": ctx["session_id"],
             "stage4_candidate_id": ctx["stage4_candidate_id"],
+            "promotion_source": ctx.get("promotion_source"),
+            "promotion_source_label": ctx.get("promotion_source_label"),
+            "promotion_selection_criterion": ctx.get("promotion_selection_criterion"),
+            "promotion_warning": ctx.get("promotion_warning"),
+            "walk_forward_net_pnl_pct": ctx.get("walk_forward_net_pnl_pct"),
+            "walk_forward_profit_factor": ctx.get("walk_forward_profit_factor"),
+            "overall_net_pnl_usdt": ctx.get("overall_net_pnl_usdt"),
+            "timing_skips": ctx.get("timing_skips"),
             "margin_allocation_pct": ctx["margin_allocation_pct"],
             "leverage": ctx["leverage"],
             "signal_count": len(ctx["signal_inputs"]),
@@ -117,14 +129,13 @@ def _load_asset_contexts(
         if session.get("source_candidate_id") not in accepted_candidate_ids:
             continue
         artifact_root = _resolve_path(workspace_root, session["artifact_root"])
-        realized_path = artifact_root / "promotion" / "stage4_realized_expectancy.json"
-        candidates_path = artifact_root / "promotion" / "stage4_candidates.json"
+        promotion_root = artifact_root / "promotion"
+        realized_path = promotion_root / "stage4_realized_expectancy.json"
         scores_path = artifact_root / "promotion" / "stage1a_canonical_full_cycle_scores.json"
         if not realized_path.is_file() or not scores_path.is_file():
             continue
         realized = json.loads(realized_path.read_text())
         scores = json.loads(scores_path.read_text())
-        best_candidate_id = str(realized.get("best_candidate_id") or (realized.get("best_candidate") or {}).get("candidate_id"))
         asset = str(session.get("asset") or realized.get("asset") or "").upper()
         if not asset:
             continue
@@ -132,19 +143,19 @@ def _load_asset_contexts(
         if margin_pct <= 0:
             continue
 
-        # Load Stage 4 setup
-        candidates_payload = json.loads(candidates_path.read_text()) if candidates_path.is_file() else {"candidates": []}
-        normalized = _normalize_candidates(candidates_payload)
-        best_candidate = next((c for c in normalized if c["candidate_id"] == best_candidate_id), None)
-        if best_candidate is None:
+        selection = _resolve_portfolio_promotion_candidate(promotion_root=promotion_root, scores=scores)
+        if selection is None:
             continue
+        best_candidate_id = selection["candidate_id"]
+        best_candidate = selection["candidate"]
+        selected_scores = selection["scores"]
 
         # Leverage and cost assumptions live in the realized expectancy file,
         # not in stage4_candidates.json. Override the normalized default.
-        realized_best = realized.get("best_candidate") or {}
-        realized_setup = realized_best.get("setup") or {}
-        if realized_setup.get("leverage") is not None:
-            best_candidate["leverage"] = float(realized_setup["leverage"])
+        selected_best = selection.get("best") or {}
+        selected_setup = selected_best.get("setup") or {}
+        if selected_setup.get("leverage") is not None:
+            best_candidate["leverage"] = float(selected_setup["leverage"])
 
         cost = realized.get("cost_assumptions", {})
         fees_bps = float(cost.get("fees_bps_per_side", 5.0))
@@ -153,7 +164,8 @@ def _load_asset_contexts(
         # Load signals
         signal_inputs = _load_signal_inputs(
             session=session,
-            scores=scores,
+            scores=selected_scores,
+            timing_overlay=selection.get("overlay"),
             repository=repository,
         )
 
@@ -176,6 +188,14 @@ def _load_asset_contexts(
             "source_candidate_id": session.get("source_candidate_id"),
             "stage4_run_id": realized.get("run_id"),
             "stage4_candidate_id": best_candidate_id,
+            "promotion_source": selection["source"],
+            "promotion_source_label": selection["label"],
+            "promotion_selection_criterion": selection["criterion"],
+            "promotion_warning": selection.get("warning"),
+            "walk_forward_net_pnl_pct": _walk_forward_net_pnl_pct(selected_best),
+            "walk_forward_profit_factor": _walk_forward_profit_factor(selected_best),
+            "overall_net_pnl_usdt": _overall_net_pnl_usdt(selected_best),
+            "timing_skips": selected_best.get("skipped_timing_filter"),
             "candidate": best_candidate,
             "leverage": leverage,
             "margin_allocation_pct": margin_pct,
@@ -188,10 +208,125 @@ def _load_asset_contexts(
     return sorted(contexts, key=lambda item: item["asset"])
 
 
+def _resolve_portfolio_promotion_candidate(*, promotion_root: Path, scores: dict[str, Any]) -> dict[str, Any] | None:
+    stage4a = _stage4a_portfolio_candidate(promotion_root=promotion_root, scores=scores)
+    if stage4a is None:
+        return None
+    stage4b = _stage4b_portfolio_candidate(
+        promotion_root=promotion_root,
+        scores=scores,
+        latest_stage4a_run_id=str(stage4a["result"].get("run_id") or ""),
+    )
+    candidates = [stage4a]
+    if stage4b is not None:
+        candidates.append(stage4b)
+    eligible = [candidate for candidate in candidates if _walk_forward_net_pnl_pct(candidate["best"]) > 0]
+    if eligible:
+        return max(eligible, key=_promotion_rank_key)
+    best = max(candidates, key=lambda candidate: (_overall_net_pnl_usdt(candidate["best"]), candidate["source"] == PROMOTION_SOURCE_STAGE4A))
+    return {**best, "criterion": "overall_net_pnl_fallback", "warning": "weak_walk_forward_fallback"}
+
+
+def _stage4a_portfolio_candidate(*, promotion_root: Path, scores: dict[str, Any]) -> dict[str, Any] | None:
+    realized_path = promotion_root / "stage4_realized_expectancy.json"
+    candidates_path = promotion_root / "stage4_candidates.json"
+    if not realized_path.is_file():
+        return None
+    realized = json.loads(realized_path.read_text())
+    best = realized.get("best_candidate") or {}
+    candidate_id = str(realized.get("best_candidate_id") or best.get("candidate_id") or "")
+    if not candidate_id:
+        return None
+    candidate = _candidate_setup_for_id(candidates_path=candidates_path, candidate_id=candidate_id)
+    if candidate is None:
+        return None
+    return {
+        "source": PROMOTION_SOURCE_STAGE4A,
+        "label": "Stage 4A",
+        "criterion": "walk_forward_net_pnl_pct",
+        "result": realized,
+        "best": best,
+        "candidate_id": candidate_id,
+        "candidate": candidate,
+        "scores": scores,
+        "overlay": None,
+    }
+
+
+def _stage4b_portfolio_candidate(*, promotion_root: Path, scores: dict[str, Any], latest_stage4a_run_id: str) -> dict[str, Any] | None:
+    timing_root = promotion_root / "stage4b_timing"
+    replay_path = timing_root / "timing_replay.json"
+    overlay_path = timing_root / "timing_overlay.json"
+    candidates_path = promotion_root / "stage4_candidates.json"
+    if not replay_path.is_file() or not overlay_path.is_file():
+        return None
+    replay = json.loads(replay_path.read_text())
+    overlay = json.loads(overlay_path.read_text())
+    if str(overlay.get("source_stage4_run_id") or "") != latest_stage4a_run_id:
+        return None
+    best = replay.get("best_candidate") or {}
+    candidate_id = str(replay.get("best_candidate_id") or best.get("candidate_id") or "")
+    if not candidate_id:
+        return None
+    candidate = _candidate_setup_for_id(candidates_path=candidates_path, candidate_id=candidate_id)
+    if candidate is None:
+        return None
+    return {
+        "source": PROMOTION_SOURCE_STAGE4B,
+        "label": "Stage 4B Timing",
+        "criterion": "walk_forward_net_pnl_pct",
+        "result": replay,
+        "best": best,
+        "candidate_id": candidate_id,
+        "candidate": candidate,
+        "scores": scores,
+        "overlay": overlay,
+    }
+
+
+def _candidate_setup_for_id(*, candidates_path: Path, candidate_id: str) -> dict[str, Any] | None:
+    candidates_payload = json.loads(candidates_path.read_text()) if candidates_path.is_file() else {"candidates": []}
+    normalized = _normalize_candidates(candidates_payload)
+    return next((candidate for candidate in normalized if candidate["candidate_id"] == candidate_id), None)
+
+
+def _promotion_rank_key(candidate: dict[str, Any]) -> tuple[float, float, float, bool]:
+    best = candidate["best"]
+    return (
+        _walk_forward_net_pnl_pct(best),
+        _walk_forward_profit_factor(best),
+        _overall_net_pnl_usdt(best),
+        candidate["source"] == PROMOTION_SOURCE_STAGE4A,
+    )
+
+
+def _walk_forward_net_pnl_pct(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("net_pnl_pct"), 0.0)
+
+
+def _walk_forward_profit_factor(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("profit_factor"), 0.0)
+
+
+def _overall_net_pnl_usdt(best: dict[str, Any]) -> float:
+    account = best.get("account") or {}
+    return _float_or_default(account.get("net_pnl_usdt"), 0.0)
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _load_signal_inputs(
     *,
     session: dict[str, Any],
     scores: dict[str, Any],
+    timing_overlay: dict[str, Any] | None = None,
     repository: Any,
 ) -> list[dict[str, Any]]:
     records = scores.get("records", [])
@@ -222,15 +357,31 @@ def _load_signal_inputs(
         signal_ts = _coerce_datetime(packet.get("timestamp") or signal["timestamp"])
         reference_price = get_reference_price(packet)
         direction = str(record.get("decision_direction") or record.get("agent_direction") or "").upper()
+        skip_reason = record.get("stage4b_skip_reason")
+        if _timing_overlay_matches(signal_ts=signal_ts, direction=direction, overlay=timing_overlay):
+            direction = "SKIP"
+            skip_reason = "timing_filter"
         inputs.append({
             "signal_id": signal_id,
             "signal_ts": signal_ts,
             "reference_price": float(reference_price),
             "direction": direction,
             "agreement": record.get("agreement"),
+            "skip_reason": skip_reason,
         })
     inputs.sort(key=lambda item: (item["signal_ts"], item["signal_id"]))
     return inputs
+
+
+def _timing_overlay_matches(*, signal_ts: datetime, direction: str, overlay: dict[str, Any] | None) -> bool:
+    if not overlay or direction not in {"LONG", "SHORT"}:
+        return False
+    hours = set(int(hour) for hour in overlay.get("exclude_utc_hours") or [])
+    weekdays = set(int(day) for day in overlay.get("exclude_utc_weekdays") or [])
+    applies_to = str(overlay.get("applies_to") or "all").upper()
+    skip_for_time = signal_ts.hour in hours and (not weekdays or signal_ts.weekday() in weekdays)
+    skip_for_side = applies_to in {"ALL", "all"} or applies_to == direction
+    return skip_for_time and skip_for_side
 
 
 def _load_candles(
@@ -370,7 +521,7 @@ def _simulate(
 
             if signal["direction"] not in {"LONG", "SHORT"}:
                 skipped_signals.append(_skip_record(
-                    asset=asset, signal=signal, reason="no_trade_decision",
+                    asset=asset, signal=signal, reason=str(signal.get("skip_reason") or "no_trade_decision"),
                     account_equity=account_equity, isolated_margin=isolated_margin, available_cash=available_cash,
                 ))
                 continue
@@ -439,6 +590,7 @@ def _simulate(
         "skipped_pyramid_margin": sum(1 for item in skipped_signals if item["skip_reason"] == "insufficient_free_margin_pyramid"),
         "skipped_asset_open": sum(1 for item in skipped_signals if item["skip_reason"] == "asset_position_open"),
         "skipped_no_trade": sum(1 for item in skipped_signals if item["skip_reason"] == "no_trade_decision"),
+        "skipped_timing_filter": sum(1 for item in skipped_signals if item["skip_reason"] == "timing_filter"),
         "available_cash_usdt": _round_money(available_cash),
         "isolated_margin_usdt": _round_money(final_isolated_margin),
         "margin_deficit_candles": 0,

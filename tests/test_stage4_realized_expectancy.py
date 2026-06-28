@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 
 from quant_terminal_worker.stage4.realized_expectancy import run_stage4_realized_expectancy
+from quant_terminal_worker.stage4.timing import generate_stage4b_timing_prompt
+from quant_terminal_worker.stage4.timing import run_stage4b_timing_replay
 
 
 def test_run_stage4_realized_expectancy_scores_full_decision_set(tmp_path: Path):
@@ -461,6 +463,161 @@ def test_stage4_backtest_keeps_run_history_and_updates_latest_compatibility_file
     assert latest["run_id"] == second["run_id"]
     assert latest["source_run_path"].endswith(f"stage4_runs/{second['run_id']}/stage4_realized_expectancy.json")
     assert optimal["run_id"] == second["run_id"]
+
+
+def test_stage4b_timing_replay_requires_stage4a_baseline(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+
+    try:
+        run_stage4b_timing_replay(
+            workspace_root=tmp_path,
+            session=session,
+            signal_rows=[_signal("sig-1", "2026-05-01T00:00:00Z", 100)],
+            candles=[{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101, "low": 99, "close": 100}],
+        )
+    except ValueError as exc:
+        assert "Stage 4B requires completed Stage 4A" in str(exc)
+    else:
+        raise AssertionError("Stage 4B replay should require Stage 4A baseline artifacts")
+
+
+def test_stage4b_timing_overlay_skips_matching_utc_hour_and_preserves_stage4a(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[
+            _record("sig-1", "LONG"),
+            _record("sig-2", "LONG"),
+        ],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    signals = [
+        _signal("sig-1", "2026-05-01T00:00:00Z", 100),
+        _signal("sig-2", "2026-05-01T01:00:00Z", 100),
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101},
+        {"timestamp": "2026-05-01T01:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101},
+    ]
+    stage4a = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+    promotion_root = artifact_root / "promotion"
+    timing_root = promotion_root / "stage4b_timing"
+    timing_root.mkdir(parents=True)
+    (timing_root / "timing_overlay.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage4b_timing_overlay.v1",
+                "source_stage4_run_id": stage4a["run_id"],
+                "exclude_utc_hours": [1],
+                "applies_to": "all",
+                "rationale": "Skip the weak 01 UTC window.",
+            }
+        )
+    )
+
+    result = run_stage4b_timing_replay(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+    )
+
+    assert result["artifact_role"] == "stage4b_timing_replay"
+    assert result["baseline"]["run_id"] == stage4a["run_id"]
+    assert result["best_candidate"]["executed_trades"] == 1
+    assert result["best_candidate"]["skipped_timing_filter"] == 1
+    trades = result["ledger"]["candidates"][0]["trades"]
+    assert trades[0]["entry_status"] == "FILLED"
+    assert trades[1]["entry_status"] == "SKIPPED"
+    assert trades[1]["skip_reason"] == "timing_filter"
+    assert (timing_root / "timing_replay.json").exists()
+    assert (timing_root / "timing_trade_ledger.json").exists()
+    assert (timing_root / "timing_summary.md").exists()
+    assert json.loads((promotion_root / "stage4_realized_expectancy.json").read_text())["run_id"] == stage4a["run_id"]
+
+
+def test_stage4b_timing_overlay_rejects_exact_signal_filters(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    signals = [_signal("sig-1", "2026-05-01T00:00:00Z", 100)]
+    candles = [{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101}]
+    stage4a = run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=signals,
+        candles=candles,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+    timing_root = artifact_root / "promotion" / "stage4b_timing"
+    timing_root.mkdir(parents=True)
+    (timing_root / "timing_overlay.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage4b_timing_overlay.v1",
+                "source_stage4_run_id": stage4a["run_id"],
+                "exclude_utc_hours": [0],
+                "exclude_signal_ids": ["sig-1"],
+                "rationale": "This should be rejected because it targets exact signals.",
+            }
+        )
+    )
+
+    try:
+        run_stage4b_timing_replay(
+            workspace_root=tmp_path,
+            session=session,
+            signal_rows=signals,
+            candles=candles,
+        )
+    except ValueError as exc:
+        assert "exact signal" in str(exc)
+    else:
+        raise AssertionError("Stage 4B overlay should reject exact signal filters")
+
+
+def test_generate_stage4b_timing_prompt_writes_context_after_stage4a(tmp_path: Path):
+    artifact_root = _write_stage4_fixture(
+        tmp_path,
+        records=[_record("sig-1", "LONG")],
+        setup={"tp_pct": 1.0, "sl_pct": 5.0, "max_hold_hours": 1},
+    )
+    session = _session(artifact_root)
+    run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session=session,
+        signal_rows=[_signal("sig-1", "2026-05-01T00:00:00Z", 100)],
+        candles=[{"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101}],
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+
+    prompt = generate_stage4b_timing_prompt(workspace_root=tmp_path, session=session)
+
+    assert prompt["prompt_type"] == "stage4b_timing_optimizer"
+    assert "$stage4b-timing-optimizer" in prompt["prompt"]
+    assert "timing_overlay.json" in prompt["prompt"]
+    assert Path(prompt["prompt_path"]).exists()
+    assert Path(prompt["context_path"]).exists()
 
 
 def _write_stage4_fixture(tmp_path: Path, *, records: list[dict], setup: dict) -> Path:

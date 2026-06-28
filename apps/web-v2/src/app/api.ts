@@ -738,6 +738,7 @@ export type Stage4TradeLedgerRow = {
 
 export type Stage4CandidateDetail = {
   session_id: string;
+  source?: "stage4_realized_expectancy" | "stage4b_timing" | string;
   run_id?: string | null;
   created_at?: string | null;
   trade_count: number;
@@ -761,7 +762,18 @@ export type PortfolioBacktestResult = {
     asset: string;
     session_id: string;
     stage4_candidate_id: string;
+    promotion_source?: "stage4_realized_expectancy" | "stage4b_timing" | string | null;
+    promotion_source_label?: string | null;
+    promotion_selection_criterion?: string | null;
+    promotion_warning?: string | null;
+    walk_forward_net_pnl_pct?: number | null;
+    walk_forward_profit_factor?: number | null;
+    overall_net_pnl_usdt?: number | null;
+    timing_skips?: number | null;
     margin_allocation_pct: number;
+    leverage?: number | null;
+    signal_count?: number | null;
+    candle_count?: number | null;
   }>;
   summary: {
     eligible_asset_count: number;
@@ -771,6 +783,9 @@ export type PortfolioBacktestResult = {
     skipped_insufficient_margin: number;
     skipped_asset_open: number;
     blocked_pyramid_legs: number;
+    skipped_timing_filter?: number;
+    skipped_pyramid_margin?: number;
+    skipped_no_trade?: number;
   };
   account: {
     initial_capital_usdt: number;
@@ -869,6 +884,44 @@ export type Stage4RealizedExpectancyState = {
   candidates: Stage4CandidateResult[];
 };
 
+export type Stage4BTimingState = {
+  exists: boolean;
+  prompt_exists?: boolean;
+  context_exists?: boolean;
+  overlay_exists?: boolean;
+  prompt_path?: string | null;
+  context_path?: string | null;
+  overlay_path?: string | null;
+  timing_replay_path?: string | null;
+  timing_trade_ledger_path?: string | null;
+  summary_path?: string | null;
+  latest_run_id?: string | null;
+  best_candidate_id?: string | null;
+  best_candidate: Partial<Stage4CandidateResult> & {
+    skipped_timing_filter?: number;
+  };
+  candidates: Array<Stage4CandidateResult & {
+    skipped_timing_filter?: number;
+  }>;
+  latest_account?: Stage4CandidateResult["account"];
+  stage4b_runs?: Array<{
+    run_id: string;
+    created_at: string;
+    best_candidate_id?: string;
+    account?: Stage4CandidateResult["account"];
+    overlay?: Record<string, unknown>;
+  }>;
+};
+
+export type Stage4BTimingPrompt = {
+  prompt_type: "stage4b_timing_optimizer" | string;
+  session_id: string;
+  prompt: string;
+  prompt_path: string;
+  context_path: string;
+  overlay_path: string;
+};
+
 export type Stage1GateSummary = {
   session_id: string;
   status: string;
@@ -899,6 +952,19 @@ export type Stage1GateSummary = {
   stage3_grid: Stage3GridState;
   stage3_pyramid: Stage3PyramidState;
   stage4_realized_expectancy: Stage4RealizedExpectancyState;
+  stage4b_timing: Stage4BTimingState;
+  promotion_candidate?: {
+    exists: boolean;
+    source?: "stage4_realized_expectancy" | "stage4b_timing" | string | null;
+    label?: string | null;
+    candidate_id?: string | null;
+    best_candidate?: Partial<Stage4CandidateResult>;
+    walk_forward_net_pnl_pct?: number;
+    walk_forward_profit_factor?: number;
+    overall_net_pnl_usdt?: number;
+    timing_skips?: number;
+    warning?: string | null;
+  };
   downstream_contract: {
     stage2_stage3: string;
     stage4: string;
@@ -1476,8 +1542,21 @@ export function runStage4RealizedExpectancy(request: Stage4RealizedExpectancyReq
   });
 }
 
-export function fetchStage4CandidateDetail(request: { session_id: string; candidate_id: string }): Promise<{ detail: Stage4CandidateDetail }> {
-  return requestJson(`/api/v1/research/stage1-sessions/${request.session_id}/stage4/candidates/${encodeURIComponent(request.candidate_id)}/details`);
+export function generateStage4BTimingPrompt(sessionId: string): Promise<{ stage4b_timing_prompt: Stage4BTimingPrompt; gate: Stage1GateSummary }> {
+  return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage4/timing-prompt`, { method: "POST" });
+}
+
+export function runStage4BTimingReplay(sessionId: string): Promise<{ stage4b_timing: Stage4BTimingState; gate: Stage1GateSummary } | AsyncJobResponse> {
+  return requestJson(`/api/v1/research/stage1-sessions/${sessionId}/stage4/timing-replay`, { method: "POST" });
+}
+
+export function fetchStage4CandidateDetail(request: {
+  session_id: string;
+  candidate_id: string;
+  source?: "stage4_realized_expectancy" | "stage4b_timing" | string;
+}): Promise<{ detail: Stage4CandidateDetail }> {
+  const search = request.source ? `?source=${encodeURIComponent(request.source)}` : "";
+  return requestJson(`/api/v1/research/stage1-sessions/${request.session_id}/stage4/candidates/${encodeURIComponent(request.candidate_id)}/details${search}`);
 }
 
 export function promoteExecutionBundle(sessionId: string): Promise<{ bundle: ExecutionBundle; route: DeploymentRoute }> {

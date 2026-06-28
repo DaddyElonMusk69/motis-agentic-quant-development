@@ -19,6 +19,7 @@ import {
   fetchStage1IterationDetail,
   fetchStage1Iterations,
   fetchStage1ResearchSessions,
+  generateStage4BTimingPrompt,
   generateStage1FailureAudit,
   isJobResponse,
   promoteExecutionBundle,
@@ -30,6 +31,7 @@ import {
   runStage3FixedSl,
   runStage3LocalVariants,
   runStage3Pyramid,
+  runStage4BTimingReplay,
   runStage4RealizedExpectancy,
   scoreStage1Iteration,
   type DevelopmentQueueRow,
@@ -96,6 +98,12 @@ type PortfolioBacktestModalState = {
   result: PortfolioBacktestResult | null;
 };
 
+type Stage4CandidateSelection = {
+  candidate: Stage4CandidateResult;
+  source: "stage4_realized_expectancy" | "stage4b_timing";
+  label: string;
+};
+
 const HEAVY_RESEARCH_QUERY_GC_MS = 30_000;
 
 type ExitSide = "LONG" | "SHORT";
@@ -158,6 +166,9 @@ function restoreDevelopmentJob(job: RuntimeJob): ActiveDevelopmentJob | null {
   }
   if (job.job_type === "stage4_realized_expectancy") {
     return { action: "stage4", jobId: job.job_id, label: "Running Stage 4 backtest", sessionId };
+  }
+  if (job.job_type === "stage4b_timing_replay") {
+    return { action: "stage4b", jobId: job.job_id, label: "Running Stage 4B timing replay", sessionId };
   }
   if (job.job_type === "portfolio_backtest") {
     return { action: "portfolio", jobId: job.job_id, label: "Running portfolio backtest" };
@@ -715,7 +726,7 @@ export function ResearchDevelopmentPage() {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
   const [overrideAction, setOverrideAction] = useState<Stage1OverrideAction | null>(null);
   const [selectedIteration, setSelectedIteration] = useState<Stage1IterationSummary | null>(null);
-  const [selectedStage4Candidate, setSelectedStage4Candidate] = useState<Stage4CandidateResult | null>(null);
+  const [selectedStage4Candidate, setSelectedStage4Candidate] = useState<Stage4CandidateSelection | null>(null);
   const [startChoice, setStartChoice] = useState<Stage1StartChoice | null>(null);
   const [activeJob, setActiveJob] = useState<ActiveDevelopmentJob | null>(null);
   const [portfolioBacktestModal, setPortfolioBacktestModal] = useState<PortfolioBacktestModalState | null>(null);
@@ -763,9 +774,13 @@ export function ResearchDevelopmentPage() {
     gcTime: HEAVY_RESEARCH_QUERY_GC_MS
   });
   const stage4CandidateDetailQuery = useQuery({
-    enabled: Boolean(session?.session_id && selectedStage4Candidate?.candidate_id),
-    queryKey: ["stage4-candidate-detail", session?.session_id, selectedStage4Candidate?.candidate_id],
-    queryFn: () => fetchStage4CandidateDetail({ session_id: session!.session_id, candidate_id: selectedStage4Candidate!.candidate_id }),
+    enabled: Boolean(session?.session_id && selectedStage4Candidate?.candidate.candidate_id),
+    queryKey: ["stage4-candidate-detail", session?.session_id, selectedStage4Candidate?.source, selectedStage4Candidate?.candidate.candidate_id],
+    queryFn: () => fetchStage4CandidateDetail({
+      session_id: session!.session_id,
+      candidate_id: selectedStage4Candidate!.candidate.candidate_id,
+      source: selectedStage4Candidate!.source,
+    }),
     gcTime: HEAVY_RESEARCH_QUERY_GC_MS
   });
   const gate = gateQuery.data?.gate ?? row?.stage1_gate ?? null;
@@ -931,6 +946,28 @@ export function ResearchDevelopmentPage() {
     onSuccess: (result, variables) => {
       if (!trackAsyncJob(result, "stage4", "Running Stage 4 backtest", variables.session_id)) {
         invalidateDevelopment(variables.session_id, pool?.universe_run_id);
+      }
+    }
+  });
+  const stage4BPromptMutation = useMutation({
+    mutationFn: generateStage4BTimingPrompt,
+    onSuccess: (result) => {
+      setCopiedPrompt(false);
+      setPrompt({
+        session_id: result.stage4b_timing_prompt.session_id,
+        iteration_id: "stage4b_timing",
+        prompt_type: result.stage4b_timing_prompt.prompt_type,
+        prompt_path: result.stage4b_timing_prompt.prompt_path,
+        prompt: result.stage4b_timing_prompt.prompt
+      });
+      invalidateDevelopment(result.stage4b_timing_prompt.session_id, pool?.universe_run_id);
+    }
+  });
+  const stage4BMutation = useMutation({
+    mutationFn: runStage4BTimingReplay,
+    onSuccess: (result, sessionId) => {
+      if (!trackAsyncJob(result, "stage4b", "Running Stage 4B timing replay", sessionId)) {
+        invalidateDevelopment(sessionId, pool?.universe_run_id);
       }
     }
   });
@@ -1144,10 +1181,11 @@ export function ResearchDevelopmentPage() {
 
   const closeStage4CandidateDetail = () => {
     const sessionId = session?.session_id;
-    const candidateId = selectedStage4Candidate?.candidate_id;
+    const source = selectedStage4Candidate?.source;
+    const candidateId = selectedStage4Candidate?.candidate.candidate_id;
     setSelectedStage4Candidate(null);
     if (sessionId && candidateId) {
-      void queryClient.removeQueries({ queryKey: ["stage4-candidate-detail", sessionId, candidateId] });
+      void queryClient.removeQueries({ queryKey: ["stage4-candidate-detail", sessionId, source, candidateId] });
     }
   };
 
@@ -1323,7 +1361,7 @@ export function ResearchDevelopmentPage() {
                 className="button button--secondary button--compact portfolio-backtest-entry"
                 disabled={completedStage4Assets.length === 0}
                 onClick={openPortfolioBacktest}
-                title={completedStage4Assets.length ? "Run a pool-level account replay across Stage 4-complete assets" : "Complete Stage 4 for at least one accepted asset first"}
+                title={completedStage4Assets.length ? "Run a pool-level account replay across promotion-eligible assets" : "Complete Stage 4 for at least one accepted asset first"}
                 type="button"
               >
                 <BarChart3 aria-hidden="true" />
@@ -1502,12 +1540,17 @@ export function ResearchDevelopmentPage() {
             {activeStage === "stage4" ? (
               <Stage4Panel
                 gate={gate}
-                onOpenCandidate={setSelectedStage4Candidate}
+                onOpenCandidate={(candidate) => setSelectedStage4Candidate({ candidate, source: "stage4_realized_expectancy", label: "Stage 4A Candidate" })}
+                onOpenStage4BCandidate={(candidate) => setSelectedStage4Candidate({ candidate, source: "stage4b_timing", label: "Stage 4B Timing Candidate" })}
                 onPromote={() => session && promoteMutation.mutate(session.session_id)}
+                onGenerateStage4BPrompt={() => session && stage4BPromptMutation.mutate(session.session_id)}
+                onRunStage4B={() => session && stage4BMutation.mutate(session.session_id)}
                 onRun={runStage4}
                 inputs={stage4Inputs}
                 onInputsChange={setStage4Inputs}
                 promoting={promoteMutation.isPending}
+                stage4BPrompting={stage4BPromptMutation.isPending}
+                stage4BRunning={stage4BMutation.isPending || isJobRunning("stage4b")}
                 running={stage4Mutation.isPending || isJobRunning("stage4")}
               />
             ) : null}
@@ -1623,8 +1666,8 @@ export function ResearchDevelopmentPage() {
           <section className="terminal-modal stage4-candidate-modal" role="dialog" aria-modal="true" aria-labelledby="stage4-candidate-title">
             <header className="terminal-modal__header">
               <div>
-                <span className="eyebrow">Stage 4 Candidate</span>
-                <h2 id="stage4-candidate-title">{selectedStage4Candidate.candidate_id}</h2>
+                <span className="eyebrow">{selectedStage4Candidate.label}</span>
+                <h2 id="stage4-candidate-title">{selectedStage4Candidate.candidate.candidate_id}</h2>
               </div>
               <button className="icon-button" onClick={closeStage4CandidateDetail} type="button" aria-label="Close candidate detail">
                 <X aria-hidden="true" />
@@ -2676,20 +2719,30 @@ function Stage3Panel({
 function Stage4Panel({
   gate,
   onOpenCandidate,
+  onOpenStage4BCandidate,
+  onGenerateStage4BPrompt,
   onPromote,
+  onRunStage4B,
   onRun,
   inputs,
   onInputsChange,
   promoting,
+  stage4BPrompting,
+  stage4BRunning,
   running
 }: {
   gate: Stage1GateSummary | null;
   onOpenCandidate: (candidate: Stage4CandidateResult) => void;
+  onOpenStage4BCandidate: (candidate: Stage4CandidateResult) => void;
+  onGenerateStage4BPrompt: () => void;
   onPromote: () => void;
+  onRunStage4B: () => void;
   onRun: () => void;
   inputs: { initial_capital_usdt: number; margin_allocation_pct: number; leverage: number };
   onInputsChange: (inputs: { initial_capital_usdt: number; margin_allocation_pct: number; leverage: number }) => void;
   promoting: boolean;
+  stage4BPrompting: boolean;
+  stage4BRunning: boolean;
   running: boolean;
 }) {
   const ready = Boolean(gate?.stage3_pyramid.exists);
@@ -2709,6 +2762,12 @@ function Stage4Panel({
   const bestSetup: Stage4CandidateResult["setup"] = best.setup ?? {};
   const exitMode = best.candidate_id ? formatStage4ExitMode(bestSetup) : "n/a";
   const pyramid = bestSetup.pyramid;
+  const stage4b = gate?.stage4b_timing;
+  const stage4bBest = stage4b?.best_candidate ?? {};
+  const stage4bAccount = stage4bBest.account ?? {};
+  const promotionCandidate = gate?.promotion_candidate;
+  const stage4bLocked = !complete;
+  const stage4bReplayDisabled = stage4bLocked || !stage4b?.overlay_exists || inputsDirty || stage4BRunning;
   return (
     <div className="development-stage-body">
       <TerminalPanel
@@ -2800,6 +2859,35 @@ function Stage4Panel({
           </div>
         </div>
         {best.candidate_id ? <Stage4ExitPolicyPanel setup={bestSetup} /> : null}
+        {promotionCandidate?.exists ? (
+          <div className="stage4-result-strip">
+            <div>
+              <span>Promotion Source</span>
+              <strong>{promotionCandidate.label ?? promotionCandidate.source ?? "Stage 4A"}</strong>
+            </div>
+            <div>
+              <span>Promotion Candidate</span>
+              <strong>{promotionCandidate.candidate_id ?? "n/a"}</strong>
+            </div>
+            <div>
+              <span>WF Return</span>
+              <strong>{formatPct(promotionCandidate.walk_forward_net_pnl_pct)}</strong>
+            </div>
+            <div>
+              <span>WF PF</span>
+              <strong>{promotionCandidate.walk_forward_profit_factor != null ? promotionCandidate.walk_forward_profit_factor.toFixed(2) : "-"}</strong>
+            </div>
+            <div>
+              <span>Net PnL</span>
+              <strong>{formatUsd(promotionCandidate.overall_net_pnl_usdt)}</strong>
+            </div>
+            <div>
+              <span>Timing Skips</span>
+              <strong>{formatNumber(promotionCandidate.timing_skips ?? 0)}</strong>
+            </div>
+          </div>
+        ) : null}
+        {promotionCandidate?.warning ? <div className="state-line state-line--warn">Promotion candidate selected by fallback: {promotionCandidate.warning}</div> : null}
         <div className="stage4-footnote-grid">
           <FieldRow label="Input" value="Stage 4 candidates + full canonical decisions" />
           <FieldRow label="Simulator" value="Sequential account backtest" />
@@ -2868,6 +2956,85 @@ function Stage4Panel({
           />
         </TerminalPanel>
       ) : null}
+      <TerminalPanel
+        actions={
+          <>
+            <button className={stage4BPrompting ? "button button--secondary button--loading" : "button button--secondary"} disabled={stage4bLocked || stage4BPrompting} onClick={onGenerateStage4BPrompt} type="button">
+              {stage4BPrompting ? <RefreshCw aria-hidden="true" className="spin-icon" /> : <Clipboard aria-hidden="true" />}
+              {stage4b?.prompt_exists ? "Open Prompt" : "Prompt"}
+            </button>
+            <button className={stage4BRunning ? "button button--primary button--loading" : "button button--primary"} disabled={stage4bReplayDisabled} onClick={onRunStage4B} type="button">
+              {stage4BRunning ? <RefreshCw aria-hidden="true" className="spin-icon" /> : <Play aria-hidden="true" />}
+              Run Timing Replay
+            </button>
+          </>
+        }
+        eyebrow="stage 4b"
+        title="Timing Optimization"
+      >
+        {stage4bLocked ? <div className="state-line">Run Stage 4A before timing optimization.</div> : null}
+        {inputsDirty ? <div className="state-line state-line--warn">Stage 4A setup changed - rerun Stage 4A before Stage 4B.</div> : null}
+        {!stage4bLocked && !stage4b?.overlay_exists ? <div className="state-line">Generate the prompt, write `timing_overlay.json`, then run timing replay.</div> : null}
+        {stage4BRunning ? (
+          <StageRunProgress
+            detail="Applying timing skips, replaying Stage 4 candidates, and writing Stage 4B artifacts"
+            steps={["Load overlay", "Filter decisions", "Replay candidates", "Write comparison"]}
+            title="Running Stage 4B timing replay"
+          />
+        ) : null}
+        <div className="stage4-result-strip">
+          <div>
+            <span>Overlay</span>
+            <strong>{stage4b?.overlay_exists ? "ready" : "missing"}</strong>
+          </div>
+          <div>
+            <span>Best Candidate</span>
+            <strong>{stage4b?.best_candidate_id ?? stage4bBest.candidate_id ?? "n/a"}</strong>
+          </div>
+          <div>
+            <span>Timing Skips</span>
+            <strong>{formatNumber(stage4bBest.skipped_timing_filter)}</strong>
+          </div>
+          <div>
+            <span>Ending Equity</span>
+            <strong>{formatUsd(stage4bAccount.ending_equity_usdt)}</strong>
+          </div>
+          <div>
+            <span>vs 4A Net PnL</span>
+            <strong>{formatUsd((stage4bAccount.net_pnl_usdt ?? 0) - (account.net_pnl_usdt ?? 0))}</strong>
+          </div>
+          <div>
+            <span>Latest Run</span>
+            <strong>{stage4b?.latest_run_id ?? "n/a"}</strong>
+          </div>
+        </div>
+        <div className="stage4-footnote-grid">
+          <FieldRow label="Prompt" value={stage4b?.prompt_exists ? "generated" : "missing"} />
+          <FieldRow label="Overlay path" value={stage4b?.overlay_path ?? "n/a"} />
+          <FieldRow label="Promotion" value="unchanged; Stage 4A remains source" />
+          <FieldRow label="Replay input" value="Stage 4 candidates + timing-filtered canonical decisions" />
+        </div>
+        {stage4b?.exists ? (
+          <DataTable
+            columns={[
+              { key: "id", header: "Candidate", render: (item) => item.candidate_id },
+              { key: "net", header: "Net Exp", align: "right", render: (item) => formatPct(item.net_expectancy_pct) },
+              { key: "oos_exp", header: "OOS Exp", align: "right", render: (item) => {
+                const wf = item.slices?.walk_forward_test;
+                return wf ? formatPct(wf.net_expectancy_pct) : "-";
+              } },
+              { key: "timing", header: "Timing Skips", align: "right", render: (item) => formatNumber(item.skipped_timing_filter) },
+              { key: "trades", header: "Trades", align: "right", render: (item) => formatNumber(item.executed_trades) },
+              { key: "win", header: "Win Rate", align: "right", render: (item) => formatPct(item.win_rate_pct) },
+              { key: "pf", header: "PF", align: "right", render: (item) => item.profit_factor != null ? item.profit_factor.toFixed(2) : "-" },
+              { key: "pnl", header: "Account PnL", align: "right", render: (item) => formatPct(item.net_pnl_pct) }
+            ]}
+            getRowKey={(item) => item.candidate_id}
+            onRowClick={onOpenStage4BCandidate}
+            rows={stage4b.candidates}
+          />
+        ) : null}
+      </TerminalPanel>
     </div>
   );
 }
@@ -3068,8 +3235,30 @@ function PortfolioBacktestModal({
                       <span className="portfolio-summary-strip__label">Asset Skips</span>
                       <strong className="portfolio-summary-strip__value">{formatNumber(result.summary.skipped_asset_open)}</strong>
                     </div>
+                    <div className="portfolio-summary-strip__stat">
+                      <span className="portfolio-summary-strip__label">Timing Skips</span>
+                      <strong className="portfolio-summary-strip__value">{formatNumber(result.summary.skipped_timing_filter ?? 0)}</strong>
+                    </div>
                   </div>
                 </div>
+
+                <TerminalPanel className="scroll-panel" eyebrow="strategy source" title="Selected Portfolio Inputs">
+                  <DataTable
+                    columns={[
+                      { key: "asset", header: "Asset", render: (item) => item.asset },
+                      { key: "source", header: "Source", render: (item) => item.promotion_source_label ?? (item.promotion_source === "stage4b_timing" ? "Stage 4B Timing" : "Stage 4A") },
+                      { key: "candidate", header: "Candidate", render: (item) => item.stage4_candidate_id },
+                      { key: "wf", header: "WF Return", align: "right", render: (item) => formatPct(item.walk_forward_net_pnl_pct) },
+                      { key: "pf", header: "WF PF", align: "right", render: (item) => item.walk_forward_profit_factor != null ? item.walk_forward_profit_factor.toFixed(2) : "-" },
+                      { key: "pnl", header: "Total PnL", align: "right", render: (item) => formatUsd(item.overall_net_pnl_usdt) },
+                      { key: "timing", header: "Timing Skips", align: "right", render: (item) => formatNumber(item.timing_skips ?? 0) },
+                      { key: "margin", header: "Margin", align: "right", render: (item) => formatPct(item.margin_allocation_pct) },
+                      { key: "warning", header: "Warning", render: (item) => item.promotion_warning ?? "" }
+                    ]}
+                    getRowKey={(item) => `${item.asset}-${item.stage4_candidate_id}-${item.promotion_source ?? "stage4a"}`}
+                    rows={result.eligible_assets ?? []}
+                  />
+                </TerminalPanel>
 
                 <div className="stage4-detail-chart-card portfolio-chart-card">
                   <div className="stage4-detail-chart-card__header">
@@ -3147,7 +3336,7 @@ function PortfolioBacktestModal({
         </div>
 
         <footer className="terminal-modal__footer">
-          <span>{result ? `${result.run_id} · ${result.portfolio_backtest_path ?? "saved under pool artifacts"}` : "Stage 4-complete assets only"}</span>
+          <span>{result ? `${result.run_id} · ${result.portfolio_backtest_path ?? "saved under pool artifacts"}` : "Promotion-eligible assets only"}</span>
           <div className="table-action-row">
             <button className="button button--secondary" onClick={onClose} type="button">Close</button>
             <button className="button button--primary" disabled={running || assets.length === 0} onClick={onRun} type="button">

@@ -16,6 +16,7 @@ JOB_QUEUE_BY_TYPE = {
     "stage3_policy_step": "research",
     "stage3_pyramid": "research",
     "stage4_realized_expectancy": "research",
+    "stage4b_timing_replay": "research",
 }
 
 

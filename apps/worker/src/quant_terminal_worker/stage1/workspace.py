@@ -247,15 +247,28 @@ def read_stage1_iteration_detail(*, workspace_root: Path, session: dict[str, Any
     }
 
 
-def read_stage4_candidate_detail(*, workspace_root: Path, session: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+def read_stage4_candidate_detail(
+    *,
+    workspace_root: Path,
+    session: dict[str, Any],
+    candidate_id: str,
+    source: str = "stage4_realized_expectancy",
+) -> dict[str, Any]:
     artifact_root = _artifact_root(workspace_root, session)
     promotion_root = artifact_root / "promotion"
-    realized_path = promotion_root / "stage4_realized_expectancy.json"
-    ledger_path = promotion_root / "stage4_trade_ledger.json"
+    if source == "stage4_realized_expectancy":
+        realized_path = promotion_root / "stage4_realized_expectancy.json"
+        ledger_path = promotion_root / "stage4_trade_ledger.json"
+    elif source == "stage4b_timing":
+        timing_root = promotion_root / "stage4b_timing"
+        realized_path = timing_root / "timing_replay.json"
+        ledger_path = timing_root / "timing_trade_ledger.json"
+    else:
+        raise ValueError(f"Unsupported Stage 4 detail source: {source}")
     realized = _read_json_if_exists(realized_path)
     ledger = _read_json_if_exists(ledger_path)
     if realized is None or ledger is None:
-        raise FileNotFoundError("Stage 4 detail is not available for this session")
+        raise FileNotFoundError(f"Stage 4 detail is not available for this session: {source}")
 
     candidate = next(
         (
@@ -282,6 +295,7 @@ def read_stage4_candidate_detail(*, workspace_root: Path, session: dict[str, Any
 
     return {
         "session_id": session["session_id"],
+        "source": source,
         "run_id": realized.get("run_id"),
         "created_at": realized.get("created_at"),
         "candidate": candidate,
@@ -396,6 +410,8 @@ def build_stage1_gate_summary(*, workspace_root: Path, session: dict[str, Any]) 
     stage3_grid = _stage3_grid_state(artifact_root)
     stage3_pyramid = _stage3_pyramid_state(artifact_root)
     stage4_realized_expectancy = _stage4_realized_expectancy_state(artifact_root)
+    stage4b_timing = _stage4b_timing_state(artifact_root)
+    promotion_candidate = _promotion_candidate_state(artifact_root)
     status = "canonical_complete" if canonical["exists"] else "ready_to_freeze" if ready_to_freeze else "blocked"
     if session.get("status") == "stage1a_frozen" and canonical["exists"]:
         status = "stage1a_frozen"
@@ -411,6 +427,8 @@ def build_stage1_gate_summary(*, workspace_root: Path, session: dict[str, Any]) 
         "stage3_grid": stage3_grid,
         "stage3_pyramid": stage3_pyramid,
         "stage4_realized_expectancy": stage4_realized_expectancy,
+        "stage4b_timing": stage4b_timing,
+        "promotion_candidate": promotion_candidate,
         "downstream_contract": {
             "stage2_stage3": "Use the MATCH subset from promotion/stage1a_canonical_full_cycle_scores.json.",
             "stage4": "Use the full decision set from promotion/stage1a_canonical_full_cycle_decisions.json.",
@@ -631,6 +649,118 @@ def _stage4_realized_expectancy_state(artifact_root: Path) -> dict[str, Any]:
         "latest_account": (best or {}).get("account", {}) if best else {},
         "stage4_runs": run_index.get("runs", []),
     }
+
+
+def _stage4b_timing_state(artifact_root: Path) -> dict[str, Any]:
+    timing_root = artifact_root / "promotion" / "stage4b_timing"
+    prompt_path = timing_root / "timing_optimizer_prompt.md"
+    context_path = timing_root / "timing_context.json"
+    overlay_path = timing_root / "timing_overlay.json"
+    replay_path = timing_root / "timing_replay.json"
+    ledger_path = timing_root / "timing_trade_ledger.json"
+    summary_path = timing_root / "timing_summary.md"
+    run_index_path = timing_root / "stage4b_runs" / "index.json"
+    replay = _read_json_if_exists(replay_path)
+    run_index = _read_json_if_exists(run_index_path) or {}
+    best = replay.get("best_candidate") if replay else {}
+    return {
+        "exists": replay is not None and ledger_path.exists() and summary_path.exists(),
+        "prompt_exists": prompt_path.exists(),
+        "context_exists": context_path.exists(),
+        "overlay_exists": overlay_path.exists(),
+        "prompt_path": str(prompt_path) if prompt_path.exists() else None,
+        "context_path": str(context_path) if context_path.exists() else None,
+        "overlay_path": str(overlay_path) if overlay_path.exists() else None,
+        "timing_replay_path": str(replay_path) if replay_path.exists() else None,
+        "timing_trade_ledger_path": str(ledger_path) if ledger_path.exists() else None,
+        "summary_path": str(summary_path) if summary_path.exists() else None,
+        "latest_run_id": replay.get("run_id") if replay else run_index.get("latest_run_id"),
+        "best_candidate_id": replay.get("best_candidate_id") if replay else None,
+        "best_candidate": _compact_stage4_candidate(best or {}),
+        "candidates": [_compact_stage4_candidate(item) for item in replay.get("candidates", [])] if replay else [],
+        "latest_account": (best or {}).get("account", {}) if best else {},
+        "stage4b_runs": run_index.get("runs", []),
+    }
+
+
+def _promotion_candidate_state(artifact_root: Path) -> dict[str, Any]:
+    promotion_root = artifact_root / "promotion"
+    stage4_path = promotion_root / "stage4_realized_expectancy.json"
+    optimal_path = promotion_root / "stage4_optimal.json"
+    if not stage4_path.is_file() or not optimal_path.is_file():
+        return {"exists": False, "source": None, "candidate_id": None}
+    stage4 = _read_json_if_exists(stage4_path) or {}
+    optimal = _read_json_if_exists(optimal_path) or {}
+    stage4_best = optimal.get("best") or stage4.get("best_candidate") or {}
+    candidates = [
+        {
+            "exists": True,
+            "source": "stage4_realized_expectancy",
+            "label": "Stage 4A",
+            "candidate_id": stage4_best.get("candidate_id") or stage4.get("best_candidate_id"),
+            "best_candidate": _compact_stage4_candidate(stage4_best),
+            "walk_forward_net_pnl_pct": _wf_net_pnl_pct(stage4_best),
+            "walk_forward_profit_factor": _wf_profit_factor(stage4_best),
+            "overall_net_pnl_usdt": _overall_net_pnl_usdt(stage4_best),
+            "timing_skips": 0,
+            "warning": None,
+        }
+    ]
+    timing_root = promotion_root / "stage4b_timing"
+    replay = _read_json_if_exists(timing_root / "timing_replay.json")
+    overlay = _read_json_if_exists(timing_root / "timing_overlay.json")
+    if replay and overlay and str(overlay.get("source_stage4_run_id") or "") == str(stage4.get("run_id") or ""):
+        best = replay.get("best_candidate") or {}
+        candidates.append(
+            {
+                "exists": True,
+                "source": "stage4b_timing",
+                "label": "Stage 4B Timing",
+                "candidate_id": best.get("candidate_id") or replay.get("best_candidate_id"),
+                "best_candidate": _compact_stage4_candidate(best),
+                "walk_forward_net_pnl_pct": _wf_net_pnl_pct(best),
+                "walk_forward_profit_factor": _wf_profit_factor(best),
+                "overall_net_pnl_usdt": _overall_net_pnl_usdt(best),
+                "timing_skips": best.get("skipped_timing_filter", 0),
+                "warning": None,
+            }
+        )
+    eligible = [candidate for candidate in candidates if candidate["walk_forward_net_pnl_pct"] > 0]
+    if eligible:
+        return max(eligible, key=_promotion_candidate_rank)
+    selected = max(candidates, key=lambda item: (item["overall_net_pnl_usdt"], item["source"] == "stage4_realized_expectancy"))
+    return {**selected, "warning": "weak_walk_forward_fallback"}
+
+
+def _promotion_candidate_rank(candidate: dict[str, Any]) -> tuple[float, float, float, bool]:
+    return (
+        candidate["walk_forward_net_pnl_pct"],
+        candidate["walk_forward_profit_factor"],
+        candidate["overall_net_pnl_usdt"],
+        candidate["source"] == "stage4_realized_expectancy",
+    )
+
+
+def _wf_net_pnl_pct(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("net_pnl_pct"), 0.0)
+
+
+def _wf_profit_factor(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("profit_factor"), 0.0)
+
+
+def _overall_net_pnl_usdt(best: dict[str, Any]) -> float:
+    account = best.get("account") or {}
+    return _float_or_default(account.get("net_pnl_usdt"), 0.0)
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _compact_stage3_result(result: Any) -> dict[str, Any]:

@@ -69,6 +69,8 @@ from quant_terminal_worker.stage4.portfolio_backtest import list_portfolio_backt
 from quant_terminal_worker.stage4.portfolio_backtest import read_portfolio_backtest_run
 from quant_terminal_worker.stage4.portfolio_backtest import run_portfolio_backtest
 from quant_terminal_worker.stage4.realized_expectancy import run_stage4_realized_expectancy
+from quant_terminal_worker.stage4.timing import generate_stage4b_timing_prompt
+from quant_terminal_worker.stage4.timing import run_stage4b_timing_replay
 
 
 STAGE1_ROLE_ACTIONS = {
@@ -1162,6 +1164,56 @@ def create_app(
             ),
         }
 
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage4/timing-prompt")
+    def generate_stage4b_timing_prompt_readout(session_id: str) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        try:
+            result = generate_stage4b_timing_prompt(workspace_root=Path.cwd(), session=session)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "stage4b_timing_prompt": _relative_nested_paths(Path.cwd(), result),
+            "gate": _relative_nested_paths(
+                Path.cwd(),
+                build_stage1_gate_summary(workspace_root=Path.cwd(), session=session),
+            ),
+        }
+
+    @app.post("/api/v1/research/stage1-sessions/{session_id}/stage4/timing-replay")
+    def run_stage4b_timing_replay_readout(session_id: str) -> dict[str, Any]:
+        repository = get_runtime_repository()
+        session = repository.get_stage1_research_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Stage 1 session not found")
+        queued = enqueue_runtime_job(
+            repository,
+            job_type="stage4b_timing_replay",
+            scope_key=f"stage1_session:{session_id}",
+            payload={"session_id": session_id},
+            current_step="queued",
+        )
+        if queued:
+            return queued
+        try:
+            result = run_stage4b_timing_replay(
+                workspace_root=Path.cwd(),
+                session=session,
+                signal_rows=_flatten_signal_roles(_stage1_full_cycle_signals(session)),
+                candles=_stage2_raw_candles(session, repository=repository),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "stage4b_timing": _relative_nested_paths(Path.cwd(), result),
+            "gate": _relative_nested_paths(
+                Path.cwd(),
+                build_stage1_gate_summary(workspace_root=Path.cwd(), session=session),
+            ),
+        }
+
     @app.post("/api/v1/research/stage0-universe-runs/{universe_run_id}/portfolio-backtest")
     def run_portfolio_backtest_readout(
         universe_run_id: str,
@@ -1240,7 +1292,11 @@ def create_app(
         return {"portfolio_backtest_delete": _relative_nested_paths(Path.cwd(), result)}
 
     @app.get("/api/v1/research/stage1-sessions/{session_id}/stage4/candidates/{candidate_id}/details")
-    def get_stage4_candidate_detail(session_id: str, candidate_id: str) -> dict[str, Any]:
+    def get_stage4_candidate_detail(
+        session_id: str,
+        candidate_id: str,
+        source: str = "stage4_realized_expectancy",
+    ) -> dict[str, Any]:
         session = get_runtime_repository().get_stage1_research_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Stage 1 session not found")
@@ -1249,6 +1305,7 @@ def create_app(
                 workspace_root=Path.cwd(),
                 session=session,
                 candidate_id=candidate_id,
+                source=source,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2315,26 +2372,21 @@ def _materialize_execution_bundle(
     if not artifact_root.is_absolute():
         artifact_root = workspace_root / artifact_root
     promotion_root = artifact_root / "promotion"
-    optimal_path = promotion_root / "stage4_optimal.json"
-    realized_path = promotion_root / "stage4_realized_expectancy.json"
-    strategy_path = promotion_root / "frozen_stage1a_strategy_module" / "strategy.py"
-    if not optimal_path.is_file():
-        raise ValueError("Stage 4 optimal artifact is missing")
-    if not realized_path.is_file():
-        raise ValueError("Stage 4 realized expectancy artifact is missing")
-    if not strategy_path.is_file():
-        fallback_strategy_path = artifact_root / "strategy_module" / "strategy.py"
-        if fallback_strategy_path.is_file():
-            strategy_path = fallback_strategy_path
-        else:
-            raise ValueError("Frozen strategy module is missing")
+    strategy_path = _stage1_strategy_path(artifact_root=artifact_root, promotion_root=promotion_root)
+    selection = _resolve_stage4_promotion_candidate(promotion_root=promotion_root)
+    selected_source = selection["source"]
+    selected_result = selection["result"]
+    selected_result_path = selection["result_path"]
+    selected_summary_path = selection.get("summary_path")
+    best = selection["best"]
+    if selected_source == "stage4b_timing":
+        strategy_path = _materialize_stage4b_timing_strategy_module(
+            promotion_root=promotion_root,
+            base_strategy_path=strategy_path,
+            overlay=selection["overlay"],
+        )
 
-    optimal = _read_json_file(optimal_path)
-    realized = _read_json_file(realized_path)
-    best = optimal.get("best") or realized.get("best_candidate") or {}
-    if not best:
-        raise ValueError("Stage 4 optimal artifact does not include a best candidate")
-    simulation_inputs = realized.get("simulation_inputs") if isinstance(realized.get("simulation_inputs"), dict) else {}
+    simulation_inputs = selected_result.get("simulation_inputs") if isinstance(selected_result.get("simulation_inputs"), dict) else {}
     source_universe_run = repository.get_stage0_universe_run(session["source_universe_run_id"])
     if source_universe_run is None:
         raise ValueError("Source Stage 0 universe run is missing")
@@ -2345,27 +2397,36 @@ def _materialize_execution_bundle(
         "stage2_capture_curve": str(promotion_root / "stage2_capture_curve.json"),
         "stage3_optimal": str(promotion_root / "stage3_optimal.json"),
         "stage3_pyramid_optimal": str(promotion_root / "stage3_pyramid_optimal.json"),
-        "stage4_realized_expectancy": str(realized_path),
-        "stage4_optimal": str(optimal_path),
+        "stage4_realized_expectancy": str(promotion_root / "stage4_realized_expectancy.json"),
+        "stage4_optimal": str(promotion_root / "stage4_optimal.json"),
         "stage4_summary": str(promotion_root / "stage4_summary.md"),
     }
+    if selected_source == "stage4b_timing":
+        evidence_refs.update(
+            {
+                "stage4b_timing_replay": str(selected_result_path),
+                "stage4b_timing_overlay": str(promotion_root / "stage4b_timing" / "timing_overlay.json"),
+                "stage4b_timing_summary": str(selected_summary_path or promotion_root / "stage4b_timing" / "timing_summary.md"),
+                "stage4b_timing_strategy": str(strategy_path),
+            }
+        )
     execution_setup = {
         "schema_version": "0.1",
-        "source": "stage4_realized_expectancy",
+        "source": selected_source,
         "account_mode": account_mode,
         "execution_adapter": execution_adapter,
         "forward_hours": forward_hours,
         "hard_exit_after_hours": forward_hours,
-        "stage4_candidate_id": best.get("candidate_id") or realized.get("best_candidate_id"),
+        "stage4_candidate_id": best.get("candidate_id") or selected_result.get("best_candidate_id"),
         "setup": best.get("setup") or best,
         "sizing": {
-            "source": "stage4_realized_expectancy",
+            "source": selected_source,
             "initial_capital_usdt": simulation_inputs.get("initial_capital_usdt"),
             "margin_allocation_pct": simulation_inputs.get("margin_allocation_pct"),
             "leverage": simulation_inputs.get("leverage"),
         },
-        "cost_assumptions": realized.get("cost_assumptions", {}),
-        "slice_windows": realized.get("slice_windows", []),
+        "cost_assumptions": selected_result.get("cost_assumptions", {}),
+        "slice_windows": selected_result.get("slice_windows", []),
         "training_window": {
             "start": _date_string(session["train_start"]),
             "end": _date_string(session["train_end"]),
@@ -2374,7 +2435,13 @@ def _materialize_execution_bundle(
             "start": _date_string(session["walk_forward_start"]),
             "end": _date_string(session["walk_forward_end"]),
         },
+        "promotion_selection": {
+            "source": selected_source,
+            "criterion": selection["criterion"],
+            "warning": selection.get("warning"),
+        },
     }
+
     engine_spec = _resolve_engine_spec_for_promotion(
         repository=repository,
         signal_engine_id=session["signal_engine_id"],
@@ -2392,6 +2459,7 @@ def _materialize_execution_bundle(
         "strategy_version": session["strategy_version"],
         "session_id": session["session_id"],
         "stage4_candidate_id": execution_setup["stage4_candidate_id"],
+        "promotion_source": selected_source,
         "content": {
             "strategy": strategy_path.read_text(),
             "execution_setup": execution_setup,
@@ -2406,6 +2474,13 @@ def _materialize_execution_bundle(
 
     strategy_copy = bundle_root / "strategy.py"
     strategy_copy.write_text(strategy_path.read_text())
+    stage4b_base_copy = None
+    if selected_source == "stage4b_timing":
+        base_strategy_sidecar = strategy_path.with_name("stage1a_base_strategy.py")
+        if not base_strategy_sidecar.is_file():
+            raise ValueError("Stage 4B timing base strategy sidecar is missing")
+        stage4b_base_copy = bundle_root / "stage1a_base_strategy.py"
+        stage4b_base_copy.write_text(base_strategy_sidecar.read_text())
     (bundle_root / "execution_setup.json").write_text(json.dumps(execution_setup, indent=2, sort_keys=True) + "\n")
     (bundle_root / "evidence_refs.json").write_text(json.dumps(evidence_refs, indent=2, sort_keys=True) + "\n")
     manifest = {
@@ -2420,6 +2495,8 @@ def _materialize_execution_bundle(
         "source_stage1_session_id": session["session_id"],
         "account_mode": account_mode,
         "execution_adapter": execution_adapter,
+        "promotion_source": selected_source,
+        "promotion_selection": execution_setup["promotion_selection"],
         "content_hash": content_hash,
         "contract_version": "engine_strategy_contract.v1",
         "validated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -2434,6 +2511,8 @@ def _materialize_execution_bundle(
         "evidence_refs.json": _file_sha256(bundle_root / "evidence_refs.json"),
         "manifest.json": _file_sha256(bundle_root / "manifest.json"),
     }
+    if stage4b_base_copy is not None:
+        checksums["stage1a_base_strategy.py"] = _file_sha256(stage4b_base_copy)
     (bundle_root / "checksums.json").write_text(json.dumps(checksums, indent=2, sort_keys=True) + "\n")
     (bundle_root / "bundle.json").write_text(
         json.dumps(
@@ -2458,7 +2537,7 @@ def _materialize_execution_bundle(
         "strategy_id": session["strategy_id"],
         "strategy_version": session["strategy_version"],
         "source_stage1_session_id": session["session_id"],
-        "source_stage4_result_path": str(realized_path),
+        "source_stage4_result_path": str(selected_result_path),
         "bundle_uri": str(bundle_root),
         "strategy_module_ref": str(strategy_copy),
         "execution_setup": execution_setup,
@@ -2467,6 +2546,216 @@ def _materialize_execution_bundle(
         "content_hash": content_hash,
         "status": "promoted",
     }
+
+
+def _stage1_strategy_path(*, artifact_root: Path, promotion_root: Path) -> Path:
+    strategy_path = promotion_root / "frozen_stage1a_strategy_module" / "strategy.py"
+    if not strategy_path.is_file():
+        fallback_strategy_path = artifact_root / "strategy_module" / "strategy.py"
+        if fallback_strategy_path.is_file():
+            strategy_path = fallback_strategy_path
+        else:
+            raise ValueError("Frozen strategy module is missing")
+    return strategy_path
+
+
+def _resolve_stage4_promotion_candidate(*, promotion_root: Path) -> dict[str, Any]:
+    optimal_path = promotion_root / "stage4_optimal.json"
+    realized_path = promotion_root / "stage4_realized_expectancy.json"
+    summary_path = promotion_root / "stage4_summary.md"
+    if not optimal_path.is_file():
+        raise ValueError("Stage 4 optimal artifact is missing")
+    if not realized_path.is_file():
+        raise ValueError("Stage 4 realized expectancy artifact is missing")
+    optimal = _read_json_file(optimal_path)
+    realized = _read_json_file(realized_path)
+    stage4a_best = optimal.get("best") or realized.get("best_candidate") or {}
+    if not stage4a_best:
+        raise ValueError("Stage 4 optimal artifact does not include a best candidate")
+    stage4a = {
+        "source": "stage4_realized_expectancy",
+        "result": realized,
+        "result_path": realized_path,
+        "optimal_path": optimal_path,
+        "summary_path": summary_path,
+        "best": stage4a_best,
+        "criterion": "walk_forward_net_pnl_pct",
+        "overlay": None,
+    }
+    stage4b = _stage4b_promotion_candidate(promotion_root=promotion_root, latest_stage4a_run_id=str(realized.get("run_id") or ""))
+    candidates = [stage4a]
+    if stage4b is not None:
+        candidates.append(stage4b)
+    eligible = [candidate for candidate in candidates if _walk_forward_net_pnl_pct(candidate["best"]) > 0]
+    if eligible:
+        return max(eligible, key=_promotion_rank_key)
+    best = max(candidates, key=lambda candidate: (_overall_net_pnl_usdt(candidate["best"]), candidate["source"] == "stage4_realized_expectancy"))
+    return {**best, "criterion": "overall_net_pnl_fallback", "warning": "weak_walk_forward_fallback"}
+
+
+def _stage4b_promotion_candidate(*, promotion_root: Path, latest_stage4a_run_id: str) -> dict[str, Any] | None:
+    timing_root = promotion_root / "stage4b_timing"
+    replay_path = timing_root / "timing_replay.json"
+    overlay_path = timing_root / "timing_overlay.json"
+    ledger_path = timing_root / "timing_trade_ledger.json"
+    summary_path = timing_root / "timing_summary.md"
+    if not (replay_path.is_file() and overlay_path.is_file() and ledger_path.is_file() and summary_path.is_file()):
+        return None
+    replay = _read_json_file(replay_path)
+    overlay = _read_json_file(overlay_path)
+    if str(overlay.get("source_stage4_run_id") or "") != latest_stage4a_run_id:
+        return None
+    best = replay.get("best_candidate") or {}
+    if not best:
+        return None
+    return {
+        "source": "stage4b_timing",
+        "result": replay,
+        "result_path": replay_path,
+        "summary_path": summary_path,
+        "best": best,
+        "criterion": "walk_forward_net_pnl_pct",
+        "overlay": overlay,
+    }
+
+
+def _promotion_rank_key(candidate: dict[str, Any]) -> tuple[float, float, float, bool]:
+    best = candidate["best"]
+    return (
+        _walk_forward_net_pnl_pct(best),
+        _walk_forward_profit_factor(best),
+        _overall_net_pnl_usdt(best),
+        candidate["source"] == "stage4_realized_expectancy",
+    )
+
+
+def _walk_forward_net_pnl_pct(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("net_pnl_pct"), 0.0)
+
+
+def _walk_forward_profit_factor(best: dict[str, Any]) -> float:
+    wf = (best.get("slices") or {}).get("walk_forward_test") or {}
+    return _float_or_default(wf.get("profit_factor"), 0.0)
+
+
+def _overall_net_pnl_usdt(best: dict[str, Any]) -> float:
+    account = best.get("account") or {}
+    return _float_or_default(account.get("net_pnl_usdt"), 0.0)
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _materialize_stage4b_timing_strategy_module(*, promotion_root: Path, base_strategy_path: Path, overlay: dict[str, Any]) -> Path:
+    wrapper_root = promotion_root / "frozen_stage4b_timing_strategy_module"
+    wrapper_root.mkdir(parents=True, exist_ok=True)
+    base_copy = wrapper_root / "stage1a_base_strategy.py"
+    base_copy.write_text(base_strategy_path.read_text())
+    wrapper_path = wrapper_root / "strategy.py"
+    wrapper_path.write_text(_render_stage4b_timing_strategy_wrapper(overlay=overlay))
+    return wrapper_path
+
+
+def _render_stage4b_timing_strategy_wrapper(*, overlay: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "from __future__ import annotations",
+            "",
+            "from datetime import UTC, datetime",
+            "import importlib.util",
+            "import json",
+            "from pathlib import Path",
+            "from typing import Any",
+            "",
+            f"TIMING_OVERLAY = json.loads({json.dumps(json.dumps(overlay, sort_keys=True))})",
+            "_BASE_MODULE = None",
+            "",
+            "def _load_base_module():",
+            "    global _BASE_MODULE",
+            "    if _BASE_MODULE is not None:",
+            "        return _BASE_MODULE",
+            "    path = Path(__file__).with_name('stage1a_base_strategy.py')",
+            "    spec = importlib.util.spec_from_file_location('stage4b_stage1a_base_strategy', path)",
+            "    if spec is None or spec.loader is None:",
+            "        raise ImportError(f'cannot load base strategy: {path}')",
+            "    module = importlib.util.module_from_spec(spec)",
+            "    spec.loader.exec_module(module)",
+            "    _BASE_MODULE = module",
+            "    return module",
+            "",
+            "def decide(context: dict[str, Any]) -> dict[str, Any]:",
+            "    base = dict(_load_base_module().decide(context))",
+            "    if _timing_filter_matches(context, base):",
+            "        return _timing_skip_decision(base)",
+            "    return base",
+            "",
+            "def manage_position(context: dict[str, Any]) -> dict[str, Any]:",
+            "    module = _load_base_module()",
+            "    if hasattr(module, 'manage_position'):",
+            "        return module.manage_position(context)",
+            "    return {'action': 'HOLD'}",
+            "",
+            "def _timing_filter_matches(context: dict[str, Any], decision: dict[str, Any]) -> bool:",
+            "    action = str(decision.get('action') or decision.get('trade_action') or '').upper()",
+            "    direction = str(decision.get('direction') or '').upper()",
+            "    if action != 'ENTER' or direction not in {'LONG', 'SHORT'}:",
+            "        return False",
+            "    applies_to = str(TIMING_OVERLAY.get('applies_to') or 'all').upper()",
+            "    if applies_to in {'LONG', 'SHORT'} and direction != applies_to:",
+            "        return False",
+            "    timestamp = _packet_timestamp(context)",
+            "    if timestamp is None:",
+            "        return False",
+            "    hours = set(TIMING_OVERLAY.get('exclude_utc_hours') or [])",
+            "    weekdays = set(TIMING_OVERLAY.get('exclude_utc_weekdays') or [])",
+            "    if hours and timestamp.hour not in hours:",
+            "        return False",
+            "    if weekdays and timestamp.weekday() not in weekdays:",
+            "        return False",
+            "    return True",
+            "",
+            "def _packet_timestamp(context: dict[str, Any]) -> datetime | None:",
+            "    candidates = [context.get('timestamp'), context.get('signal_ts')]",
+            "    packet = context.get('packet') if isinstance(context.get('packet'), dict) else context",
+            "    candidates.extend([packet.get('timestamp'), packet.get('signal_ts')])",
+            "    signal = context.get('signal') if isinstance(context.get('signal'), dict) else {}",
+            "    payload = signal.get('payload') if isinstance(signal.get('payload'), dict) else {}",
+            "    candidates.extend([signal.get('timestamp'), signal.get('signal_ts'), payload.get('timestamp'), payload.get('signal_ts')])",
+            "    for value in candidates:",
+            "        if not value:",
+            "            continue",
+            "        if isinstance(value, datetime):",
+            "            return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)",
+            "        if isinstance(value, str):",
+            "            try:",
+            "                return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(UTC)",
+            "            except ValueError:",
+            "                continue",
+            "    return None",
+            "",
+            "def _timing_skip_decision(base: dict[str, Any]) -> dict[str, Any]:",
+            "    diagnostics = dict(base.get('diagnostics') or {})",
+            "    diagnostics['stage4b_timing_overlay'] = {",
+            "        'exclude_utc_hours': TIMING_OVERLAY.get('exclude_utc_hours', []),",
+            "        'exclude_utc_weekdays': TIMING_OVERLAY.get('exclude_utc_weekdays', []),",
+            "        'applies_to': TIMING_OVERLAY.get('applies_to', 'all'),",
+            "    }",
+            "    return {",
+            "        **base,",
+            "        'action': 'SKIP',",
+            "        'trade_action': 'SKIP',",
+            "        'direction': 'FLAT',",
+            "        'reason_code': 'timing_filter_utc_window',",
+            "        'diagnostics': diagnostics,",
+            "    }",
+            "",
+        ]
+    )
 
 
 def _resolve_engine_spec_for_promotion(

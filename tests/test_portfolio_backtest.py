@@ -131,6 +131,51 @@ def _write_stage4_artifacts(
     return artifact_root
 
 
+def _write_stage4b_timing_artifacts(
+    artifact_root: Path,
+    *,
+    candidate_id: str,
+    source_stage4_run_id: str = "stage4-run",
+    stage4a_wf: float = 2.0,
+    stage4b_wf: float = 6.0,
+    stage4a_total: float = 20.0,
+    stage4b_total: float = 60.0,
+    exclude_utc_hours: list[int] | None = None,
+) -> None:
+    promotion_root = artifact_root / "promotion"
+    realized = json.loads((promotion_root / "stage4_realized_expectancy.json").read_text())
+    stage4a_best = realized.get("best_candidate") or {}
+    stage4a_best["account"] = {"net_pnl_usdt": stage4a_total, "ending_equity_usdt": 1000 + stage4a_total}
+    stage4a_best["slices"] = {"walk_forward_test": {"net_pnl_pct": stage4a_wf, "profit_factor": 1.2}}
+    realized["best_candidate"] = stage4a_best
+    (promotion_root / "stage4_realized_expectancy.json").write_text(json.dumps(realized))
+
+    timing_root = promotion_root / "stage4b_timing"
+    timing_root.mkdir(parents=True, exist_ok=True)
+    overlay = {
+        "schema_version": "stage4b_timing_overlay.v1",
+        "source_stage4_run_id": source_stage4_run_id,
+        "source_stage4_candidate_id": stage4a_best.get("candidate_id"),
+        "exclude_utc_hours": exclude_utc_hours or [1],
+        "exclude_utc_weekdays": [],
+        "applies_to": "all",
+        "rationale": "Test timing window.",
+    }
+    stage4b_best = {
+        "candidate_id": candidate_id,
+        "setup": {"tp_pct": 10.0, "sl_pct": 50.0, "initial_sl_pct": 50.0, "max_hold_hours": 12.0, "leverage": 1.0},
+        "account": {"net_pnl_usdt": stage4b_total, "ending_equity_usdt": 1000 + stage4b_total},
+        "slices": {"walk_forward_test": {"net_pnl_pct": stage4b_wf, "profit_factor": 1.8}},
+        "skipped_timing_filter": 1,
+    }
+    (timing_root / "timing_overlay.json").write_text(json.dumps(overlay))
+    (timing_root / "timing_replay.json").write_text(
+        json.dumps({"run_id": "stage4b-run", "best_candidate_id": candidate_id, "best_candidate": stage4b_best, "candidates": [stage4b_best]})
+    )
+    (timing_root / "timing_trade_ledger.json").write_text(json.dumps({"run_id": "stage4b-run", "candidates": []}))
+    (timing_root / "timing_summary.md").write_text("# Stage 4B Timing Replay\n")
+
+
 def _candidate(pool_id: str, candidate_id: str, asset: str) -> dict:
     return {
         "candidate_id": candidate_id,
@@ -305,6 +350,73 @@ def test_portfolio_backtest_ignores_zero_percent_allocations(tmp_path: Path, mon
     assert result["summary"]["total_signals"] == 1
     assert {trade["asset"] for trade in result["trade_ledger"]} == {"SOL"}
     assert all(item["asset"] != "AAVE" for item in result["skipped_signals"])
+
+
+def test_portfolio_backtest_uses_resolved_stage4b_promotion_candidate(tmp_path: Path, monkeypatch):
+    pool_id = "pool-stage4b-selection"
+    aave_root = _write_stage4_artifacts(
+        tmp_path,
+        asset="AAVE",
+        session_id="stage1-aave",
+        candidate_id="stage4a-candidate",
+        tp_pct=1.0,
+        sl_pct=50.0,
+        leverage=1.0,
+        signal_records=[
+            {"signal_id": "sig-aave-1", "decision_direction": "LONG", "agreement": "MATCH"},
+            {"signal_id": "sig-aave-2", "decision_direction": "LONG", "agreement": "MATCH"},
+        ],
+    )
+    promotion_root = aave_root / "promotion"
+    stage4_candidates = json.loads((promotion_root / "stage4_candidates.json").read_text())
+    stage4_candidates["candidates"].append(
+        {
+            "candidate_id": "stage4b-candidate",
+            "setup": {
+                "candidate_id": "stage4b-candidate",
+                "entry_model": "market",
+                "tp_pct": 10.0,
+                "sl_pct": 50.0,
+                "final_tp_pct": 10.0,
+                "initial_sl_pct": 50.0,
+                "protection_enabled": False,
+                "max_hold_hours": 12.0,
+                "leverage": 1.0,
+            },
+        }
+    )
+    (promotion_root / "stage4_candidates.json").write_text(json.dumps(stage4_candidates))
+    _write_stage4b_timing_artifacts(aave_root, candidate_id="stage4b-candidate", exclude_utc_hours=[1])
+
+    candles = _make_candles("2026-05-01T00:00:00Z", 200, base_price=100.0, trend=0.0)
+    signals = {
+        "sigset-aave": [
+            _make_signal("sig-aave-1", "2026-05-01T01:00:00Z", "LONG", 100.0),
+            _make_signal("sig-aave-2", "2026-05-01T02:00:00Z", "LONG", 100.0),
+        ]
+    }
+
+    monkeypatch.setattr(
+        "quant_terminal_worker.stage4.portfolio_backtest.MarketDataReader",
+        lambda **kw: MockMarketDataReader({"AAVE": candles}),
+    )
+
+    result = run_portfolio_backtest(
+        workspace_root=tmp_path,
+        universe_run={"universe_run_id": pool_id},
+        candidates=[_candidate(pool_id, "candidate-aave", "AAVE")],
+        sessions=[_session(pool_id, "candidate-aave", "AAVE", aave_root)],
+        initial_capital_usdt=1000,
+        margin_allocations_pct={"AAVE": 30},
+        repository=MockRepository(signals),
+    )
+
+    eligible = result["eligible_assets"][0]
+    assert eligible["promotion_source"] == "stage4b_timing"
+    assert eligible["stage4_candidate_id"] == "stage4b-candidate"
+    assert result["summary"]["skipped_timing_filter"] == 1
+    assert result["skipped_signals"][0]["skip_reason"] == "timing_filter"
+    assert result["trade_ledger"][0]["candidate_id"] == "stage4b-candidate"
 
 
 def test_portfolio_backtest_consumes_pyramid_margin_dynamically(tmp_path: Path, monkeypatch):

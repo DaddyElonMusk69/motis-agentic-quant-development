@@ -211,7 +211,7 @@ def _score_candidate(
     while index < len(inputs):
         item = inputs[index]
         if item["direction"] not in {"LONG", "SHORT"}:
-            trades.append(_skipped_decision(item=item, candidate=candidate, reason="no_trade_decision"))
+            trades.append(_skipped_decision(item=item, candidate=candidate, reason=str(item["record"].get("stage4b_skip_reason") or "no_trade_decision")))
             index += 1
             continue
 

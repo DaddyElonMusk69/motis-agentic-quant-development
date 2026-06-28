@@ -1096,6 +1096,71 @@ def test_wake_records_live_observation_without_canonical_signal_insert(tmp_path)
     assert observation["decision"]["signal_id"] == signal["signal_id"]
 
 
+def test_wake_executes_stage4b_timing_strategy_wrapper(tmp_path):
+    bundle = _bundle(tmp_path)
+    bundle_root = Path(bundle["bundle_uri"])
+    (bundle_root / "stage1a_base_strategy.py").write_text(
+        "def decide(context):\n"
+        "    return {'trade_action': 'ENTER', 'action': 'ENTER', 'direction': 'LONG', 'confidence': 0.7, 'reason_code': 'base_entry'}\n"
+        "\n"
+        "def manage_position(context):\n"
+        "    return {'action': 'HOLD'}\n"
+    )
+    (bundle_root / "strategy.py").write_text(
+        "from __future__ import annotations\n"
+        "from datetime import UTC, datetime\n"
+        "import importlib.util\n"
+        "from pathlib import Path\n"
+        "TIMING_OVERLAY = {'exclude_utc_hours': [1], 'exclude_utc_weekdays': [], 'applies_to': 'all'}\n"
+        "_BASE_MODULE = None\n"
+        "def _load_base_module():\n"
+        "    global _BASE_MODULE\n"
+        "    if _BASE_MODULE is not None:\n"
+        "        return _BASE_MODULE\n"
+        "    path = Path(__file__).with_name('stage1a_base_strategy.py')\n"
+        "    spec = importlib.util.spec_from_file_location('stage4b_stage1a_base_strategy', path)\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    spec.loader.exec_module(module)\n"
+        "    _BASE_MODULE = module\n"
+        "    return module\n"
+        "def decide(context):\n"
+        "    base = dict(_load_base_module().decide(context))\n"
+        "    packet = context.get('packet') if isinstance(context.get('packet'), dict) else context\n"
+        "    signal = context.get('signal') if isinstance(context.get('signal'), dict) else {}\n"
+        "    payload = signal.get('payload') if isinstance(signal.get('payload'), dict) else {}\n"
+        "    value = context.get('timestamp') or packet.get('timestamp') or signal.get('timestamp') or payload.get('timestamp')\n"
+        "    timestamp = datetime.fromisoformat(str(value).replace('Z', '+00:00')).astimezone(UTC)\n"
+        "    if timestamp.hour in set(TIMING_OVERLAY['exclude_utc_hours']):\n"
+        "        return {**base, 'trade_action': 'SKIP', 'action': 'SKIP', 'direction': 'FLAT', 'reason_code': 'timing_filter_utc_window'}\n"
+        "    return base\n"
+        "def manage_position(context):\n"
+        "    return _load_base_module().manage_position(context)\n"
+    )
+    repository = FakeRepository(route=_route(bundle), bundle=bundle)
+    tradable_signal = {**_signal("sig-enter"), "timestamp": "2026-06-05T00:00:00Z", "payload": {"timestamp": "2026-06-05T00:00:00Z"}}
+    skipped_signal = {**_signal("sig-skip"), "timestamp": "2026-06-05T01:00:00Z", "payload": {"timestamp": "2026-06-05T01:00:00Z"}}
+
+    enter_wake = run_route_wake(
+        route_id="aave-live",
+        repository=repository,
+        adapter=FakeAdapter(),
+        live_signal_scanner=lambda **kwargs: tradable_signal,
+    )
+    skip_wake = run_route_wake(
+        route_id="aave-live",
+        repository=repository,
+        adapter=FakeAdapter(),
+        live_signal_scanner=lambda **kwargs: skipped_signal,
+    )
+
+    assert enter_wake["strategy_decision"]["trade_action"] == "ENTER"
+    assert enter_wake["order_intents"]
+    assert skip_wake["strategy_decision"]["trade_action"] == "SKIP"
+    assert skip_wake["strategy_decision"]["direction"] == "FLAT"
+    assert skip_wake["strategy_decision"]["reason_code"] == "timing_filter_utc_window"
+    assert skip_wake["order_intents"] == []
+
+
 def test_wake_entry_intent_uses_short_side_split_policy(tmp_path):
     strategy_source = (
         "def decide(context):\n"

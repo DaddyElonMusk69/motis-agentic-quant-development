@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import pyarrow as pa
@@ -11,6 +12,8 @@ import quant_terminal_api.main as api_main
 from quant_terminal_api.db.models import deployment_routes, execution_bundles, metadata, owner_states, wake_runs
 from quant_terminal_api.main import create_app
 from quant_terminal_api.repositories.runtime import RuntimeRepository
+from quant_terminal_worker.execution.bundle_loader import load_strategy_module
+from quant_terminal_worker.stage4.realized_expectancy import run_stage4_realized_expectancy
 
 
 class StubRuntimeRepository:
@@ -3646,6 +3649,294 @@ def test_stage4_endpoint_writes_realized_expectancy_from_full_decision_set(tmp_p
     assert len(gate_stage4["stage4_runs"]) == 1
 
 
+def test_stage4b_timing_prompt_endpoint_writes_prompt_and_updates_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    session, _signals, _candles = _stage4b_api_fixture(tmp_path, repository)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/stage4/timing-prompt")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stage4b_timing_prompt"]["prompt_type"] == "stage4b_timing_optimizer"
+    assert "$stage4b-timing-optimizer" in payload["stage4b_timing_prompt"]["prompt"]
+    assert payload["gate"]["stage4b_timing"]["prompt_exists"] is True
+    assert payload["gate"]["stage4b_timing"]["overlay_exists"] is False
+
+
+def test_stage4b_timing_replay_endpoint_applies_overlay_and_updates_gate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    session, _signals, _candles = _stage4b_api_fixture(tmp_path, repository)
+    promotion_root = Path(session["artifact_root"]) / "promotion"
+    stage4 = json.loads((promotion_root / "stage4_realized_expectancy.json").read_text())
+    timing_root = promotion_root / "stage4b_timing"
+    timing_root.mkdir(parents=True)
+    (timing_root / "timing_overlay.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "stage4b_timing_overlay.v1",
+                "source_stage4_run_id": stage4["run_id"],
+                "exclude_utc_hours": [1],
+                "applies_to": "all",
+                "rationale": "Skip 01 UTC for API coverage.",
+            }
+        )
+    )
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/stage4/timing-replay")
+
+    assert response.status_code == 200
+    replay = response.json()["stage4b_timing"]
+    assert replay["best_candidate"]["executed_trades"] == 1
+    assert replay["best_candidate"]["skipped_timing_filter"] == 1
+    gate_timing = response.json()["gate"]["stage4b_timing"]
+    assert gate_timing["exists"] is True
+    assert gate_timing["latest_run_id"] == replay["run_id"]
+    assert gate_timing["best_candidate"]["skipped_timing_filter"] == 1
+
+
+def test_stage4_candidate_detail_endpoint_reads_stage4b_timing_artifacts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    session, _signals, _candles = _stage4b_api_fixture(tmp_path, repository)
+    promotion_root = Path(session["artifact_root"]) / "promotion"
+    _write_promotable_stage4_branches(
+        promotion_root,
+        stage4a_wf=4.0,
+        stage4a_total=50.0,
+        stage4b_wf=5.0,
+        stage4b_total=70.0,
+    )
+    timing_root = promotion_root / "stage4b_timing"
+    (timing_root / "timing_trade_ledger.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stage4b-run",
+                "candidates": [
+                    {
+                        "candidate_id": "stage4b-best",
+                        "trades": [
+                            {
+                                "candidate_id": "stage4b-best",
+                                "signal_id": "sig-1",
+                                "entry_status": "filled",
+                                "exit_status": "tp_hit",
+                                "net_pnl_usdt": 12.5,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(
+        f"/api/v1/research/stage1-sessions/{session['session_id']}/stage4/candidates/stage4b-best/details?source=stage4b_timing"
+    )
+
+    assert response.status_code == 200
+    detail = response.json()["detail"]
+    assert detail["source"] == "stage4b_timing"
+    assert detail["run_id"] == "stage4b-run"
+    assert detail["candidate"]["candidate_id"] == "stage4b-best"
+    assert detail["trade_count"] == 1
+    assert detail["trades"][0]["exit_status"] == "tp_hit"
+
+
+def _stage4b_api_fixture(tmp_path: Path, repository: StubRuntimeRepository):
+    artifact_root = tmp_path / "dev/training_sessions/aave-vegas-tunnel-v01/stage1-aave"
+    promotion_root = artifact_root / "promotion"
+    promotion_root.mkdir(parents=True, exist_ok=True)
+    records = [
+        {
+            "signal_id": "sig-enter",
+            "agent_direction": "LONG",
+            "decision_direction": "LONG",
+            "agreement": "MATCH",
+            "sample_role": "training",
+        },
+        {
+            "signal_id": "sig-timing",
+            "agent_direction": "LONG",
+            "decision_direction": "LONG",
+            "agreement": "MATCH",
+            "sample_role": "walk_forward_test",
+        },
+    ]
+    (promotion_root / "stage1a_canonical_full_cycle_scores.json").write_text(json.dumps({"records": records}))
+    (promotion_root / "stage4_candidates.json").write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "market_tp_1p0_sl_1p0",
+                        "setup": {
+                            "entry_model": "market",
+                            "tp_pct": 1.0,
+                            "sl_pct": 5.0,
+                            "timeout_policy": "close_at_cutoff",
+                        },
+                    }
+                ]
+            }
+        )
+    )
+    signals = [
+        {
+            "signal_id": "sig-enter",
+            "timestamp": "2026-05-01T00:00:00Z",
+            "payload": {
+                "timestamp": "2026-05-01T00:00:00Z",
+                "interactions": [{"timeframe": "2h", "market_price": 100}],
+                "active_timeframes": ["2h"],
+            },
+        },
+        {
+            "signal_id": "sig-timing",
+            "timestamp": "2026-05-01T01:00:00Z",
+            "payload": {
+                "timestamp": "2026-05-01T01:00:00Z",
+                "interactions": [{"timeframe": "2h", "market_price": 100}],
+                "active_timeframes": ["2h"],
+            },
+        },
+    ]
+    candles = [
+        {"timestamp": "2026-05-01T00:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101, "volume": 1, "confirm": 1},
+        {"timestamp": "2026-05-01T01:05:00Z", "open": 100, "high": 101.5, "low": 99.5, "close": 101, "volume": 1, "confirm": 1},
+    ]
+    run_stage4_realized_expectancy(
+        workspace_root=tmp_path,
+        session={
+            "session_id": "stage1-aave",
+            "artifact_root": str(artifact_root),
+            "asset": "AAVE",
+            "strategy_id": "aave-vegas-tunnel-v01",
+            "strategy_version": "v0.1",
+            "signal_engine_id": "vegas_ema",
+            "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+            "train_start": "2026-03-01",
+            "train_end": "2026-04-30",
+            "walk_forward_start": "2026-05-01",
+            "walk_forward_end": "2026-05-31",
+        },
+        signal_rows=signals,
+        candles=candles,
+        initial_capital_usdt=1000,
+        margin_allocation_pct=30,
+        leverage=5,
+        fees_bps_per_side=0,
+        slippage_bps_per_side=0,
+    )
+    storage_uri = tmp_path / "data/market/source=okx/type=candles/asset=AAVE/timeframe=5m/origin=raw"
+    parquet_path = storage_uri / "year=2026/month=05/data.parquet"
+    parquet_path.parent.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist(candles), parquet_path)
+    repository.candle_ref = {"dataset_id": "okx-aave-raw-5m", "storage_backend": "parquet", "storage_uri": str(storage_uri)}
+    repository.window_signals = signals
+    session = {
+        "session_id": "stage1-aave",
+        "artifact_root": str(artifact_root),
+        "source_candidate_id": "candidate-aave",
+        "signal_set_key": "vegas_ema:AAVE:2026-AAVE-2h-dedupe-vote2",
+        "signal_engine_id": "vegas_ema",
+        "signal_engine_version": "0.1",
+        "asset": "AAVE",
+        "signal_set_id": "2026-AAVE-2h-dedupe-vote2",
+        "strategy_id": "aave-vegas-tunnel-v01",
+        "strategy_version": "v0.1",
+        "train_start": "2026-03-01",
+        "train_end": "2026-04-30",
+        "walk_forward_start": "2026-05-01",
+        "walk_forward_end": "2026-05-31",
+        "status": "stage1a_frozen",
+        "manifest": {"session_id": "stage1-aave"},
+    }
+    repository.stage1_sessions = [session]
+    return session, signals, candles
+
+
+def _write_promotable_stage4_branches(
+    promotion_root: Path,
+    *,
+    stage4a_wf: float,
+    stage4a_total: float,
+    stage4b_wf: float,
+    stage4b_total: float,
+    overlay_source_run_id: str = "stage4-run",
+) -> None:
+    promotion_root.mkdir(parents=True, exist_ok=True)
+    frozen_root = promotion_root / "frozen_stage1a_strategy_module"
+    frozen_root.mkdir(parents=True, exist_ok=True)
+    (frozen_root / "strategy.py").write_text(
+        "def decide(context):\n"
+        "    return {'trade_action': 'ENTER', 'action': 'ENTER', 'direction': 'LONG', 'reason_code': 'base'}\n"
+        "\n"
+        "def manage_position(context):\n"
+        "    return {'action': 'HOLD'}\n"
+    )
+    stage4a_best = {
+        "candidate_id": "stage4a-best",
+        "setup": {"tp_pct": 2.0, "sl_pct": 1.0, "initial_sl_pct": 1.0, "max_hold_hours": 36},
+        "account": {"net_pnl_usdt": stage4a_total, "ending_equity_usdt": 1000 + stage4a_total},
+        "slices": {"walk_forward_test": {"net_pnl_pct": stage4a_wf, "profit_factor": 1.4}},
+    }
+    (promotion_root / "stage4_realized_expectancy.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stage4-run",
+                "best_candidate_id": "stage4a-best",
+                "best_candidate": stage4a_best,
+                "simulation_inputs": {"initial_capital_usdt": 1000, "margin_allocation_pct": 30, "leverage": 5},
+                "cost_assumptions": {"fees_bps_per_side": 5},
+                "slice_windows": [],
+                "candidates": [stage4a_best],
+            }
+        )
+    )
+    (promotion_root / "stage4_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (promotion_root / "stage4_optimal.json").write_text(json.dumps({"run_id": "stage4-run", "best": stage4a_best}))
+    (promotion_root / "stage4_summary.md").write_text("# Stage 4 Realized Expectancy\n")
+    timing_root = promotion_root / "stage4b_timing"
+    timing_root.mkdir(parents=True, exist_ok=True)
+    overlay = {
+        "schema_version": "stage4b_timing_overlay.v1",
+        "source_stage4_run_id": overlay_source_run_id,
+        "source_stage4_candidate_id": "stage4a-best",
+        "exclude_utc_hours": [1],
+        "exclude_utc_weekdays": [],
+        "applies_to": "all",
+        "rationale": "Training-supported weak 01 UTC window.",
+    }
+    stage4b_best = {
+        "candidate_id": "stage4b-best",
+        "setup": {"tp_pct": 2.5, "sl_pct": 1.0, "initial_sl_pct": 1.0, "max_hold_hours": 36},
+        "account": {"net_pnl_usdt": stage4b_total, "ending_equity_usdt": 1000 + stage4b_total},
+        "slices": {"walk_forward_test": {"net_pnl_pct": stage4b_wf, "profit_factor": 1.8}},
+        "skipped_timing_filter": 12,
+    }
+    (timing_root / "timing_overlay.json").write_text(json.dumps(overlay))
+    (timing_root / "timing_replay.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stage4b-run",
+                "best_candidate_id": "stage4b-best",
+                "best_candidate": stage4b_best,
+                "simulation_inputs": {"initial_capital_usdt": 1000, "margin_allocation_pct": 30, "leverage": 5},
+                "cost_assumptions": {"fees_bps_per_side": 5},
+                "overlay": overlay,
+                "candidates": [stage4b_best],
+            }
+        )
+    )
+    (timing_root / "timing_trade_ledger.json").write_text(json.dumps({"candidates": []}))
+    (timing_root / "timing_summary.md").write_text("# Stage 4B Timing Replay\n")
+
+
 def test_portfolio_backtest_endpoint_writes_pool_artifacts(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     repository = StubRuntimeRepository()
@@ -4235,6 +4526,126 @@ def test_promote_execution_bundle_creates_route_and_blocked_wake(tmp_path, monke
     assert wake_response.json()["wake"]["branch"] == "route_gate"
 
 
+def test_promote_execution_bundle_selects_stage4b_when_walk_forward_is_better(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-stage4b.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    _write_promotable_stage4_branches(
+        promotion_root,
+        stage4a_wf=8,
+        stage4a_total=500,
+        stage4b_wf=18,
+        stage4b_total=450,
+    )
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+
+    assert response.status_code == 200
+    bundle = response.json()["bundle"]
+    assert bundle["execution_setup"]["source"] == "stage4b_timing"
+    assert bundle["execution_setup"]["stage4_candidate_id"] == "stage4b-best"
+    assert bundle["execution_setup"]["sizing"]["source"] == "stage4b_timing"
+    assert bundle["source_stage4_result_path"].endswith("promotion/stage4b_timing/timing_replay.json")
+    assert bundle["evidence_refs"]["stage4b_timing_replay"].endswith("promotion/stage4b_timing/timing_replay.json")
+    assert bundle["evidence_refs"]["stage4b_timing_overlay"].endswith("promotion/stage4b_timing/timing_overlay.json")
+    assert "frozen_stage4b_timing_strategy_module" in bundle["evidence_refs"]["stage4b_timing_strategy"]
+    strategy_path = Path(bundle["strategy_module_ref"])
+    module = load_strategy_module(strategy_path)
+    assert module.decide({"timestamp": "2026-05-01T00:00:00Z"})["trade_action"] == "ENTER"
+    skipped = module.decide({"timestamp": "2026-05-01T01:00:00Z"})
+    assert skipped["trade_action"] == "SKIP"
+    assert skipped["direction"] == "FLAT"
+    assert skipped["reason_code"] == "timing_filter_utc_window"
+
+
+def test_stage1_gate_reports_resolved_promotion_candidate(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    repository = StubRuntimeRepository()
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    _write_promotable_stage4_branches(
+        promotion_root,
+        stage4a_wf=4,
+        stage4a_total=500,
+        stage4b_wf=12,
+        stage4b_total=450,
+    )
+    repository.stage1_sessions = [session]
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.get(f"/api/v1/research/stage1-sessions/{session['session_id']}/gate")
+
+    assert response.status_code == 200
+    candidate = response.json()["gate"]["promotion_candidate"]
+    assert candidate["source"] == "stage4b_timing"
+    assert candidate["candidate_id"] == "stage4b-best"
+    assert candidate["walk_forward_net_pnl_pct"] == 12
+    assert candidate["overall_net_pnl_usdt"] == 450
+
+
+def test_promote_execution_bundle_keeps_stage4a_when_stage4b_only_wins_total_pnl(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-stage4a-wf.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    _write_promotable_stage4_branches(
+        promotion_root,
+        stage4a_wf=14,
+        stage4a_total=500,
+        stage4b_wf=5,
+        stage4b_total=900,
+    )
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+
+    assert response.status_code == 200
+    bundle = response.json()["bundle"]
+    assert bundle["execution_setup"]["source"] == "stage4_realized_expectancy"
+    assert bundle["execution_setup"]["stage4_candidate_id"] == "stage4a-best"
+    assert "stage4b_timing_replay" not in bundle["evidence_refs"]
+
+
+def test_promote_execution_bundle_ignores_stale_stage4b_overlay(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-stage4b-stale.db'}")
+    metadata.create_all(engine)
+    repository = RuntimeRepository(engine)
+    _register_vegas_engine(repository)
+    session = _queue_session(tmp_path, "candidate-aave", "AAVE", "stage1a_frozen")
+    promotion_root = tmp_path / session["artifact_root"] / "promotion"
+    _write_promotable_stage4_branches(
+        promotion_root,
+        stage4a_wf=6,
+        stage4a_total=500,
+        stage4b_wf=30,
+        stage4b_total=900,
+        overlay_source_run_id="older-stage4-run",
+    )
+    repository.create_stage0_universe(_queue_universe_run(), [_queue_candidate("candidate-aave", "AAVE", "accepted", 91.2)])
+    repository.create_stage1_research_session(session)
+    client = TestClient(create_app(runtime_repository=repository))
+
+    response = client.post(f"/api/v1/research/stage1-sessions/{session['session_id']}/promote-execution-bundle")
+
+    assert response.status_code == 200
+    bundle = response.json()["bundle"]
+    assert bundle["execution_setup"]["source"] == "stage4_realized_expectancy"
+    assert bundle["execution_setup"]["stage4_candidate_id"] == "stage4a-best"
+
+
 def test_promote_execution_bundle_rejects_missing_strategy_decide(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'execution-invalid-strategy.db'}")
@@ -4521,13 +4932,13 @@ def test_trading_wake_auto_warms_required_market_data(tmp_path, monkeypatch):
     repository.update_deployment_route_gate(route["route_id"], enabled=True, manually_armed=True)
 
     class FakeMarketDataRepository:
-        def get_raw_candle_ref(self, asset, timeframe="5m"):
-            return {
-                "dataset_id": f"{asset.lower()}-raw-{timeframe}",
-                "asset": asset,
-                "instrument": f"{asset}-USDT-SWAP",
+        def __init__(self):
+            self.raw_ref = {
+                "dataset_id": "aave-raw-5m",
+                "asset": "AAVE",
+                "instrument": "AAVE-USDT-SWAP",
                 "data_type": "candles",
-                "timeframe": timeframe,
+                "timeframe": "5m",
                 "data_origin": "raw",
                 "start_ts": "2026-03-01T00:00:00Z",
                 "end_ts": "2026-06-01T00:00:00Z",
@@ -4535,17 +4946,25 @@ def test_trading_wake_auto_warms_required_market_data(tmp_path, monkeypatch):
                 "storage_uri": str(tmp_path / "market-data"),
             }
 
+        def get_raw_candle_ref(self, asset, timeframe="5m"):
+            return dict(self.raw_ref)
+
         def list_derived_refs_for_raw(self, registration):
             return []
 
+    market_data_repository = FakeMarketDataRepository()
+
     fill_calls = []
 
-    def fake_fill_service(*, registration, repository, adapter):
+    def fake_fill_service(*, registration, repository, adapter, as_of):
         fill_calls.append(registration["dataset_id"])
+        latest_confirmed_start = as_of - timedelta(minutes=5)
+        repository.raw_ref["end_ts"] = latest_confirmed_start.isoformat().replace("+00:00", "Z")
         return {
             "dataset_id": registration["dataset_id"],
             "status": "current",
             "rows_added": 0,
+            "end_ts": repository.raw_ref["end_ts"],
             "derived_rebuilt": [],
         }
 
@@ -4578,7 +4997,7 @@ def test_trading_wake_auto_warms_required_market_data(tmp_path, monkeypatch):
     client = TestClient(
         create_app(
             runtime_repository=repository,
-            market_data_repository=FakeMarketDataRepository(),
+            market_data_repository=market_data_repository,
             market_data_fill_service=fake_fill_service,
             signal_pool_extension_service=fake_signal_extender,
             live_signal_scan_service=lambda **kwargs: None,
