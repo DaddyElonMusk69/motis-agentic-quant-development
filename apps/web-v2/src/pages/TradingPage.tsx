@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { AlertTriangle, Archive, CheckCircle2, ChevronLeft, ChevronRight, Clock, Play, RefreshCw, Send, Settings, Square, Trash2, X } from "lucide-react";
+import { Archive, ChevronLeft, ChevronRight, Play, RefreshCw, Send, Square, Trash2, X } from "lucide-react";
 import {
   archiveTradingRoute,
   deleteArchivedTradingRoute,
@@ -388,19 +388,6 @@ function dataFreshnessLabel(report: DataFreshnessReport | null): string {
   return `Data ${report.status}`;
 }
 
-function executionSteps(route: DeploymentRoute, warmup: DataWarmupReport | null, latestWake: WakeRun | null): Array<{ label: string; state: "done" | "pending" | "blocked" }> {
-  const hardBlocked = hasHardBlockers(route);
-  const freshness = effectiveDataFreshness(route, warmup);
-  const dataBlocked = warmup?.reason === "market_data_stale" || freshness?.status === "stale";
-  return [
-    { label: "Warm Data", state: dataBlocked ? "blocked" : route.data_warmed || warmup?.status === "warmed" ? "done" : hardBlocked ? "blocked" : "pending" },
-    { label: "Signals", state: latestWake ? "done" : "pending" },
-    { label: "Exchange", state: latestWake?.exchange_snapshot ? "done" : "pending" },
-    { label: "Strategy", state: latestWake?.strategy_decision ? "done" : "pending" },
-    { label: latestWake?.branch === "position_management" ? "Manage" : "Route", state: latestWake ? "done" : "pending" }
-  ];
-}
-
 function pendingIntentForLatestWake(wake: WakeRun | null): { wake: WakeRun; intent: OrderIntent } | null {
   if (!wake) {
     return null;
@@ -623,6 +610,7 @@ export function TradingPage() {
             <div className="list-header">
               <span>Execution Routes</span>
               <div className="list-header-actions">
+                {route ? <span className="selected-route-pill">{route.asset}</span> : null}
                 <span className="count-pill">{formatNumber(routes.length)}</span>
                 <button className="button button--secondary button--compact" onClick={() => setArchivedOpen(true)} type="button">
                   <Archive aria-hidden="true" />
@@ -643,12 +631,9 @@ export function TradingPage() {
                     || (stopMutation.isPending && stopMutation.variables === item.route_id)
                   }
                   onSelect={() => updateTradingUrl(item.route_id)}
-                  onRun={() => toggleLifecycle(item)}
                   onArchive={() => archiveRoute(item)}
-                  onSaveSettings={(settings) => settingsMutation.mutate({ route_id: item.route_id, ...settings })}
                   route={item}
                   archiveBusy={archiveMutation.isPending && archiveMutation.variables === item.route_id}
-                  settingsSaving={settingsMutation.isPending && item.route_id === route?.route_id}
                   selected={item.route_id === route?.route_id}
                   warmup={item.route_id === route?.route_id ? warmup : null}
                 />
@@ -669,15 +654,6 @@ export function TradingPage() {
                   <RefreshCw aria-hidden="true" />
                   Check CLI
                 </button>
-                <button
-                  className={route?.scheduler_status === "running" ? "button button--danger" : "button button--primary"}
-                  disabled={!route || startInProgress || stopInProgress || (route.scheduler_status !== "running" && hasHardBlockers(route))}
-                  onClick={() => toggleLifecycle(route)}
-                  type="button"
-                >
-                  {route?.scheduler_status === "running" ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
-                  {startInProgress ? "Starting" : stopInProgress ? "Stopping" : route ? routeActionLabel(route) : "Select"}
-                </button>
               </div>
             </div>
 
@@ -685,6 +661,15 @@ export function TradingPage() {
 
             {route ? (
               <>
+                <ExecutionCommandCenter
+                  health={healthQuery.data ?? null}
+                  latestWake={latestWake}
+                  onToggle={() => toggleLifecycle(route)}
+                  route={route}
+                  startInProgress={startInProgress}
+                  stopInProgress={stopInProgress}
+                  warmup={warmup}
+                />
                 {startInProgress ? (
                   <div className="progress-card trading-start-progress">
                     <div className="progress-card__header">
@@ -702,25 +687,7 @@ export function TradingPage() {
                     </div>
                   </div>
                 ) : null}
-                <TerminalPanel title="Selected Route Evidence">
-                  <div className="trading-evidence-grid">
-                    <div className="field-stack">
-                      <FieldRow label="Instrument" value={route.instrument} />
-                      <FieldRow label="Active bundle" value={route.active_bundle_id ?? route.bundle_id ?? "n/a"} />
-                      {routeTpSlRows(route).map((row) => (
-                        <FieldRow key={row.label} label={row.label} value={row.value} />
-                      ))}
-                      <FieldRow label="Next wake" value={formatTimestamp(route.next_wake_at)} />
-                      <FieldRow label="Last wake" value={formatTimestamp(route.last_wake_at)} />
-                    </div>
-                    <div className="field-stack">
-                      <FieldRow label="Position" value={positionSummary(latestWake?.exchange_snapshot)} />
-                      <FieldRow label="Open orders" value={formatNumber(Array.isArray(latestWake?.exchange_snapshot?.open_orders) ? latestWake?.exchange_snapshot?.open_orders.length : undefined)} />
-                      <FieldRow label="Balance" value={formatSnapshotValue(latestWake?.exchange_snapshot?.balance)} />
-                      <FieldRow label="Latest decision" value={latestWake ? formatDecision(latestWake) : "n/a"} />
-                    </div>
-                  </div>
-                </TerminalPanel>
+                <LatestWakeSummary latestWake={latestWake} route={route} />
 
                 {pending ? (
                   <TerminalPanel title="Pending Intent">
@@ -762,6 +729,19 @@ export function TradingPage() {
                     </div>
                   </TerminalPanel>
                 ) : null}
+
+                <div className="execution-detail-grid-v2">
+                  <section className="execution-detail-section-v2">
+                    <ExecutionSettings compact route={route} saving={settingsMutation.isPending} onSave={(settings) => settingsMutation.mutate({ route_id: route.route_id, ...settings })} />
+                  </section>
+                  <section className="execution-detail-section-v2">
+                    <div className="execution-section-heading">
+                      <span>promoted bundle</span>
+                      <strong>Strategy Readout</strong>
+                    </div>
+                    <BundleReadout route={route} />
+                  </section>
+                </div>
 
                 <TerminalPanel
                   className="scroll-panel trading-wake-history-panel"
@@ -843,18 +823,142 @@ export function TradingPage() {
   );
 }
 
+function ExecutionCommandCenter({
+  health,
+  latestWake,
+  onToggle,
+  route,
+  startInProgress,
+  stopInProgress,
+  warmup
+}: {
+  health: ExchangeHealth | null;
+  latestWake: WakeRun | null;
+  onToggle: () => void;
+  route: DeploymentRoute;
+  startInProgress: boolean;
+  stopInProgress: boolean;
+  warmup: DataWarmupReport | null;
+}) {
+  const status = routeStatus(route);
+  const freshness = effectiveDataFreshness(route, warmup);
+  const sizing = effectiveRouteSizing(route);
+  const liveMode = route.auto_submit_enabled ? "Live submit" : "Intent-only";
+  const actionDisabled = startInProgress || stopInProgress || (route.scheduler_status !== "running" && hasHardBlockers(route));
+  return (
+    <section className={`execution-command-center execution-command-center--${status.state}`}>
+      <div className="execution-command-center__identity">
+        <span className="eyebrow">Selected Route</span>
+        <div className="execution-command-center__title">
+          <strong>{route.instrument}</strong>
+          <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
+        </div>
+        <p>{status.detail}</p>
+      </div>
+
+      <div className="execution-command-center__action">
+        <span className={route.auto_submit_enabled ? "execution-mode-pill execution-mode-pill--live" : "execution-mode-pill"}>
+          {liveMode}
+        </span>
+        <button
+          className={route.scheduler_status === "running" ? "button button--danger execution-command-center__button" : "button button--primary execution-command-center__button"}
+          disabled={actionDisabled}
+          onClick={onToggle}
+          type="button"
+        >
+          {route.scheduler_status === "running" ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
+          {startInProgress ? "Starting" : stopInProgress ? "Stopping" : routeActionLabel(route)}
+        </button>
+      </div>
+
+      <div className="execution-command-center__metrics">
+        <div>
+          <span>Data</span>
+          <strong className={freshness?.status === "stale" ? "tone-warn" : freshness?.status === "fresh" ? "tone-pass" : undefined}>{dataFreshnessLabel(freshness)}</strong>
+        </div>
+        <div>
+          <span>Last Decision</span>
+          <strong>{latestWake ? formatDecision(latestWake) : "n/a"}</strong>
+        </div>
+        <div>
+          <span>Position</span>
+          <strong>{positionSummary(latestWake?.exchange_snapshot)}</strong>
+        </div>
+        <div>
+          <span>Sizing</span>
+          <strong>{formatPercent(sizing.margin_allocation_pct)} @ {formatNumber(sizing.leverage)}x</strong>
+        </div>
+        <div>
+          <span>Next Wake</span>
+          <strong>{formatTimestamp(route.next_wake_at)}</strong>
+        </div>
+        <div>
+          <span>Exchange</span>
+          <strong className={health?.connected ? "tone-pass" : health?.status === "blocked" ? "tone-warn" : undefined}>{health?.connected ? "CLI connected" : health?.status ? String(health.status).replaceAll("_", " ") : "unchecked"}</strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function LatestWakeSummary({ latestWake, route }: { latestWake: WakeRun | null; route: DeploymentRoute }) {
+  if (!latestWake) {
+    return (
+      <section className="latest-wake-summary latest-wake-summary--empty">
+        <div className="execution-section-heading">
+          <span>latest cycle</span>
+          <strong>No wake recorded yet</strong>
+        </div>
+        <p>Start the route or run one wake to populate live exchange, signal, and strategy evidence.</p>
+      </section>
+    );
+  }
+  const intentCount = latestWake.order_intents.length;
+  return (
+    <section className="latest-wake-summary">
+      <div className="execution-section-heading">
+        <span>latest cycle</span>
+        <strong>{formatTimestamp(latestWake.completed_at ?? latestWake.started_at)}</strong>
+      </div>
+      <div className="latest-wake-summary__grid">
+        <div>
+          <span>Branch</span>
+          <strong>{latestWake.branch}</strong>
+        </div>
+        <div>
+          <span>Decision</span>
+          <strong>{formatDecision(latestWake)}</strong>
+        </div>
+        <div>
+          <span>Signal</span>
+          <strong>{formatSignalScan(latestWake)}</strong>
+        </div>
+        <div>
+          <span>Intents</span>
+          <strong>{formatNumber(intentCount)}</strong>
+        </div>
+        <div>
+          <span>Open Orders</span>
+          <strong>{formatNumber(Array.isArray(latestWake.exchange_snapshot?.open_orders) ? latestWake.exchange_snapshot?.open_orders.length : undefined)}</strong>
+        </div>
+        <div>
+          <span>Route</span>
+          <strong>{route.asset} / {route.signal_engine_id}</strong>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function RouteCard({
   actionBusy,
   archiveBusy,
   health,
   latestWake,
   onArchive,
-  onRun,
-  onSaveSettings,
   onSelect,
   route,
   selected,
-  settingsSaving,
   warmup
 }: {
   actionBusy: boolean;
@@ -862,16 +966,12 @@ function RouteCard({
   health: ExchangeHealth | null;
   latestWake: WakeRun | null;
   onArchive: () => void;
-  onRun: () => void;
-  onSaveSettings: (settings: { cron_interval_minutes: number; execution_adapter: string; exchange_account: string; margin_allocation_pct: number; leverage: number; manual_sizing_enabled: boolean; auto_submit_enabled: boolean }) => void;
   onSelect: () => void;
   route: DeploymentRoute;
   selected: boolean;
-  settingsSaving: boolean;
   warmup: DataWarmupReport | null;
 }) {
   const status = routeStatus(route);
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const legs = pyramidMaxLegs(route);
   const sizing = effectiveRouteSizing(route);
   const margin = Number(sizing.margin_allocation_pct ?? 0);
@@ -892,10 +992,15 @@ function RouteCard({
 
   return (
     <article className={cardClass}>
-      <button className="route-card-v2__header" onClick={onSelect} type="button">
-        <div className="signal-pool-card__top">
-          <strong>{route.asset} / {route.signal_engine_id}</strong>
-          <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
+      <button className="route-card-v2__header" onClick={onSelect} type="button" aria-current={selected ? "true" : undefined}>
+        <div className="route-card-v2__top">
+          <div className="route-card-v2__identity">
+            <strong>{route.asset}</strong>
+            <span>{route.signal_engine_id}</span>
+          </div>
+          <div className="route-card-v2__badges">
+            <StatusBadge tone={status.tone}>{status.label}</StatusBadge>
+          </div>
         </div>
         <div className="route-card-v2__sub">
           {route.instrument} · {route.account_mode} · {executionInterval(route)}
@@ -905,62 +1010,31 @@ function RouteCard({
         </div>
       </button>
 
-      <div className="route-card-v2__pipeline">
-        {executionSteps(route, warmup, latestWake).map((step) => (
-          <React.Fragment key={step.label}>
-            <span className="route-card-v2__step">
-              <span className={`route-card-v2__step-icon route-card-v2__step-icon--${step.state}`}>
-                {step.state === "done" ? <CheckCircle2 aria-hidden="true" /> : step.state === "blocked" ? <AlertTriangle aria-hidden="true" /> : <Clock aria-hidden="true" />}
-              </span>
-              <span className={`route-card-v2__step-label route-card-v2__step-label--${step.state}`}>{step.label}</span>
-            </span>
-            <span className={`route-card-v2__step-connector ${step.state === "done" ? "route-card-v2__step-connector--done" : ""}`} aria-hidden="true" />
-          </React.Fragment>
-        ))}
-      </div>
-
-      <div className="route-card-v2__setup-line">{setupLine}</div>
-      <div className={`route-card-v2__data-freshness route-card-v2__data-freshness--${freshness?.status === "stale" ? "stale" : freshness?.status === "fresh" ? "fresh" : "unknown"}`}>
-        <span>{dataFreshnessLabel(freshness)}</span>
-        <small>{dataFreshnessSummary(freshness)}</small>
-      </div>
-
-      {settingsOpen ? (
-        <div className="route-card-v2__settings">
-          <ExecutionSettings compact route={route} saving={settingsSaving} onSave={onSaveSettings} />
-          <button
-            className="button button--secondary route-card-v2__archive"
-            disabled={archiveBusy || actionBusy}
-            onClick={onArchive}
-            type="button"
-          >
-            <Archive aria-hidden="true" />
-            {archiveBusy ? "Archiving" : "Archive"}
-          </button>
+      <div className="route-card-v2__compact-grid">
+        <div className={`route-card-v2__data-freshness route-card-v2__data-freshness--${freshness?.status === "stale" ? "stale" : freshness?.status === "fresh" ? "fresh" : "unknown"}`}>
+          <span>{dataFreshnessLabel(freshness)}</span>
+          <small>{freshness?.raw_5m?.timestamp ? formatTimestamp(freshness.raw_5m.timestamp) : "raw n/a"}</small>
         </div>
-      ) : null}
+        <div className="route-card-v2__decision">
+          <span>Last decision</span>
+          <strong>{latestWake ? formatDecision(latestWake) : status.detail}</strong>
+        </div>
+      </div>
+      <div className="route-card-v2__setup-line">{setupLine}</div>
 
       <div className="route-card-v2__footer">
         <span className={`route-card-v2__status ${status.state === "blocked" ? "tone-warn" : status.state === "running" ? "tone-pass" : ""}`}>
           {status.detail}
         </span>
-        <div className="route-card-v2__actions">
+        <div className="route-card-v2__actions route-card-v2__actions--quiet">
           <button
-            className={`route-card-v2__settings-btn ${settingsOpen ? "route-card-v2__settings-btn--open" : ""}`}
-            onClick={() => setSettingsOpen((prev) => !prev)}
+            className="route-card-v2__archive-btn"
+            disabled={archiveBusy || actionBusy}
+            onClick={onArchive}
             type="button"
-            aria-label={settingsOpen ? "Hide settings" : "Show settings"}
+            aria-label="Archive route"
           >
-            <Settings aria-hidden="true" />
-          </button>
-          <button
-            className={route.scheduler_status === "running" ? "button button--danger route-card-v2__run" : "button button--primary route-card-v2__run"}
-            disabled={actionBusy || archiveBusy || (route.scheduler_status !== "running" && hasHardBlockers(route))}
-            onClick={onRun}
-            type="button"
-          >
-            {route.scheduler_status === "running" ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
-            {actionBusy ? "Working" : routeActionLabel(route)}
+            <Archive aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -1098,67 +1172,86 @@ function ExecutionSettings({ compact = false, onSave, route, saving }: {
     }
   };
 
+  const saveButton = (
+    <button
+      className="button button--secondary execution-settings-save-v2"
+      disabled={!dirty || !valid || saving}
+      onClick={() => onSave({
+        cron_interval_minutes: cronMinutes,
+        execution_adapter: exchange,
+        exchange_account: account,
+        margin_allocation_pct: margin,
+        leverage,
+        manual_sizing_enabled: manualSizing,
+        auto_submit_enabled: autoSubmit
+      })}
+      type="button"
+    >
+      {saving ? "Saving" : "Save Setup"}
+    </button>
+  );
+
   return (
-    <div className={compact ? "execution-settings-v2 execution-settings-v2--compact" : "execution-settings-v2"}>
-      <label>
-        Cron Minutes
-        <input min="1" max="1440" type="number" value={cron} onChange={(event) => setCron(event.target.value)} />
-      </label>
-      <label>
-        Exchange
-        <select value={exchange} onChange={(event) => setExchange(event.target.value)}>
-          <option value="okx">OKX</option>
-        </select>
-      </label>
-      <label>
-        Account
-        <input value={account} onChange={(event) => setAccount(event.target.value)} />
-      </label>
-      <label className="slider-row-v2">
-        <span>Full position margin {formatPercent(displayMargin)}</span>
-        {manualSizing ? (
-          <input min="1" max="100" step="1" type="range" value={margin} onChange={(event) => setMargin(Number(event.target.value))} />
-        ) : (
-          <strong>{formatPercent(bundleSizing.margin_allocation_pct)} from Stage 4</strong>
-        )}
-      </label>
-      <label className="slider-row-v2">
-        <span>Leverage {formatNumber(displayLeverage)}x</span>
-        {manualSizing ? (
-          <input min="1" max="20" step="1" type="range" value={leverage} onChange={(event) => setLeverage(Number(event.target.value))} />
-        ) : (
-          <strong>{formatNumber(bundleSizing.leverage)}x from Stage 4</strong>
-        )}
-      </label>
-      <label className="checkbox-row-v2">
-        <span>Manual Sizing Override</span>
-        <input type="checkbox" checked={manualSizing} onChange={(event) => toggleManualSizing(event.target.checked)} />
-      </label>
-      <label className="checkbox-row-v2">
-        <span>Live Orders</span>
-        <input type="checkbox" checked={autoSubmit} onChange={(event) => setAutoSubmit(event.target.checked)} />
-      </label>
-      <button
-        className="button button--secondary"
-        disabled={!dirty || !valid || saving}
-        onClick={() => onSave({
-          cron_interval_minutes: cronMinutes,
-          execution_adapter: exchange,
-          exchange_account: account,
-          margin_allocation_pct: margin,
-          leverage,
-          manual_sizing_enabled: manualSizing,
-          auto_submit_enabled: autoSubmit
-        })}
-        type="button"
-      >
-        {saving ? "Saving" : "Save Setup"}
-      </button>
+    <div className="execution-settings-block-v2">
+      {compact ? (
+        <div className="execution-section-heading execution-section-heading--action">
+          <span>risk and schedule</span>
+          <strong>Execution Setup</strong>
+          {saveButton}
+        </div>
+      ) : null}
+      <div className={compact ? "execution-settings-v2 execution-settings-v2--compact" : "execution-settings-v2"}>
+        <label className="execution-field-v2">
+          <span>Cron</span>
+          <input min="1" max="1440" type="number" value={cron} onChange={(event) => setCron(event.target.value)} />
+        </label>
+        <label className="execution-field-v2">
+          <span>Exchange</span>
+          <select value={exchange} onChange={(event) => setExchange(event.target.value)}>
+            <option value="okx">OKX</option>
+          </select>
+        </label>
+        <label className="slider-row-v2">
+          <span>
+            <span>Margin</span>
+            <strong>{formatPercent(displayMargin)}</strong>
+          </span>
+          {manualSizing ? (
+            <input min="1" max="100" step="1" type="range" value={margin} onChange={(event) => setMargin(Number(event.target.value))} />
+          ) : (
+            <em>{formatPercent(bundleSizing.margin_allocation_pct)} from Stage 4</em>
+          )}
+        </label>
+        <label className="slider-row-v2">
+          <span>
+            <span>Leverage</span>
+            <strong>{formatNumber(displayLeverage)}x</strong>
+          </span>
+          {manualSizing ? (
+            <input min="1" max="20" step="1" type="range" value={leverage} onChange={(event) => setLeverage(Number(event.target.value))} />
+          ) : (
+            <em>{formatNumber(bundleSizing.leverage)}x from Stage 4</em>
+          )}
+        </label>
+        <label className="execution-toggle-row-v2">
+          <span>
+            <strong>Manual Sizing</strong>
+          </span>
+          <input aria-label="Manual sizing override" type="checkbox" checked={manualSizing} onChange={(event) => toggleManualSizing(event.target.checked)} />
+        </label>
+        <label className="execution-toggle-row-v2">
+          <span>
+            <strong>Live Orders</strong>
+          </span>
+          <input aria-label="Live orders" type="checkbox" checked={autoSubmit} onChange={(event) => setAutoSubmit(event.target.checked)} />
+        </label>
+        {compact ? null : saveButton}
+      </div>
     </div>
   );
 }
 
-function BundleReadout({ latestWake, route }: { latestWake: WakeRun | null; route: DeploymentRoute }) {
+function BundleReadout({ route }: { route: DeploymentRoute }) {
   const setup = routeSetup(route);
   const legs = pyramidMaxLegs(route);
   const sizing = effectiveRouteSizing(route);
@@ -1166,17 +1259,37 @@ function BundleReadout({ latestWake, route }: { latestWake: WakeRun | null; rout
   const perLegMarginPct = legs > 0 ? margin / legs : margin;
   const tpSlRows = routeTpSlRows(route);
   return (
-    <div className="field-stack">
+    <div className="strategy-readout-grid">
       {tpSlRows.map((row) => (
-        <FieldRow key={row.label} label={row.label} value={row.value} />
+        <div className="strategy-readout-grid__item" key={row.label}>
+          <span>{row.label}</span>
+          <strong>{row.value}</strong>
+        </div>
       ))}
-      <FieldRow label="Pyramid legs" value={formatNumber(legs)} />
-      <FieldRow label="Step" value={formatSetupValue(readRecordValue(readRecordValue(setup, "pyramid"), "step_pct") ?? readRecordValue(setup, "step_pct"), "%")} />
-      <FieldRow label="Hard hold gate" value={formatSetupValue(setup.max_hold_hours ?? readRecordValue(route.active_bundle?.execution_setup, "hard_exit_after_hours"), "h")} />
-      <FieldRow label="Sizing source" value={sizing.source} />
-      <FieldRow label="Per-leg margin" value={`${formatPercent(perLegMarginPct)} of account`} />
-      <FieldRow label="Initial notional" value={`${formatPercent(perLegMarginPct * Number(sizing.leverage ?? 1))} of account`} />
-      <FieldRow label="Last branch" value={latestWake?.branch ?? "n/a"} />
+      <div className="strategy-readout-grid__item">
+        <span>Pyramid</span>
+        <strong>{formatNumber(legs)} legs</strong>
+      </div>
+      <div className="strategy-readout-grid__item">
+        <span>Step</span>
+        <strong>{formatSetupValue(readRecordValue(readRecordValue(setup, "pyramid"), "step_pct") ?? readRecordValue(setup, "step_pct"), "%")}</strong>
+      </div>
+      <div className="strategy-readout-grid__item">
+        <span>Hold Gate</span>
+        <strong>{formatSetupValue(setup.max_hold_hours ?? readRecordValue(route.active_bundle?.execution_setup, "hard_exit_after_hours"), "h")}</strong>
+      </div>
+      <div className="strategy-readout-grid__item">
+        <span>Sizing Source</span>
+        <strong>{sizing.source}</strong>
+      </div>
+      <div className="strategy-readout-grid__item">
+        <span>Per-Leg Margin</span>
+        <strong>{formatPercent(perLegMarginPct)}</strong>
+      </div>
+      <div className="strategy-readout-grid__item">
+        <span>Initial Notional</span>
+        <strong>{formatPercent(perLegMarginPct * Number(sizing.leverage ?? 1))}</strong>
+      </div>
     </div>
   );
 }

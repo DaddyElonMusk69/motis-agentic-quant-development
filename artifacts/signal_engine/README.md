@@ -19,13 +19,12 @@ and `artifacts/`. It does not support old root folders such as `training_data`,
 - Live signal packets: `live/signals/<signal_engine_id>/<ASSET>/...`
 - Live router state: `live/router`
 
-`signal_engine_id` is the canonical producer identity. Current engine ids are the existing
-root names, such as `vegas_ema` and `bollinger`. `signal_family` is legacy descriptive
-metadata only and must not drive routing.
+`signal_engine_id` is the canonical producer identity. `signal_family` is
+legacy descriptive metadata only and must not drive routing.
 
 ## Common Commands
 
-Generate EMA/Vegas replay signals:
+Generate replay signals:
 
 ```bash
 python3 artifacts/signal_engine/scripts/signals/generate_training_session.py \
@@ -35,7 +34,7 @@ python3 artifacts/signal_engine/scripts/signals/generate_training_session.py \
   --vote-threshold 2
 ```
 
-Scan live EMA/Vegas signals:
+Scan live signals:
 
 ```bash
 python3 artifacts/signal_engine/scripts/signals/scan_okx_live_signals.py \
@@ -49,7 +48,7 @@ python3 artifacts/signal_engine/scripts/live/autonomous_wake_router.py \
   --asset BTC \
   --account-mode live \
   --strategy-id btc-vegas-tunnel-v01 \
-  --signal-engine-id vegas_ema \
+  --signal-engine-id <engine_id> \
   --engine-registry-path artifacts/signal_engine/engine_registry.json \
   --router-state-root live/router/state/wake_router \
   --owner-state-root live/router/state/live/open_position_owner \
